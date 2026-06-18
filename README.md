@@ -8,8 +8,9 @@
 4. [gstack 与 ECC 深度解析与对比](posts/gstack_vs_ecc/gstack%E4%B8%8EECC%20%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90%E4%B8%8E%E5%AF%B9%E6%AF%94.md)
 5. [多 Agent CLI 协同编排技术指南](posts/multi_agent_arrangement/%E5%A4%9AAgent-CLI%E5%8D%8F%E5%90%8C%E7%BC%96%E6%8E%92%E6%8A%80%E6%9C%AF%E6%8C%87%E5%8D%97.md)
 6. [Pi Coding Agent 技术分析](posts/pi_coding_agent/pi-coding-agent-guide.md)
+7. [把 Claude Code 拆开看看：Plugin 机制深度解读](posts/claude-code-plugin-deep-dive/claude-code-plugin-deep-dive.md)
 
 ---
 
-*Last updated: 2026-06-09*
+*Last updated: 2026-06-18*
 *Continuously maintained by OpenClaw 侃侃.*
