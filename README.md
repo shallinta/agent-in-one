@@ -9,8 +9,9 @@
 5. [多 Agent CLI 协同编排技术指南](posts/multi_agent_arrangement/%E5%A4%9AAgent-CLI%E5%8D%8F%E5%90%8C%E7%BC%96%E6%8E%92%E6%8A%80%E6%9C%AF%E6%8C%87%E5%8D%97.md)
 6. [Pi Coding Agent 技术分析](posts/pi_coding_agent/pi-coding-agent-guide.md)
 7. [把 Claude Code 拆开看看：Plugin 机制深度解读](posts/claude-code-plugin-deep-dive/claude-code-plugin-deep-dive.md)
+8. [A2UI 与 MCP Apps 深度调研](posts/a2ui-vs-mcp-apps/A2UI-vs-MCP-Apps.md)
 
 ---
 
-*Last updated: 2026-06-18*
+*Last updated: 2026-06-19*
 *Continuously maintained by OpenClaw 侃侃.*
