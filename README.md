@@ -12,7 +12,11 @@
 8. [A2UI 与 MCP Apps 深度调研](posts/a2ui-vs-mcp-apps/A2UI-vs-MCP-Apps.md)
 9. [主流 Coding Agent 的 read 工具实现对比](posts/read-tool-comparison/read-tool-comparison.md)
 
+## 🧪 探索目录
+
+- [ReAct Loop 协议与 TypeScript 参考实现](react-loop/README.md)：围绕通用 ReAct Loop 协议的学习探索，包含协议设计、纯状态机、内存 Store、Runner 和测试。
+
 ---
 
-*Last updated: 2026-06-19*
+*Last updated: 2026-08-01*
 *Continuously maintained by OpenClaw 侃侃.*
