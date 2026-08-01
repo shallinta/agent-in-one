@@ -11,6 +11,7 @@
 7. [把 Claude Code 拆开看看：Plugin 机制深度解读](posts/claude-code-plugin-deep-dive/claude-code-plugin-deep-dive.md)
 8. [A2UI 与 MCP Apps 深度调研](posts/a2ui-vs-mcp-apps/A2UI-vs-MCP-Apps.md)
 9. [主流 Coding Agent 的 read 工具实现对比](posts/read-tool-comparison/read-tool-comparison.md)
+10. [从 API 到 Token：大模型调用与底层机制](posts/llm-from-api-to-token/llm-from-api-to-token.md)
 
 ## 🧪 探索目录
 
