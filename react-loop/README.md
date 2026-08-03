@@ -1,10 +1,25 @@
-# ReAct Loop TypeScript 参考实现
+# ReAct Loop 协议设计与 TypeScript 参考实现
+
+本目录记录了一套通用 ReAct Loop 协议设计，以及配套的 TypeScript 学习型参考实现。
+
+## 1. 设计方案
+
+设计方案提出一套与语言、框架、传输方式和具体 AgentCore 解耦的 ReAct Loop 控制平面协议，
+用于统一工具执行、人工审批、暂停恢复、取消和 Checkpoint 等编排语义。协议以纯状态机为核心，
+由 Input 驱动状态转换并产出 Effect 和事件，再由宿主提供的适配器执行副作用；整体定位为学习研究
+性质的跨语言协议设计。
+
+[阅读完整设计方案](./react-loop-protocol-design.md)
+
+## 2. TypeScript 参考实现
 
 本目录包含一个可执行、面向学习的 TypeScript 参考实现，与
 [`react-loop-protocol-design.md`](./react-loop-protocol-design.md) 配套使用。它重点呈现
 协议的 P0 不变量和主要内存执行路径，而不是将其定位为生产级工作流引擎。
 
-## 包含内容
+[查看 TypeScript 参考实现入口](./src/index.ts)
+
+### 2.1 包含内容
 
 - 采用 JSON 形态、带判别字段的协议联合类型，以及轻量的运行时边界校验器。
 - 纯函数式 `transition(state, input)` 状态机，为 effect、batch、call、pause 和 event
@@ -16,7 +31,7 @@
 - 内存 Runner，可注入 AgentCore、Policy 和 Tool Executor 适配器。
 - 脚本化测试替身和一致性风格测试。
 
-## 运行方式
+### 2.2 运行方式
 
 ```bash
 bun install
@@ -77,7 +92,7 @@ console.log(state.status); // completed
 `inputId` 参数，都是由调用方管理的命令 ID。只有在重试同一个逻辑命令时才能复用 ID；
 不同的并发命令必须使用不同的 ID。
 
-## 有意保留的研究缺口
+### 2.3 有意保留的研究缺口
 
 本包**不提供**持久化崩溃恢复、checkpoint 导入、执行权声明或栅栏（fencing）机制、持久且可重放的
 事件流、向已经运行的 effect 传播取消信号、自动生成的 JSON Schema、跨语言 fixture，
