@@ -1,24 +1,22 @@
-# ReAct Loop TypeScript Reference
+# ReAct Loop TypeScript 参考实现
 
-This directory contains an executable, learning-oriented TypeScript companion to
-[`react-loop-protocol-design.md`](./react-loop-protocol-design.md). It focuses on
-the protocol's P0 invariants and main in-memory path, rather than pretending to be
-a production workflow engine.
+本目录包含一个可执行、面向学习的 TypeScript 参考实现，与
+[`react-loop-protocol-design.md`](./react-loop-protocol-design.md) 配套使用。它重点呈现
+协议的 P0 不变量和主要内存执行路径，而不是将其定位为生产级工作流引擎。
 
-## What is included
+## 包含内容
 
-- JSON-shaped, discriminated protocol unions and small runtime boundary validators.
-- A pure `transition(state, input)` state machine with deterministic effect, batch,
-  call, pause, and event identities.
-- Stable internal `call_key` values, batch-local provider `call_id` validation,
-  receipt-window deduplication, revision CAS, and effect-result correlation.
-- Ordered tool-progress merging, including `unknown` outcomes, retry-safe retries,
-  and manual result supply.
-- An authoritative in-memory Store that atomically records each State transition.
-- An in-memory Runner with injected AgentCore, Policy, and Tool Executor adapters.
-- Scripted fakes and conformance-style tests.
+- 采用 JSON 形态、带判别字段的协议联合类型，以及轻量的运行时边界校验器。
+- 纯函数式 `transition(state, input)` 状态机，为 effect、batch、call、pause 和 event
+  提供确定性标识。
+- 稳定的内部 `call_key`、batch 内 provider `call_id` 校验、回执窗口去重、revision CAS，
+  以及 effect 与结果的关联校验。
+- 按顺序合并工具执行进度，包括 `unknown` 结果、重试安全机制和手动补充结果。
+- 权威的内存 Store，以原子方式记录每一次 State 转换。
+- 内存 Runner，可注入 AgentCore、Policy 和 Tool Executor 适配器。
+- 脚本化测试替身和一致性风格测试。
 
-## Run it
+## 运行方式
 
 ```bash
 bun install
@@ -26,7 +24,7 @@ bun test
 bun run typecheck
 ```
 
-Minimal example:
+最小示例：
 
 ```ts
 import {
@@ -75,22 +73,18 @@ const state = await runner.start({
 console.log(state.status); // completed
 ```
 
-`start.input_id` and the final `inputId` argument of `runner.resume(...)` and
-`runner.cancel(...)` are caller-owned command IDs. Reuse an ID only when retrying
-the same logical command; distinct concurrent commands must use distinct IDs.
+`start.input_id` 以及 `runner.resume(...)` 和 `runner.cancel(...)` 的最后一个
+`inputId` 参数，都是由调用方管理的命令 ID。只有在重试同一个逻辑命令时才能复用 ID；
+不同的并发命令必须使用不同的 ID。
 
-## Deliberate research gaps
+## 有意保留的研究缺口
 
-This package does **not** provide durable crash recovery, checkpoint import,
-execution claims or fencing, durable/replayable event streaming, cancellation
-propagation into already-running effects, generated JSON Schemas, cross-language
-fixtures, or production storage adapters. The exported runner capabilities report
-these durability features as `false`.
+本包**不提供**持久化崩溃恢复、checkpoint 导入、执行权声明或栅栏（fencing）机制、持久且可重放的
+事件流、向已经运行的 effect 传播取消信号、自动生成的 JSON Schema、跨语言 fixture，
+或生产级存储适配器。导出的 Runner capabilities 会将这些持久化能力报告为 `false`。
 
-The protocol retains a `recover` Input for research completeness, but this reference
-state machine rejects it explicitly and the in-memory Runner does not expose a
-recovery API.
+为了保持研究内容的完整性，协议保留了 `recover` Input；但本参考状态机会明确拒绝它，
+内存 Runner 也未暴露恢复 API。
 
-The in-memory Store makes the transition boundary observable and testable, but a
-process crash loses all state. The article keeps the harder distributed-runtime
-questions visible for further study instead of hiding them behind misleading APIs.
+内存 Store 让状态转换边界变得可观察、可测试，但进程崩溃会导致全部状态丢失。文章保留了
+更棘手的分布式运行时问题，以便后续研究，而没有用容易引起误解的 API 将它们隐藏起来。
