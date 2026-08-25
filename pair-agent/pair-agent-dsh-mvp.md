@@ -4,13 +4,13 @@
 >
 > **上游规范：**[Pair Agent 模型技术设计参考](pair-agent-spec.md)
 >
-> **DSH 基线：**`dsh-v0.1.1-rc.2`，commit `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`。
+> **DSH 分析基线：**`dsh-v0.1.1-rc.2`，commit `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`；本文的现有源码结论和链接均以该快照为证据。
 >
-> **稳定性说明：**该版本仍处于 Developer Preview，存在兼容性破坏风险；原型必须锁定 commit，而不是跟随浮动分支。
+> **实现基线策略：**正式开发启动时重新审查 DSH 最新可用状态，从通过基线质量门禁的 commit 创建 fork 并锁定完整 SHA；实现和运行期间不得跟随浮动分支。
 >
 > **实现语言：**TypeScript，运行于 Node.js；首个模型协议使用 OpenAI Chat Completions 兼容接口。
 >
-> **版本：**Exploration Draft 0.2，2026-08-25
+> **版本：**Exploration Draft 0.3，2026-08-25
 
 ---
 
@@ -159,8 +159,8 @@ Pair Runtime 不复制 DSH Agent Loop，也不把两个 Agent 的模型消息强
 | Agent/Session 一对一 | Agent Registry identity invariant | 原样保留 |
 | Common System | `systemPrompt.section()` | 两个 Agent 使用相同 Pair Contract、完整 Role Catalog 和事件解释规则 |
 | Active Role | DSH 标准 `user` message | Pair Request Builder 生成保留标签的 role reminder；不授予权限 |
-| 动态共享上下文 | DSH Session/LLM request seam | Pair Context Builder 直接读取 Pair Ledger；不使用 `systemPrompt.context()` 默认尾部快照 |
-| Cache-first 请求排列 | DSH Agent Loop request construction | 复用并拓展：增加窄的 Pair request-layout seam，保持 tool-call 闭合规则 |
+| 动态共享上下文 | DSH Session + 通用 request-layout plugin seam | Pair Context Builder 直接读取 Pair Ledger；不使用 `systemPrompt.context()` 默认尾部快照 |
+| Cache-first 请求排列 | DSH Agent Loop request construction | 复用并拓展：在 `buildRequest()` 内增加通用 `agent/request-layout` waterfall，Pair 逻辑由插件注册 |
 | 工具视图 | `tools.restrict()` 和 scoped tool registration | Navigator/Pilot 分别配置 |
 | 确定性拒绝 | `tools.guard()`、`tools/pre-execute` | 校验角色、Goal/Task Revision 和暂停状态 |
 | 普通新输入 | `agent.followup()` | 新用户 Turn 或新 Task 唤醒 |
@@ -197,6 +197,33 @@ DSH 自带 `@deepseek-ai/dsh-goal` 的事件溯源和 CAS 思路值得借鉴，�
 JSONL provider 的 `root` 没有默认值，必须由 Host 提供绝对目录。它采用 lazy materialization 和 write-behind batching，因此所有进入 Pair durable 状态的关键边界都必须显式等待 `ctx.sessions.flush(session)`。
 
 MVP 使用 fresh spawn continuable child，避免把 Pilot 的完整历史复制给临时执行者；Pilot 必须在子任务 Prompt 中显式提供 Task Ref、必要上下文、权限上限和交付要求。
+
+### 4.2 DSH fork 与实现基线操作路径
+
+本节区分“文档分析基线”和“实际实现基线”。`b150a551...` 继续作为本文结论的可追溯源码快照，但不预先锁死尚未启动的实现。MVP 正式开发的第一项工作是执行以下基线审查：
+
+```text
+读取 DSH 最新可用状态
+  → 检查是否已经提供等价 request-layout seam
+  → 运行原生 install / build / typecheck / test
+  → 审查 Agent、Session、Prompt、Tools 和 persistence 兼容性
+  → 选定一个完整 upstream commit SHA
+  → 从该 SHA 创建 Pair Agent 使用的最小 fork
+  → 实现或适配通用 agent/request-layout seam
+  → 通过 DSH 基线与 Pair Adapter contract tests
+  → 锁定实际 fork commit SHA 后开始 Pair Runtime 开发
+```
+
+操作约束：
+
+- 不直接依赖浮动 `main`、branch、npm `latest` 或 `next` tag；
+- 分别记录作为起点的 upstream commit 和实际构建使用的 fork commit；
+- fork 只维护通用 request-layout seam、retry attempt 身份及其 contract tests，不包含 Pair Domain；
+- 如果最新 DSH 已经提供等价能力，优先编写兼容 Adapter，不重复引入自定义 seam；
+- 如果最新源码使本文的 Agent Loop、Session Event 或 persistence 假设失效，先更新本方案和兼容性测试，再编写 Pair Runtime；
+- DSH 后续升级作为独立变更处理，每次重新运行相同基线审查和完整回归，不能在功能开发中顺带提升 commit。
+
+在官方 npm 尚未包含所需 seam 时，MVP 直接构建并使用锁定 fork 源码。验证成功后先按 DSH 当前贡献政策在 GitHub Discussions 提交通用扩展点、基线等价测试和使用证据；只有上游未来开放并接受外部 PR 时才提交代码。Pair Agent 切换到纯官方 npm 依赖的条件是：seam 已进入官方发布版本、TypeScript API 可用、移除 fork/patch 后 Pair Adapter contract tests 全部通过。上游进度不阻塞 MVP 开发。
 
 ## 5. Pair Runtime 组件
 
@@ -330,11 +357,49 @@ Common System
 + Current Trigger
 ```
 
-DSH 当前把 Agent Loop request 标记为 immutable，并原生使用 `session.deriveMessages()`；现有 `agent/pre-step` 只能修改本轮领取的消息，不能把 Shared Context 移到已有历史之前。因此 MVP 需要一个窄的 request-layout 扩展点，或 Pair-aware Agent Loop adapter，不能通过修改已冻结的 `llm/stream` 请求实现。
+DSH 当前把 Agent Loop request 标记为 immutable，并原生使用 `session.deriveMessages()`；现有 `agent/pre-step` 只能修改本轮领取的消息，不能把 Shared Context 移到已有历史之前。因此 MVP 选择在 DSH 中增加一个窄而通用的 `agent/request-layout` 插件扩展点，不复制或替换 Agent Loop，也不把 Pair Agent 逻辑硬编码进 DSH。
 
 该 seam 必须位于 DSH 现有 `buildRequest(turn, step, tools, system, boundaryMessages, signal)` 内部：此时 pre-step 已领取的消息和本轮 tool result 已经追加到 Session，`boundaryMessages = session.deriveMessages()` 是即将发送的完整协议边界。不能在 pre-step 之前或只凭旧 `localLog` 构造，否则会漏掉当前 claimed input 或 next-step tool result。
 
-扩展点至少接收：
+DSH 侧新增的是默认保持原行为的通用 waterfall：
+
+```ts
+interface RequestLayoutInput {
+  turn: number;
+  step: number;
+  attempt: number;
+  system?: string;
+  tools: readonly ToolSchema[];
+  boundaryMessages: readonly Message[];
+  config: LlmCallConfig;
+  signal: AbortSignal;
+}
+
+interface RequestLayoutResult {
+  messages: readonly Message[];
+}
+
+const layout = await dispatch.waterfall(
+  "agent/request-layout",
+  { turn, step, attempt, system, tools, boundaryMessages, config, signal },
+  () => Promise.resolve({ messages: boundaryMessages }),
+);
+
+const request = markAgentLoopRequest(deepFreeze({
+  ...config,
+  messages: layout.messages,
+  ...(system ? { system } : {}),
+  ...(tools.length > 0 ? { tools } : {}),
+  sessionId: session.id,
+  signal,
+}));
+```
+
+未安装布局插件时，默认值仍是原始 `boundaryMessages`，普通 DSH Agent 的请求、Session 和工具行为不变。DSH 还需要在同一 turn/step 的 request-error retry 中维护单调递增的 `attempt`，使插件能够为每次真实 Provider attempt 建立稳定身份。
+
+Pair Runtime 通过插件注册该 waterfall。插件读取 Pair Ledger、运行 Context Builder 和 Local History Projector、执行 link barrier 与 Snapshot CAS，然后返回 cache-first `messages`。DSH seam 只提供时机和完整输入，既不理解 Pair Session、Goal、Task，也不直接访问 Pair Ledger。
+
+Pair 插件内部的构造输入至少包含：
 
 ```ts
 interface PairRequestBuildInput {
@@ -360,9 +425,11 @@ interface PairRequestBuildInput {
 
 `attempt` 在同一个 turn/step 内每次进入 `buildRequest()` 时递增，包括 request-error retry。Projector 以 `boundaryMessages` 为最终协议输入，用 `localLog` 和持久 link 判断哪些完整 span 可以排除；任何只存在于 boundary 的当前消息默认保留。seam 每个 step、每个 retry 都执行一次并产生唯一 Request Snapshot。
 
-它只改变请求投影，不改变 DSH Session Event Log、Turn、Tool execution 和持久化内核。实际模型请求仍由 DSH LLM Adapter 发送。
+它只改变请求投影，不改变 DSH Session Event Log、Turn、Tool execution 和持久化内核。实际模型请求仍由 DSH LLM Adapter 发送。request-layout 结果必须经过 DSH 的结构校验和最终 `deepFreeze`，插件不能直接持有或调用 Provider。
 
 `systemPrompt.context()` 不用于 Pair Shared Context，因为其默认行为是把完整快照作为新的 user-role message 追加到 Agent-local History 尾部。Pair Context Builder 直接读取 Pair Ledger，避免尾部重复快照。`agent.inject()` 同样不作为共同事实源，只适合交付一个非唤醒 delivery frame。
+
+现有插件 API 仍可实现一个降低要求的验证原型：用 `systemPrompt.context()` 把 Shared Context 追加到 Local History 尾部。但该顺序不满足本方案的公共前缀、Local History 去重和 Request Snapshot 要求，因此不是本 MVP 的正式实现路径。用自定义 LLM Adapter 忽略冻结请求并另造请求会使 DSH Request Header、实际 Provider 请求和审计记录分离，也不采用。
 
 ### 5.5 Role Setup
 
@@ -491,14 +558,24 @@ Request Builder 在投影前执行 link barrier：扫描目标 Session 到本次
 ### 6.1 Pair Session Header
 
 ```ts
+interface DshBuildRef {
+  upstreamRepository: "https://github.com/deepseek-ai/deepseek-harness";
+  upstreamCommit: string;          // 启动审查时选定的完整 SHA
+  sourceRepository: string;        // 实际 fork URL
+  sourceCommit: string;            // 实际构建使用的完整 SHA
+  requestLayoutSeamVersion: 1;
+}
+
 interface PairCreated {
   pairId: string;
   navigatorSessionId: string;
   pilotSessionId: string;
-  dshCommit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e";
+  dshBuild: DshBuildRef;
   schemaVersion: 1;
 }
 ```
+
+`upstreamCommit` 与 `sourceCommit` 必须是完整、不可变的 commit SHA，不能保存 branch 或 tag。恢复时 Host 校验当前构建的 `DshBuildRef` 与 Pair Session Header 是否兼容；不匹配时进入显式迁移或 degraded 流程，不能静默用新 DSH 代码恢复旧 Session。
 
 ### 6.2 Pair Event Envelope
 
@@ -1264,7 +1341,8 @@ MVP 借鉴而不直接复用以下实现思想：
 | Active Role Reminder | 全新增 | Pair Request Builder 生成保留的 user-role envelope |
 | Pair Context Builder | 全新增 | 从 Pair Ledger 生成确定性 Events + Projection 公共前缀 |
 | Agent Local History Projector | 全新增 | 用 SessionEventPairLink 去重并保持 tool protocol spans |
-| Cache-first Pair Request Builder | 复用并拓展 | 增加 DSH request-layout seam；输出 Chat Completions messages |
+| 通用 Request Layout 插件 seam | 复用并拓展 | DSH `buildRequest()` 新增 `agent/request-layout` waterfall；默认 identity，不包含 Pair 语义 |
+| Cache-first Pair Request Builder | 全新增 | Pair 插件注册 request-layout seam，输出 Chat Completions messages 并记录 Request Snapshot |
 | 两个用户输入 Channel 与 Response Owner | 全新增 | Pair Host / Pair UI |
 | 带用户来源和版本的 Pair Goal | 全新增 | Pair Goal Domain；只借鉴 DSH Goal 的 CAS 思路 |
 | Navigator Task 与 Pilot Execution Plan | 全新增 | Pair Task/Plan Domain |
@@ -1331,12 +1409,15 @@ MVP 至少通过以下端到端场景：
 20. 已由 `representation: full` Pair Event 覆盖的普通消息不会在 Local Request Tail 重复出现，tool call/result span 仍然闭合；
 21. 进程重启后只从 Pair Ledger 与两条 DSH Session 重建请求，且 `PairRequestSnapshot` digest 一致；
 22. 所有 Chat Completions 请求都不包含 Provider conversation continuation 标识；
-23. Cache 实验记录 cached tokens、总输入 token、延迟、角色遵循度和错误率，并允许无数据迁移地回退 DSH 原生顺序。
+23. Cache 实验记录 cached tokens、总输入 token、延迟、角色遵循度和错误率，并允许无数据迁移地回退 DSH 原生顺序；
+24. 未注册 `agent/request-layout` 插件时，普通 DSH Agent 的 messages、tool call/result、retry、cancel 和 resume 行为与基线一致；注册 Pair 插件后，最终请求才采用 cache-first 布局。
 
 ## 14. 实施分段
 
 ### 14.1 P0：运行骨架
 
+- 审查 DSH 最新可用 commit、运行原生质量门禁、创建最小 fork，并锁定 upstream/fork 完整 SHA；
+- 通用 `agent/request-layout` seam、retry attempt 身份与 DSH 基线 contract tests；
 - Pair Ledger 与 Projection；
 - 两个顶层 DSH Agent；
 - TypeScript / Node.js 运行骨架与 Chat Completions route；
@@ -1368,7 +1449,9 @@ P2 完成代表 MVP 语义闭环完成，不代表生产就绪。Shared Checkpoi
 
 ### 15.1 DSH 兼容性
 
-DSH 处于 Developer Preview。所有 package、事件和 setup 行为都以固定 commit 为准；升级必须先跑 Pair Adapter contract tests，不能直接提升依赖版本。
+DSH 处于 Developer Preview。本文分析仍以页首固定快照为准；真正实现则按 4.2 在开发启动时重新选择最新可用且通过原生质量门禁的 commit，并立即锁定 upstream/fork 完整 SHA。此后所有 package、事件和 setup 行为都以该实现基线为准；升级必须作为独立变更运行 DSH 基线与 Pair Adapter contract tests，不能直接提升依赖版本。
+
+若启动审查时 DSH 仍无等价能力，MVP 对 fork 的唯一必要源码扩展是通用 `agent/request-layout` waterfall 和 retry `attempt` 身份。它必须保持默认 identity、不得包含 Pair 类型或 Pair Ledger 依赖，并以普通 Agent 请求、tool call/result、request-error retry、cancel 和 resume contract tests 证明无插件时行为不变。上游尚未发布该能力时在锁定 commit 的最小 fork 中维护，禁止复制整个 Agent Loop；验证完成后先通过 GitHub Discussions 提案，待贡献政策允许并获得维护者认可后再考虑 PR。
 
 ### 15.2 跨日志一致性
 
@@ -1400,9 +1483,11 @@ DSH 可以完整复用 Pair Agent 所需的大部分“单 Agent 执行能力”
 
 Pair Agent 必须新增的是“共同协作语义”和公共请求投影：Pair Session、Pair Ledger、Goal/Task Authority、双 Channel、Pair Context Builder、Local History Projector、cache-first Pair Request Builder、delivery 对账和跨 Session fencing。
 
+现有 `systemPrompt.context()`、`agent/pre-step` 和 `agent/request` 插件钩子不能在完整 `session.deriveMessages()` 产生后、最终请求冻结前重排全部 messages；LLM Adapter 再造请求又会破坏请求记录一致性。因此本 MVP 不把限制绕到 Adapter 或 Session 中，而是为 DSH 补充一个默认无行为变化的通用 request-layout 插件 seam。seam 合入后，所有 Pair 语义仍由 Pair Runtime 插件实现。
+
 因此 MVP 的合理定位是：
 
-> 不修改 DSH 的 Agent/Session 持久化内核，在两套独立 DSH Runtime 之上增加一个 TypeScript Pair Runtime；用 Pair Ledger 维护共同事实，用 DSH Session 维护各自真实执行历史，用本地 Request Builder 重建 Chat Completions 请求，不依赖模型供应商保存会话状态。
+> 不修改 DSH 的 Agent/Session 持久化内核，也不复制 Agent Loop；只在 DSH `buildRequest()` 中增加一个通用、默认 identity 的 `agent/request-layout` 插件 seam。Pair Runtime 以插件方式使用该 seam，在两套独立 DSH Runtime 之上维护 Pair Ledger、各自 DSH Session 和本地 Chat Completions Request Builder，不依赖模型供应商保存会话状态。
 
 ## 17. 源码参考
 
