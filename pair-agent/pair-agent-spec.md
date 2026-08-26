@@ -1,5 +1,7 @@
 # Pair Agent 模型技术设计参考
 
+![pair-agent](assets/pair-agent-16x9.png)
+
 > **性质：**学习与探索用技术设计，不是生产规范，也不提供真实实现、部署或迁移路径。
 >
 > **基础模型接口：**以 OpenAI Chat Completions API 为基准，同时给出 Responses API 适配方案。
