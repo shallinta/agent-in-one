@@ -1,0 +1,2282 @@
+From 7ebde0e88467701ae57071bc2eb08a1aab75359e Mon Sep 17 00:00:00 2001
+From: Pair Agent DSH Patch Applicator <pair-agent-dsh@example.invalid>
+Date: Thu, 27 Aug 2026 00:00:00 +0000
+Subject: [PATCH] feat(web): add addressed session boot
+
+---
+ .../tests/addressed-embedded-session.e2e.ts   | 378 ++++++++++++++++++
+ apps/web/tsconfig.json                        |   3 +-
+ packages/client/runtime/README.i18n.yaml      |   4 +-
+ packages/client/runtime/README.md             |  10 +
+ packages/client/runtime/README.zh.md          |  10 +
+ .../src/client/contract/sessions-port.ts      |   5 +
+ .../runtime/src/client/contract/sessions.ts   |   5 +
+ packages/client/runtime/src/client/index.ts   |  15 +-
+ .../runtime/src/client/sessions/manager.ts    |  64 ++-
+ .../runtime/src/client/sessions/service.ts    |  67 +++-
+ .../runtime/src/client/web-session-boot.ts    |  59 +++
+ .../runtime/src/client/workspaces/service.ts  |  10 +
+ .../tests/sessions-service.client.spec.ts     | 227 ++++++++++-
+ .../tests/web-boot-options.client.spec.ts     |  28 ++
+ .../tests/workspaces-service.client.spec.ts   |  46 +++
+ .../ui-conversation/src/client/apply.ts       |   2 +
+ .../src/client/chat/ChatView.tsx              |   5 +-
+ .../src/client/chat/TurnTailNodeView.tsx      |   2 +-
+ .../src/client/contract/slots.ts              |  12 +-
+ .../src/client/skeleton/ConversationRoot.tsx  |  47 ++-
+ .../tests/apply-inject.client.spec.tsx        |   2 +-
+ .../tests/chat-view.client.spec.tsx           |  11 +
+ .../tests/skeleton.client.spec.tsx            |  37 ++
+ packages/client/ui-layout/README.i18n.yaml    |   4 +-
+ packages/client/ui-layout/README.md           |   2 +
+ packages/client/ui-layout/README.zh.md        |   2 +
+ .../ui-layout/src/client/AppFrame.module.css  |   7 +
+ .../client/ui-layout/src/client/AppFrame.tsx  |  34 +-
+ packages/client/ui-layout/src/client/index.ts |   4 +-
+ .../ui-layout/tests/app-frame.client.spec.tsx |  63 ++-
+ .../ui-layout/tests/apply.client.spec.ts      |   7 +-
+ .../ui-sidebar/src/client/SidebarRoot.tsx     |   3 +
+ .../ui-sidebar/src/client/contract/slots.ts   |   2 +
+ .../client/ui-sidebar/src/client/index.ts     |   1 +
+ .../ui-sidebar/tests/apply.client.spec.tsx    |   3 +-
+ .../tests/pointer-scrollbars.client.spec.tsx  |   1 +
+ .../tests/sidebar-root.client.spec.tsx        |  19 +-
+ .../src/client/WorkspaceBrowser.tsx           |  20 +-
+ .../ui-workspace/src/client/contract/slots.ts |   2 +
+ .../client/ui-workspace/src/client/index.ts   |   1 +
+ .../ui-workspace/src/client/rows/Rows.tsx     |  28 +-
+ .../tests/workspace-browser.client.spec.tsx   |  14 +
+ .../src/client/slot-catalog.ts                |   2 +-
+ .../client-runtime/src/sessions.ts            |   4 +
+ tsconfig.host.json                            |   1 +
+ 45 files changed, 1196 insertions(+), 77 deletions(-)
+ create mode 100644 apps/web/tests/addressed-embedded-session.e2e.ts
+ create mode 100644 packages/client/runtime/src/client/web-session-boot.ts
+ create mode 100644 packages/client/runtime/tests/web-boot-options.client.spec.ts
+
+diff --git a/apps/web/tests/addressed-embedded-session.e2e.ts b/apps/web/tests/addressed-embedded-session.e2e.ts
+new file mode 100644
+index 0000000000..4cfb76590a
+--- /dev/null
++++ b/apps/web/tests/addressed-embedded-session.e2e.ts
+@@ -0,0 +1,378 @@
++// Generic addressed/embedded Web seam: two same-origin browsing contexts
++// share browser storage but boot independent Session runtimes, validate their
++// Host-listed roots before mounting the conversation, and never converge on
++// the global persisted-current key.
++import type { Browser, BrowserContext, Page } from 'playwright'
++import { chromium } from 'playwright'
++import { afterAll, beforeAll, describe, expect, it } from 'vitest'
++import { fileURLToPath } from 'node:url'
++import {
++  SESSION_FORMAT_VERSION, SessionId as sessionId, type SessionEvent,
++} from '@deepseek-ai/dsh-session'
++import { snapshotSubagentDescriptor } from '@deepseek-ai/dsh-subagent'
++import {
++  launchWebScaffold, seedBlankSession, watchConsole, type WebScaffold,
++} from './scaffold.ts'
++
++const FIRST_ROOT = 'addressed-first-root'
++const SECOND_ROOT = 'addressed-second-root'
++const SECOND_CHILD = 'addressed-second-child'
++const SECOND_CHILD_LABEL = 'addressed child'
++const BLANK_ROOT = 'addressed-blank-root'
++const BLANK_PROMPT = 'Use the bash tool to run exactly: echo WEB_E2E_OK. Then reply with the single word DONE and stop.'
++const BLANK_FIXTURE = fileURLToPath(new URL('./snapshots/fresh-round-trip/session.jsonl', import.meta.url))
++
++function addressedUrl(baseUrl: string, session: string, pane: string): string {
++  const query = new URLSearchParams({
++    embedded: '1',
++    session,
++    expectedSession: session,
++    pane,
++  })
++  return `${baseUrl}?${query.toString()}`
++}
++
++function addressedGlobalUrl(baseUrl: string, session: string): string {
++  const query = new URLSearchParams({ session, expectedSession: session })
++  return `${baseUrl}?${query.toString()}`
++}
++
++function captureHistoryTargets(page: Page): string[] {
++  const targets: string[] = []
++  page.on('request', (request) => {
++    const path = new URL(request.url()).pathname
++    if (path !== '/api/session.history' && path !== '/api/subagent.history') return
++    const envelope = request.postDataJSON() as {
++      payload?: { sessionId?: unknown; childSessionId?: unknown }
++    }
++    const target = path === '/api/session.history'
++      ? envelope.payload?.sessionId
++      : envelope.payload?.childSessionId
++    if (typeof target === 'string') targets.push(target)
++  })
++  return targets
++}
++
++function captureSessionMutationRequests(page: Page): string[] {
++  const methods: string[] = []
++  page.on('request', (request) => {
++    const path = new URL(request.url()).pathname
++    if (path === '/api/session.create' || path === '/api/session.fork') methods.push(path)
++  })
++  return methods
++}
++
++async function seedRootSession(scaffold: WebScaffold, id: string, prompt: string): Promise<void> {
++  const session = sessionId(id)
++  const createdAt = Date.now() - 60_000
++  await scaffold.ctx.sessionPersistence.create({
++    version: SESSION_FORMAT_VERSION,
++    id: session,
++    createdAt,
++    cwd: scaffold.workspaceCwd,
++    delegationDepth: 0,
++  })
++  await scaffold.ctx.sessionPersistence.append(session, [
++    {
++      type: 'turn/start', seq: 0, time: createdAt,
++      data: { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } },
++    },
++    {
++      type: 'user/message', seq: 1, time: createdAt + 1,
++      data: { content: [{ type: 'text', text: prompt }], source: { kind: 'user' } },
++      surfaceOp: 'append',
++    },
++    {
++      type: 'step/start', seq: 2, time: createdAt + 2,
++      data: { turn: 1, step: 1 },
++    },
++    {
++      type: 'assistant/message', seq: 3, time: createdAt + 3,
++      data: {
++        turn: 1,
++        step: 1,
++        message: {
++          id: '00000000-0000-4000-8000-000000000001',
++          role: 'assistant',
++          content: [{ type: 'text', text: 'Addressed root ready.' }],
++          source: { kind: 'model', provider: 'snapshot', model: 'snapshot-replier' },
++        },
++      },
++      sourceEventSeqs: [],
++      surfaceOp: 'append',
++    },
++    {
++      type: 'step/end', seq: 4, time: createdAt + 4,
++      data: { turn: 1, step: 1 },
++    },
++    {
++      type: 'session/title', seq: 5, time: createdAt + 5,
++      data: { title: prompt, messageSeqs: [1], source: { kind: 'fallback' } },
++    },
++    {
++      type: 'turn/end', seq: 6, time: createdAt + 6,
++      data: { turn: 1, reason: { kind: 'completed' } },
++    },
++  ] as SessionEvent[])
++  await scaffold.ctx.sessionProjectionCache.coldSnapshot(session)
++}
++
++describe('web e2e: addressed embedded Session boot', () => {
++  let scaffold: WebScaffold
++  let browser: Browser
++  let context: BrowserContext
++  let firstPage: Page
++  let secondPage: Page
++  let firstHistory: string[]
++  let secondHistory: string[]
++
++  beforeAll(async () => {
++    scaffold = await launchWebScaffold()
++    await seedRootSession(scaffold, FIRST_ROOT, 'Keep the first addressed root isolated.')
++    await seedRootSession(scaffold, SECOND_ROOT, 'Keep the second addressed root isolated.')
++    const childId = sessionId(SECOND_CHILD)
++    const createdAt = Date.now() - 30_000
++    await scaffold.ctx.sessionPersistence.create({
++      version: SESSION_FORMAT_VERSION,
++      id: childId,
++      createdAt,
++      cwd: scaffold.workspaceCwd,
++      parentSession: sessionId(SECOND_ROOT),
++      origin: 'subagent',
++      delegationDepth: 1,
++    })
++    await scaffold.ctx.sessionPersistence.append(childId, [
++      {
++        type: 'turn/start', seq: 0, time: createdAt,
++        data: { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } },
++      },
++      {
++        type: 'user/message', seq: 1, time: createdAt + 1,
++        data: {
++          content: [{ type: 'text', text: 'Inspect the addressed child.' }],
++          source: { kind: 'user' },
++        },
++        surfaceOp: 'append',
++      },
++      {
++        type: 'subagent/descriptor', seq: 2, time: createdAt + 2,
++        data: snapshotSubagentDescriptor({
++          mode: 'continuable', provider: 'spawn', label: SECOND_CHILD_LABEL,
++        }),
++      },
++      {
++        type: 'turn/end', seq: 3, time: createdAt + 3,
++        data: { turn: 1, reason: { kind: 'completed' } },
++      },
++    ] as SessionEvent[])
++    await scaffold.ctx.sessionProjectionCache.coldSnapshot(childId)
++    await expect(scaffold.ctx.subagents.listChildren(sessionId(SECOND_ROOT))).resolves.toMatchObject([
++      { kind: 'child', id: childId, mode: 'continuable', label: SECOND_CHILD_LABEL },
++    ])
++    browser = await chromium.launch()
++    context = await browser.newContext({ locale: 'en-US', viewport: { width: 1280, height: 900 } })
++    // Both pages see the same stale global cell. Addressed boot must not read
++    // or overwrite it; display labels are deliberately unrelated carrier data.
++    await context.addInitScript(() => {
++      localStorage.setItem('dsh.sessions.current', JSON.stringify({ sessionId: 'stale-global-root' }))
++    })
++    firstPage = await context.newPage()
++    secondPage = await context.newPage()
++    watchConsole(firstPage)
++    watchConsole(secondPage)
++    firstHistory = captureHistoryTargets(firstPage)
++    secondHistory = captureHistoryTargets(secondPage)
++    await Promise.all([
++      firstPage.goto(addressedUrl(scaffold.baseUrl, FIRST_ROOT, 'left'), { waitUntil: 'load' }),
++      secondPage.goto(addressedUrl(scaffold.baseUrl, SECOND_ROOT, 'right'), { waitUntil: 'load' }),
++    ])
++  }, 120_000)
++
++  afterAll(async () => {
++    const failures: unknown[] = []
++    await context?.close().catch((error: unknown) => failures.push(error))
++    await browser?.close().catch((error: unknown) => failures.push(error))
++    await scaffold?.close().catch((error: unknown) => failures.push(error))
++    if (failures.length === 1) throw failures[0]
++    if (failures.length > 1) throw new AggregateError(failures, 'addressed embedded teardown failed')
++  })
++
++  it('keeps two same-origin runtimes distinct across legal child navigation, return and refresh', async () => {
++    await Promise.all([
++      firstPage.locator('[data-embedded="true"]').waitFor({ timeout: 30_000 }),
++      secondPage.locator('[data-embedded="true"]').waitFor({ timeout: 30_000 }),
++    ])
++    expect(await firstPage.getByRole('tree', { name: 'Sessions' }).count()).toBe(0)
++    expect(await secondPage.getByRole('tree', { name: 'Sessions' }).count()).toBe(0)
++    await expect.poll(() => firstHistory.at(-1), { timeout: 30_000 }).toBe(FIRST_ROOT)
++    await expect.poll(() => secondHistory.at(-1), { timeout: 30_000 }).toBe(SECOND_ROOT)
++
++    const childCatalogTrigger = secondPage.getByRole('button', { name: '1 subagent' })
++    expect(
++      await childCatalogTrigger.count(),
++      await secondPage.locator('body').ariaSnapshot(),
++    ).toBe(1)
++    await childCatalogTrigger.focus()
++    await childCatalogTrigger.press('ArrowDown')
++    await secondPage.getByRole('treeitem', { name: new RegExp(SECOND_CHILD_LABEL) }).click()
++    await secondPage.getByText('Inspect the addressed child.', { exact: true }).waitFor({ timeout: 30_000 })
++    expect(secondHistory).toContain(SECOND_CHILD)
++    expect(firstHistory.at(-1)).toBe(FIRST_ROOT)
++
++    const hierarchy = secondPage.getByRole('navigation', { name: 'Session hierarchy' })
++    await hierarchy.getByRole('button').first().click()
++    await secondPage.locator('[data-conversation-scroll]')
++      .getByText('Keep the second addressed root isolated.', { exact: true })
++      .waitFor({ timeout: 30_000 })
++    expect(firstHistory.at(-1)).toBe(FIRST_ROOT)
++
++    const previousSecondHistory = secondHistory.length
++    await secondPage.reload({ waitUntil: 'load' })
++    await secondPage.locator('[data-embedded="true"]').waitFor({ timeout: 30_000 })
++    await expect.poll(() => secondHistory.length, { timeout: 30_000 }).toBeGreaterThan(previousSecondHistory)
++    expect(secondHistory.at(-1)).toBe(SECOND_ROOT)
++    expect(firstHistory.at(-1)).toBe(FIRST_ROOT)
++  })
++
++  it('fails closed before the Composer for invalid, mismatched and absent roots', async () => {
++    const invalid = await context.newPage()
++    const mismatch = await context.newPage()
++    const missing = await context.newPage()
++    try {
++      await invalid.goto(`${scaffold.baseUrl}?embedded=1`, { waitUntil: 'load' })
++      await invalid.getByText('embedded presentation requires session', { exact: false }).waitFor({ timeout: 30_000 })
++      expect(await invalid.locator('textarea').count()).toBe(0)
++
++      await mismatch.goto(
++        `${scaffold.baseUrl}?embedded=1&session=${FIRST_ROOT}&expectedSession=${SECOND_ROOT}`,
++        { waitUntil: 'load' },
++      )
++      await mismatch.getByText('session does not match expectedSession', { exact: false }).waitFor({ timeout: 30_000 })
++      expect(await mismatch.locator('textarea').count()).toBe(0)
++
++      await missing.goto(addressedUrl(scaffold.baseUrl, 'addressed-missing-root', 'ignored'), { waitUntil: 'load' })
++      await missing.locator('[data-addressed-session-gate="missing"]').waitFor({ timeout: 30_000 })
++      expect(await missing.locator('textarea').count()).toBe(0)
++    } finally {
++      await Promise.all([invalid.close(), mismatch.close(), missing.close()])
++    }
++  })
++
++  it('rejects a visible cross-root sidebar selection without changing the transcript or history target', async () => {
++    const page = await context.newPage()
++    const history = captureHistoryTargets(page)
++    try {
++      await page.goto(addressedGlobalUrl(scaffold.baseUrl, SECOND_ROOT), { waitUntil: 'load' })
++      const tree = page.getByRole('tree', { name: 'Sessions' })
++      await tree.waitFor({ timeout: 30_000 })
++      await expect.poll(() => history.at(-1), { timeout: 30_000 }).toBe(SECOND_ROOT)
++
++      const firstRow = tree.getByRole('treeitem').filter({ hasText: 'Keep the first addressed root isolated.' })
++      const secondRow = tree.getByRole('treeitem').filter({ hasText: 'Keep the second addressed root isolated.' })
++      const transcript = page.locator('[data-conversation-scroll]')
++      await transcript.getByText('Keep the second addressed root isolated.', { exact: true })
++        .waitFor({ timeout: 30_000 })
++      expect(await firstRow.getAttribute('aria-selected')).toBe('false')
++      expect(await secondRow.getAttribute('aria-selected')).toBe('true')
++      const historyBefore = [...history]
++
++      const rejection = page.waitForEvent('pageerror')
++      await firstRow.click()
++      expect(String(await rejection)).toContain(
++        `sessions.open: session ${FIRST_ROOT} is outside addressed root ${SECOND_ROOT}`,
++      )
++
++      expect(history).toEqual(historyBefore)
++      expect(await firstRow.getAttribute('aria-selected')).toBe('false')
++      expect(await secondRow.getAttribute('aria-selected')).toBe('true')
++      await transcript.getByText('Keep the second addressed root isolated.', { exact: true }).waitFor()
++      expect(await transcript.getByText('Keep the first addressed root isolated.', { exact: true }).count()).toBe(0)
++    } finally {
++      await page.close()
++    }
++  })
++
++  it('keeps fixed-root create and fork UI actions side-effect free in embedded and global presentations', async () => {
++    const embeddedMutations = captureSessionMutationRequests(secondPage)
++    const embeddedErrors: string[] = []
++    secondPage.on('pageerror', error => embeddedErrors.push(String(error)))
++    expect(await secondPage.getByRole('button', { name: 'Branch into a new conversation' }).count()).toBe(0)
++    expect(embeddedMutations).toEqual([])
++    expect(embeddedErrors).toEqual([])
++
++    const page = await context.newPage()
++    const mutations = captureSessionMutationRequests(page)
++    const pageErrors: string[] = []
++    page.on('pageerror', error => pageErrors.push(String(error)))
++    try {
++      await page.goto(addressedGlobalUrl(scaffold.baseUrl, SECOND_ROOT), { waitUntil: 'load' })
++      await page.getByRole('tree', { name: 'Sessions' }).waitFor({ timeout: 30_000 })
++      const newSessionButtons = page.getByRole('button', { name: 'New Session' })
++      expect(await newSessionButtons.count()).toBeGreaterThan(0)
++      for (let index = 0; index < await newSessionButtons.count(); index++) {
++        expect(await newSessionButtons.nth(index).isDisabled()).toBe(true)
++      }
++      expect(await page.getByRole('button', { name: 'Branch into a new conversation' }).count()).toBe(0)
++      await page.waitForTimeout(100)
++
++      expect(mutations).toEqual([])
++      expect(pageErrors).toEqual([])
++      await page.locator('[data-conversation-scroll]')
++        .getByText('Keep the second addressed root isolated.', { exact: true })
++        .waitFor({ timeout: 30_000 })
++    } finally {
++      await page.close()
++    }
++  })
++})
++
++describe('web e2e: blank addressed root is directly composable', () => {
++  let scaffold: WebScaffold
++  let browser: Browser
++  let context: BrowserContext
++  let page: Page
++
++  beforeAll(async () => {
++    scaffold = await launchWebScaffold({ replayFixture: BLANK_FIXTURE, paceMs: 1 })
++    await seedBlankSession(scaffold, BLANK_ROOT, scaffold.workspaceCwd)
++    browser = await chromium.launch()
++    context = await browser.newContext({ locale: 'en-US', viewport: { width: 1280, height: 900 } })
++    page = await context.newPage()
++    watchConsole(page)
++  }, 120_000)
++
++  afterAll(async () => {
++    const failures: unknown[] = []
++    await context?.close().catch((error: unknown) => failures.push(error))
++    await browser?.close().catch((error: unknown) => failures.push(error))
++    await scaffold?.close().catch((error: unknown) => failures.push(error))
++    if (failures.length === 1) throw failures[0]
++    if (failures.length > 1) throw new AggregateError(failures, 'blank addressed teardown failed')
++  })
++
++  it('does not offer Workspace mutation and sends through the fixed Session', async () => {
++    const mutations: string[] = []
++    page.on('request', (request) => {
++      const path = new URL(request.url()).pathname
++      if (
++        path === '/api/host.createDirectory'
++        || path === '/api/workspace.create'
++        || path === '/api/session.create'
++      ) mutations.push(path)
++    })
++
++    await page.goto(addressedUrl(scaffold.baseUrl, BLANK_ROOT, 'blank'), { waitUntil: 'load' })
++    await page.locator('[data-embedded="true"]').waitFor({ timeout: 30_000 })
++    expect(await page.getByRole('button', { name: 'Choose workspace' }).count()).toBe(0)
++
++    const composer = page.locator('textarea').first()
++    await composer.waitFor({ timeout: 30_000 })
++    expect(await composer.isEditable()).toBe(true)
++    const settled = scaffold.whenTurnSettled()
++    await composer.fill(BLANK_PROMPT)
++    await composer.press('Enter')
++    expect(await settled).toBe(sessionId(BLANK_ROOT))
++    await page.getByText('DONE', { exact: true }).waitFor({ timeout: 30_000 })
++    expect(mutations).toEqual([])
++  }, 120_000)
++})
+diff --git a/apps/web/tsconfig.json b/apps/web/tsconfig.json
+index 38a0438ef9..67fba3da8f 100644
+--- a/apps/web/tsconfig.json
++++ b/apps/web/tsconfig.json
+@@ -99,7 +99,8 @@
+     "tests/composer-tab-geometry.e2e.ts",
+     "tests/complex-history.perf.ts",
+     "tests/pwsh-terminal.e2e.ts",
+-    "tests/workflow-run.e2e.ts"
++    "tests/workflow-run.e2e.ts",
++    "tests/addressed-embedded-session.e2e.ts"
+   ],
+   "references": [
+     {
+diff --git a/packages/client/runtime/README.i18n.yaml b/packages/client/runtime/README.i18n.yaml
+index 81a36fe029..aee09f62f4 100644
+--- a/packages/client/runtime/README.i18n.yaml
++++ b/packages/client/runtime/README.i18n.yaml
+@@ -2,5 +2,5 @@
+ # side as of the last confirmed-consistent state. Both languages carry equal authority;
+ # after editing either side, bring the other along and re-record with:
+ #   pnpm run verify-translation-pairing --write packages/client/runtime/README.md
+-README.md: c1eb195ddd9996e0b65aecddf43eb6ae2cb6feee
+-README.zh.md: 654233af055017ea0f48123ca252d288880ab81d
++README.md: 596a406967a8a610d8f4d42de3a45c535cd1ca26
++README.zh.md: 1c47e4271902ae531bf43e712a5dffa0080af5e5
+diff --git a/packages/client/runtime/README.md b/packages/client/runtime/README.md
+index c1eb195ddd..596a406967 100644
+--- a/packages/client/runtime/README.md
++++ b/packages/client/runtime/README.md
+@@ -16,6 +16,16 @@ The callback returns one synchronous disposer or an iterable of disposers. A gen
+ 
+ ## Workspace and Session lists
+ 
++### Addressed Web boot
++
++The Web client accepts an opt-in generic addressed presentation through `?embedded=1&session=<root-session-id>`. Boot parameters are parsed before `SessionRuntime` is constructed, so an addressed runtime never restores or briefly projects the process-wide `dsh.sessions.current` selection. It uses an in-memory selection initialized to the requested root instead; the first successful Host `session.list` baseline must contain that exact root before the session-scoped shell can mount. A missing root therefore fails closed without falling back to another listed Session.
++
++`expectedSession` is an optional accidental-carrier-mismatch check: when present it must exactly equal `session`. It is not an authorization source. Repeated reserved parameters, empty or malformed ids, and embedded presentation without `session` reject Web boot. Addressed mode may also run with the ordinary global presentation by supplying `session` without `embedded=1`. Unrecognized display parameters are ignored and can never grant Session, tool, or Agent authority.
++
++Addressed navigation derives every switch from the current root-reachable Host catalog graph; visiting a child never creates durable authority. A successful `subagent.list` refresh is the membership baseline. While a later refresh is `loading`, its last-success entries remain the most recent Host-proven evidence and navigation may continue against that exact graph. A refresh error contributes no edges, and a successful refresh that removes or changes an edge immediately revokes that descendant and everything below it. The root-reachable graph must be structurally valid and acyclic; corrupt or cyclic evidence fails closed. `open()`, `openSubagent()`, return-to-root, automatic catalog refresh, and reload all apply the same rule, preventing stale descendants, siblings, and cross-root selection. Standard Web boot keeps the existing persisted-current and navigation behavior unchanged.
++
++An addressed runtime is also a generic fixed-root browser capability: `session.create`, `session.fork`, Workspace connect/create, and New Session flows fail before Host mutation. Presentation plugins disable or hide their create/fork controls, while the service guard remains the final side-effect fence. Existing root and catalog-proven subagent transcripts, details, continuation, and return navigation remain available.
++
+ Workspace and Session lists have independent monotone `pending` → `ready` baseline phases and separate refresh activity/error state. Incremental upsert/removal/order frames and unary mutation echoes arriving during a list request replay over its response. Every successful Workspace baseline re-establishes Host-durable Workspace order so reconnects adopt changes committed while this client was offline. `WorkspaceRuntime.insertBefore` installs an optimistic order immediately; only the latest unary echo may replace it, a newer Host order frame outranks an older echo, and a latest rejected request restores the last Host-confirmed order rather than an earlier uncommitted drag. Removed Workspace ids retain process-local tombstones so late changed frames cannot resurrect them. Workspace recency is derived only after both baselines are ready and never changes Workspace list order.
+ 
+ `SessionSummary.pendingInteraction` classifies the live user action blocking a Session as `approval`, `plan-review`, or `question`. `SessionManager` tracks answerable requested/resolved mux frames by their stable request identities even before a Session object is instantiated; pre-instantiation buffering retains every live request, replaces replay duplicates, and removes resolved requests so the list status always has a matching answerable `PendingWait` when the Session is opened. The first pending question takes presentation priority over concurrent approvals to match composer routing, while only a request that satisfies the plan-review composer's binary rendering constraints keeps the distinct `plan-review` status. The state is connection-generation scoped: disconnect clears it, and mux-open replay restores only requests that remain pending.
+diff --git a/packages/client/runtime/README.zh.md b/packages/client/runtime/README.zh.md
+index 654233af05..1c47e42719 100644
+--- a/packages/client/runtime/README.zh.md
++++ b/packages/client/runtime/README.zh.md
+@@ -18,6 +18,16 @@
+ 
+ ## Workspace 与 Session 列表
+ 
++### 定址 Web 启动
++
++Web 客户端通过 `?embedded=1&session=<root-session-id>` 接受一种可选的通用定址展示模式。启动参数会在构造 `SessionRuntime` 之前解析，因此定址 runtime 既不会恢复进程级 `dsh.sessions.current` 选择，也不会短暂投影它。该 runtime 改用以请求 root 初始化的内存选择；只有首个成功的 Host `session.list` 基线确实包含这个 root 后，才允许挂载会话作用域外壳。因此 root 缺失时会 fail closed，不会回退到其他已列出的 Session。
++
++`expectedSession` 是可选的意外载体不一致检查：一旦出现，就必须与 `session` 完全相等。它不是授权来源。保留参数重复、id 为空或格式非法，以及 embedded 展示缺少 `session`，都会拒绝 Web 启动。仅提供 `session` 而不提供 `embedded=1` 时，定址模式也可以搭配普通全局展示运行。未识别的展示参数会被忽略，绝不能授予 Session、tool 或 Agent 权限。
++
++定址导航的每次切换都从当前以 root 可达的 Host 目录图派生；访问过 child 并不会形成持久授权。一次成功的 `subagent.list` 刷新会建立成员关系基线。后续刷新处于 `loading` 时，其 last-success entries 仍是最近一次由 Host 证明的证据，导航可以继续严格使用这张图。刷新报错时，该目录不贡献任何边；成功刷新删除或改变一条边时，则立即撤销该后代及其下游的全部授权。root 可达图必须在结构上合法且无环；损坏或成环的证据会 fail closed。`open()`、`openSubagent()`、返回 root、自动目录刷新与重新加载都遵循同一规则，从而拒绝过期后代、sibling 与跨 root 选择。标准 Web 启动保持既有的持久 current 与导航行为不变。
++
++定址 runtime 还提供一种通用的 fixed-root 浏览器能力：`session.create`、`session.fork`、Workspace connect/create 与 New Session 流程都会在 Host 变更前失败。展示插件会禁用或隐藏 create/fork 控件，同时保留 service guard 作为最终副作用门禁。既有 root 与已由目录证明的 subagent transcript、details、continuation 和返回导航仍然可用。
++
+ Workspace 和 Session 列表各自具有单调的 `pending` → `ready` 基线阶段，也有各自的刷新活动／错误状态。列表请求期间到达的增量插入或更新／移除／顺序帧与一元变更回显会在其响应之上回放。每次成功的 Workspace 基线都会重新建立 Host 持久 Workspace 顺序，因此重连会接纳该客户端离线期间提交的变更。`WorkspaceRuntime.insertBefore` 会立即安装乐观顺序；只有最新一元回声可以替换它，更新的 Host 顺序帧优先于旧回声，而最新请求被拒时会恢复最近一次由 Host 确认的顺序，不会恢复更早且尚未提交的拖拽。已移除的 Workspace id 会保留进程本地删除标记，避免延迟到达的 changed 帧将其复活。Workspace 新近程度只在两条基线都 ready 后派生，且绝不改变 Workspace 列表顺序。
+ 
+ `SessionSummary.pendingInteraction` 将阻塞 Session 的实时用户操作分类为 `approval`、`plan-review` 或 `question`。`SessionManager` 依据稳定的请求标识跟踪可应答请求的 requested/resolved mux 帧，即使 `Session` 对象尚未实例化也不例外；实例化前的缓冲会保留每个仍有效的请求，替换回放产生的重复项，并移除已解决的请求，因此打开 Session 时，列表状态始终有一个对应的可应答 `PendingWait`。审批与问题并发时，第一个 pending 问题具有更高的呈现优先级，以匹配 composer 路由；只有满足 plan-review composer 二元呈现约束的请求才会保留独立的 `plan-review` 状态。该状态的作用域限定在连接代次内：断连时清除，mux 打开时的回放只恢复仍处于 pending 的请求。
+diff --git a/packages/client/runtime/src/client/contract/sessions-port.ts b/packages/client/runtime/src/client/contract/sessions-port.ts
+index 551c3a16ee..3b0e964c81 100644
+--- a/packages/client/runtime/src/client/contract/sessions-port.ts
++++ b/packages/client/runtime/src/client/contract/sessions-port.ts
+@@ -9,6 +9,7 @@
+ 
+ import type { SessionId, WorkspaceId } from '@deepseek-ai/dsh-api-remotes/client'
+ import type { ObservableSnapshot } from './store.ts'
++import type { WebSessionBoot } from '../web-session-boot.ts'
+ 
+ /** Session-list row facts sibling domains read: recency, blank-reuse eligibility, and its cwd canon. */
+ export interface SessionsPortSummary {
+@@ -29,6 +30,10 @@ export interface SessionsPortList {
+ 
+ /** The sessions-service face injected into sibling domains. */
+ export interface SessionsPort {
++  /** Immutable browser navigation policy parsed before the Sessions domain starts. */
++  readonly webSessionBoot: WebSessionBoot
++  /** True when this browser runtime is fixed to one addressed Session root. */
++  readonly fixedRoot: boolean
+   /** Observable list snapshot (read face only; writes stay inside the sessions domain). */
+   readonly list: ObservableSnapshot<SessionsPortList>
+   /**
+diff --git a/packages/client/runtime/src/client/contract/sessions.ts b/packages/client/runtime/src/client/contract/sessions.ts
+index 27b9d2d13b..221bf0a137 100644
+--- a/packages/client/runtime/src/client/contract/sessions.ts
++++ b/packages/client/runtime/src/client/contract/sessions.ts
+@@ -19,11 +19,16 @@ import type {
+ } from '../sessions/service.ts'
+ import type { SessionFace } from './session.ts'
+ import type { ObservableSnapshot } from './store.ts'
++import type { WebSessionBoot } from '../web-session-boot.ts'
+ 
+ export type { AgentContext } from '../agents/scope.ts'
+ 
+ /** The sessions-service face injected as `ctx.sessions`. */
+ export interface ISessions {
++  /** Immutable browser boot policy parsed before SessionRuntime construction. */
++  readonly webSessionBoot: WebSessionBoot
++  /** True when browser navigation is fixed to one addressed root and cannot create or fork Sessions. */
++  readonly fixedRoot: boolean
+   /** The useSessions standard feed (list rows + current selection; read face — writes stay inside the domain). */
+   readonly list: ObservableSnapshot<SessionListState>
+   /** Atomic current-session provide projection (the renderer host's `sessions.provideInfo` feed). */
+diff --git a/packages/client/runtime/src/client/index.ts b/packages/client/runtime/src/client/index.ts
+index 90a2b2f5f3..4fe6edea5c 100644
+--- a/packages/client/runtime/src/client/index.ts
++++ b/packages/client/runtime/src/client/index.ts
+@@ -15,6 +15,7 @@ import type { ConversationSnapshot } from './sessions/conversation.ts'
+ import type { UseProjection } from './sessions/projection-store.ts'
+ import { ConversationEventRegistry } from './conversation/event-registry.ts'
+ import { ConversationViewRegistry } from './conversation/view-registry.ts'
++import { parseWebSessionBoot } from './web-session-boot.ts'
+ 
+ export { isAppendSurfaceEvent, isReplacementSurfaceEvent } from '@deepseek-ai/dsh-session/surface'
+ 
+@@ -59,6 +60,7 @@ export type { IWorkspaces } from './contract/workspaces.ts'
+ export type {
+   SessionBinding, SessionListState, SessionProvideContribution, SessionProvideDescriptor, SessionSummary,
+ } from './sessions/service.ts'
++export type { AddressedSessionBoot, WebSessionBoot } from './web-session-boot.ts'
+ export type { SessionListPhase, SessionSearchResultItem, SubagentCatalogSnapshot } from './sessions/manager.ts'
+ export type { SubagentAddress, JobView } from '@deepseek-ai/dsh-client-connection/client'
+ export type { WorkspaceListPhase } from './workspaces/manager.ts'
+@@ -182,17 +184,28 @@ declare module '@deepseek-ai/cordis' {
+ /** Required services: the wire handle and Client Typert registry. */
+ export const inject = ['connection', 'typert', 'remote', 'remote.commands']
+ 
++/** Return the browser query while preserving non-DOM runtime/test baseline boot. */
++function browserLocationSearch(): string {
++  const location: unknown = Reflect.get(globalThis, 'location')
++  if (typeof location !== 'object' || location === null) return ''
++  const search: unknown = Reflect.get(location, 'search')
++  return typeof search === 'string' ? search : ''
++}
++
+ /** Mounts the browser runtime services and connection stream.
+  * @param ctx - Client Cordis context.
+  */
+ export function apply(ctx: Context): void {
++  // Parse before SessionRuntime construction: an invalid addressed carrier
++  // fails plugin boot before any current Session projection or Composer mount.
++  const webSessionBoot = parseWebSessionBoot(browserLocationSearch())
+   ctx.plugin(SlotRegistry)
+   const conversation = {
+     events: new ConversationEventRegistry(ctx),
+     views: new ConversationViewRegistry(ctx),
+   }
+   const connection = ctx.get('connection') as ConnectionHandle
+-  const sessions = new SessionRuntime(ctx, connection.api, ctx.remote, conversation)
++  const sessions = new SessionRuntime(ctx, connection.api, ctx.remote, conversation, webSessionBoot)
+   ctx.typert.contexts.registerClient('agent', {
+     identity: candidate => sessions.scopeOf(candidate),
+   })
+diff --git a/packages/client/runtime/src/client/sessions/manager.ts b/packages/client/runtime/src/client/sessions/manager.ts
+index 13aa20d1c8..7d4f7fd80f 100644
+--- a/packages/client/runtime/src/client/sessions/manager.ts
++++ b/packages/client/runtime/src/client/sessions/manager.ts
+@@ -208,11 +208,12 @@ export class SessionManager {
+   selectSubagent(address: SubagentAddress): void {
+     const catalog = this.catalogs.get(address.parentSessionId)
+     const entry = catalog?.entries.find(candidate => candidate.id === address.childSessionId)
+-    if (entry === undefined || entry.kind !== 'child' || entry.mode !== address.mode) {
++    if (catalog === undefined || catalog.state === 'error' || catalog.error !== null
++      || entry === undefined || entry.kind !== 'child' || entry.mode !== address.mode) {
+       throw new Error(`sessions.selectSubagent: ${address.childSessionId} is not a healthy catalog child`)
+     }
+     this.addresses.set(address.childSessionId, address)
+-    this.sessions.get(address.childSessionId)?.configureSubagent(address, catalog?.parentAvailable ?? false)
++    this.sessions.get(address.childSessionId)?.configureSubagent(address, catalog.parentAvailable)
+     this.selected = address.childSessionId
+     this.completedNotifications.delete(address.childSessionId)
+     void this.refreshSubagents(address.childSessionId)
+@@ -251,6 +252,65 @@ export class SessionManager {
+     return undefined
+   }
+ 
++  /**
++   * Resolve one session through the current Host-proven catalog graph.
++   * Ready catalogs and their last successful entries while a refresh is
++   * loading remain proof; an error snapshot contributes no edges. The whole
++   * root-reachable graph must be a structurally valid DAG before any route is
++   * returned, so retained addresses never become authorization.
++   * @param rootSessionId - fixed navigation root.
++   * @param targetSessionId - candidate root or descendant.
++   * @returns the exact direct-parent route, `undefined` when unreachable, or
++   *   `null` when the reachable catalog graph is corrupt/cyclic.
++   */
++  addressedRoute(
++    rootSessionId: SessionId,
++    targetSessionId: SessionId,
++  ): readonly SubagentAddress[] | undefined | null {
++    if (targetSessionId === rootSessionId) return []
++    const visiting = new Set<SessionId>()
++    const visited = new Set<SessionId>()
++    const predecessor = new Map<SessionId, SubagentAddress>()
++    const visit = (parentSessionId: SessionId): boolean => {
++      if (visited.has(parentSessionId)) return true
++      if (visiting.has(parentSessionId)) return false
++      visiting.add(parentSessionId)
++      const catalog = this.catalogs.get(parentSessionId)
++      if (catalog !== undefined && catalog.state !== 'error' && catalog.error === null) {
++        const directChildren = new Set<SessionId>()
++        for (const candidate of catalog.entries) {
++          if (candidate.kind !== 'child') continue
++          if (directChildren.has(candidate.id)) return false
++          directChildren.add(candidate.id)
++          const address: SubagentAddress = {
++            parentSessionId,
++            childSessionId: candidate.id,
++            mode: candidate.mode,
++          }
++          if (!predecessor.has(candidate.id)) predecessor.set(candidate.id, address)
++          if (!visit(candidate.id)) return false
++        }
++      }
++      visiting.delete(parentSessionId)
++      visited.add(parentSessionId)
++      return true
++    }
++    if (!visit(rootSessionId)) return null
++    if (!predecessor.has(targetSessionId)) return undefined
++    const reverse: SubagentAddress[] = []
++    const seen = new Set<SessionId>()
++    let cursor = targetSessionId
++    while (cursor !== rootSessionId) {
++      if (seen.has(cursor)) return null
++      seen.add(cursor)
++      const address = predecessor.get(cursor)
++      if (address === undefined) return undefined
++      reverse.push(address)
++      cursor = address.parentSessionId
++    }
++    return reverse.reverse()
++  }
++
+   // ---- Instance management ----
+ 
+   /**
+diff --git a/packages/client/runtime/src/client/sessions/service.ts b/packages/client/runtime/src/client/sessions/service.ts
+index c66da4e0d3..0f1d632250 100644
+--- a/packages/client/runtime/src/client/sessions/service.ts
++++ b/packages/client/runtime/src/client/sessions/service.ts
+@@ -37,6 +37,7 @@ import type { SessionListPhase, SessionSearchResultItem, SubagentCatalogSnapshot
+ import type { PendingInteractionStatus } from './pending.ts'
+ import { SessionProvideChannel } from './provide.ts'
+ import type { Session } from './session.ts'
++import type { WebSessionBoot } from '../web-session-boot.ts'
+ 
+ /** Session list row projected from the host list RPC plus live stream increments. */
+ export interface SessionSummary {
+@@ -227,6 +228,10 @@ export interface SessionProvideDescriptor {
+ 
+ /** Root sessions service: list store, current selection, object-layer manager, scope tree, bindings, and breadcrumb routes. */
+ export class SessionRuntime implements ISessions {
++  /** Immutable browser boot policy; Pane labels and unrelated query values never enter it. */
++  readonly webSessionBoot: WebSessionBoot
++  /** Generic fixed-root capability exposed to presentation and adjacent runtimes. */
++  readonly fixedRoot: boolean
+   /**
+    * The wire schema's own result bound, re-exposed for presentation plugins as
+    * injected data. Not per-connection state: the `session.search` response
+@@ -268,7 +273,6 @@ export class SessionRuntime implements ISessions {
+   private watched: SessionId | undefined
+   /** Removed-while-staged sessions whose teardown waits for the stage to move away. */
+   private readonly deferredRemovals = new Set<SessionId>()
+-
+   /**
+    * @param ctx - client root context (scope fibers mount under it).
+    * @param api - wire client shared with every Session.
+@@ -280,10 +284,14 @@ export class SessionRuntime implements ISessions {
+     api: IApiClient,
+     remote: SessionRemotes,
+     conversationRuntime?: ConversationRuntime,
++    webSessionBoot: WebSessionBoot = { embedded: false },
+   ) {
+-    this.selection = createSnapshotStore<SessionSelection>(
+-      {},
+-      { persist: { name: 'dsh.sessions.current' } })
++    this.webSessionBoot = webSessionBoot
++    const addressedRoot = webSessionBoot.addressed?.rootSessionId
++    this.fixedRoot = addressedRoot !== undefined
++    this.selection = addressedRoot === undefined
++      ? createSnapshotStore<SessionSelection>({}, { persist: { name: 'dsh.sessions.current' } })
++      : createSnapshotStore<SessionSelection>({ sessionId: addressedRoot })
+     const restored = this.selection.getSnapshot()
+     const conversationEvents = rootCtx.get('conversationEvents')
+     const conversationViews = rootCtx.get('conversationViews')
+@@ -370,6 +378,11 @@ export class SessionRuntime implements ISessions {
+    * @param id - listed or addressed session id.
+    */
+   open(id: SessionId): void {
++    const route = this.assertAddressedNavigation(id)
++    if (route !== undefined && route.length > 0) {
++      this.manager.selectSubagent(route[route.length - 1] as SubagentAddress)
++      return
++    }
+     this.manager.select(id)
+   }
+ 
+@@ -378,6 +391,20 @@ export class SessionRuntime implements ISessions {
+    * @param address - catalog-derived parent and child ids.
+    */
+   openSubagent(address: SubagentAddress): void {
++    const root = this.webSessionBoot.addressed?.rootSessionId
++    if (root !== undefined) {
++      const route = this.manager.addressedRoute(root, address.childSessionId)
++      if (route === null) {
++        throw new Error(`sessions.openSubagent: addressed catalog graph is not a valid DAG under root ${root}`)
++      }
++      const proven = route?.[route.length - 1]
++      if (proven === undefined
++        || proven.parentSessionId !== address.parentSessionId
++        || proven.childSessionId !== address.childSessionId
++        || proven.mode !== address.mode) {
++        throw new Error(`sessions.openSubagent: ${address.childSessionId} is not a current Host-proven catalog child under root ${root}`)
++      }
++    }
+     this.manager.selectSubagent(address)
+   }
+ 
+@@ -420,9 +447,29 @@ export class SessionRuntime implements ISessions {
+    * per the masked-gap contract until the next open() moves the stage.
+    */
+   clear(): void {
++    const root = this.webSessionBoot.addressed?.rootSessionId
++    if (root !== undefined) {
++      const snapshot = this.list.getSnapshot()
++      if (snapshot.ids.includes(root) && snapshot.current !== root) this.manager.select(root)
++      return
++    }
+     this.manager.clearSelection()
+   }
+ 
++  /** Resolve or reject every ordinary selection against the current Host-proven addressed graph. */
++  private assertAddressedNavigation(id: SessionId): readonly SubagentAddress[] | undefined {
++    const root = this.webSessionBoot.addressed?.rootSessionId
++    if (root === undefined) return undefined
++    const route = this.manager.addressedRoute(root, id)
++    if (route === null) {
++      throw new Error(`sessions.open: addressed catalog graph is not a valid DAG under root ${root}`)
++    }
++    if (route === undefined) {
++      throw new Error(`sessions.open: session ${id} is outside addressed root ${root}`)
++    }
++    return route
++  }
++
+   /**
+    * Refresh the real Session baseline, reusing an in-flight pull.
+    * @returns completion of the current or newly started baseline pull.
+@@ -483,6 +530,7 @@ export class SessionRuntime implements ISessions {
+    * @throws {SessionCreateError} with the requested id.
+    */
+   async create(opts: { workspaceId?: WorkspaceId; cwd?: string; sessionId?: SessionId } = {}): Promise<SessionId> {
++    if (this.fixedRoot) throw new Error('sessions.create: unavailable under a fixed addressed root')
+     const result = await this.manager.create(opts)
+     if (!result.ok) throw new SessionCreateError(result.error, opts.sessionId)
+     this.projectList()
+@@ -509,6 +557,7 @@ export class SessionRuntime implements ISessions {
+     atSeq?: number
+     increaseTitle?: boolean
+   }): Promise<SessionId> {
++    if (this.fixedRoot) throw new Error('sessions.fork: unavailable under a fixed addressed root')
+     const sourceTitle = opts.increaseTitle
+       ? this.list.getSnapshot().byId[opts.sessionId]?.title
+       : undefined
+@@ -661,6 +710,16 @@ export class SessionRuntime implements ISessions {
+     const {
+       items, current, phase, subagentsByParent, jobsBySession, currentAddress,
+     } = this.manager.getListSnapshot()
++    const addressedRoot = this.webSessionBoot.addressed?.rootSessionId
++    const currentRoute = addressedRoot === undefined || current === undefined || current === addressedRoot
++      ? []
++      : this.manager.addressedRoute(addressedRoot, current)
++    if (addressedRoot !== undefined && current !== undefined && current !== addressedRoot
++      && (currentRoute === undefined || currentRoute === null)
++      && items.some(item => item.sessionId === addressedRoot)) {
++      this.manager.select(addressedRoot)
++      return
++    }
+     const ids: SessionId[] = []
+     const byId: Record<SessionId, SessionSummary> = {}
+     for (const entry of items) {
+diff --git a/packages/client/runtime/src/client/web-session-boot.ts b/packages/client/runtime/src/client/web-session-boot.ts
+new file mode 100644
+index 0000000000..670848eaf4
+--- /dev/null
++++ b/packages/client/runtime/src/client/web-session-boot.ts
+@@ -0,0 +1,59 @@
++/** Generic URL-selected Web Session boot and embedded presentation options. */
++import type { SessionId } from '@deepseek-ai/dsh-api-remotes/client'
++
++/** A root Session whose existence must be proven by the Host list before UI activation. */
++export interface AddressedSessionBoot {
++  readonly rootSessionId: SessionId
++}
++
++/** Browser boot projection shared by the Session runtime and presentation shell. */
++export interface WebSessionBoot {
++  readonly embedded: boolean
++  readonly addressed?: AddressedSessionBoot
++}
++
++const RESERVED = ['embedded', 'session', 'expectedSession'] as const
++
++function single(params: URLSearchParams, name: typeof RESERVED[number]): string | undefined {
++  const values = params.getAll(name)
++  if (values.length > 1) throw new Error(`web session boot: duplicate ${name} parameter`)
++  return values[0]
++}
++
++function sessionId(value: string | undefined, name: string): SessionId | undefined {
++  if (value === undefined) return undefined
++  if (value.length === 0) throw new Error(`web session boot: ${name} must not be empty`)
++  if (value.length > 1024) throw new Error(`web session boot: ${name} is too long`)
++  if (/\p{Cc}/u.test(value)) throw new Error(`web session boot: ${name} must not contain control characters`)
++  return value as SessionId
++}
++
++/**
++ * Parse the generic Web boot query before SessionRuntime construction.
++ * `expectedSession` only catches accidental carrier mismatches; Host list
++ * membership and catalog lineage remain the navigation authorities.
++ * @param search - location search string, including or excluding the leading question mark.
++ * @returns validated boot options for the Session runtime and Web presentation.
++ */
++export function parseWebSessionBoot(search: string): WebSessionBoot {
++  const params = new URLSearchParams(search)
++  const embeddedValue = single(params, 'embedded')
++  if (embeddedValue !== undefined && embeddedValue !== '1') {
++    throw new Error('web session boot: embedded must be exactly "1"')
++  }
++  const rootSessionId = sessionId(single(params, 'session'), 'session')
++  const expectedSessionId = sessionId(single(params, 'expectedSession'), 'expectedSession')
++  if (expectedSessionId !== undefined && rootSessionId === undefined) {
++    throw new Error('web session boot: expectedSession requires session')
++  }
++  if (expectedSessionId !== undefined && expectedSessionId !== rootSessionId) {
++    throw new Error('web session boot: session does not match expectedSession')
++  }
++  if (embeddedValue === '1' && rootSessionId === undefined) {
++    throw new Error('web session boot: embedded presentation requires session')
++  }
++  return {
++    embedded: embeddedValue === '1',
++    ...(rootSessionId === undefined ? {} : { addressed: { rootSessionId } }),
++  }
++}
+diff --git a/packages/client/runtime/src/client/workspaces/service.ts b/packages/client/runtime/src/client/workspaces/service.ts
+index c23e3b3a6c..025b3a4dbf 100644
+--- a/packages/client/runtime/src/client/workspaces/service.ts
++++ b/packages/client/runtime/src/client/workspaces/service.ts
+@@ -87,6 +87,9 @@ export class WorkspaceRuntime implements IWorkspaces {
+    * @returns the reused or newly created session id.
+    */
+   async connectWorkspace(workspaceId: WorkspaceId): Promise<SessionId> {
++    if (this.sessions.fixedRoot) {
++      throw new Error('workspaces.connectWorkspace: unavailable under a fixed addressed root')
++    }
+     const workspace = this.list.getSnapshot().items.find(item => item.workspaceId === workspaceId)
+     if (workspace === undefined) throw new Error(`workspaces.connectWorkspace: unknown workspace ${workspaceId}`)
+     // Coalesce concurrent connects: a create's summary lands without cwd
+@@ -128,6 +131,9 @@ export class WorkspaceRuntime implements IWorkspaces {
+       throw new Error('workspaces.startInitialSelection: already started')
+     }
+     this.initialSelectionStarted = true
++    // An addressed browser owns its root selection. Workspace recency must
++    // neither mint a blank session nor race the Host validation of that root.
++    if (this.sessions.webSessionBoot.addressed !== undefined) return () => {}
+     let state: 'waiting' | 'connecting' | 'done' = 'waiting'
+     let disposed = false
+     const reconcile = (): void => {
+@@ -175,6 +181,7 @@ export class WorkspaceRuntime implements IWorkspaces {
+    * @param workspaceId - explicit target Workspace for scoped actions.
+    */
+   startSession(workspaceId?: WorkspaceId): void {
++    if (this.sessions.fixedRoot) return
+     const workspace = this.list.getSnapshot()
+     const current = this.sessions.list.getSnapshot().current
+     const currentWorkspaceId = current === undefined
+@@ -197,6 +204,9 @@ export class WorkspaceRuntime implements IWorkspaces {
+    * @returns the created or idempotently resolved Workspace.
+    */
+   async create(input: { path: string }): Promise<WorkspaceView> {
++    if (this.sessions.fixedRoot) {
++      throw new Error('workspaces.create: unavailable under a fixed addressed root')
++    }
+     const result = await this.manager.create(input)
+     if (!result.ok) throw new WorkspaceCreateError(result.error)
+     return result.value.workspace
+diff --git a/packages/client/runtime/tests/sessions-service.client.spec.ts b/packages/client/runtime/tests/sessions-service.client.spec.ts
+index b135b56ebe..b199bfb85c 100644
+--- a/packages/client/runtime/tests/sessions-service.client.spec.ts
++++ b/packages/client/runtime/tests/sessions-service.client.spec.ts
+@@ -10,6 +10,7 @@ import { Context } from '@deepseek-ai/cordis'
+ import { afterEach, describe, expect, it, vi } from 'vitest'
+ import type { SessionId } from '@deepseek-ai/dsh-api-remotes/client'
+ import { SessionCreateError, SessionRuntime, scopeOf } from '../src/client/sessions/service.ts'
++import type { WebSessionBoot } from '../src/client/web-session-boot.ts'
+ import { FakeApiClient, deferred, err, fakeRemote, ok } from './fake-api.client.ts'
+ 
+ const sid = (s: string): SessionId => s as SessionId
+@@ -20,10 +21,10 @@ interface Bench {
+   svc: SessionRuntime
+ }
+ 
+-function bench(): Bench {
++function bench(boot?: WebSessionBoot): Bench {
+   const ctx = new Context()
+   const api = new FakeApiClient()
+-  const svc = new SessionRuntime(ctx, api, fakeRemote())
++  const svc = new SessionRuntime(ctx, api, fakeRemote(), undefined, boot)
+   return { ctx, api, svc }
+ }
+ 
+@@ -352,6 +353,228 @@ describe('cell (render-layer session kit)', () => {
+   })
+ })
+ 
++describe('addressed embedded session boot', () => {
++  it('selects the addressed root on the first projection and ignores global persisted current', async () => {
++    const storage = new Map<string, string>([
++      ['dsh.sessions.current', JSON.stringify({ sessionId: 'stale-global' })],
++    ])
++    vi.stubGlobal('localStorage', {
++      getItem: (key: string) => storage.get(key) ?? null,
++      setItem: (key: string, value: string) => { storage.set(key, value) },
++    })
++    const b = bench({ embedded: true, addressed: { rootSessionId: sid('root-a') } })
++
++    expect(b.svc.list.getSnapshot().current).toBeUndefined()
++    await feedList(b, [{ id: 'stale-global' }, { id: 'root-a' }])
++
++    expect(b.svc.list.getSnapshot().current).toBe('root-a')
++    expect(storage.get('dsh.sessions.current')).toContain('stale-global')
++  })
++
++  it('keeps two addressed runtimes fixed to different roots and fences navigation to catalog-proven descendants', async () => {
++    const first = bench({ embedded: true, addressed: { rootSessionId: sid('first-root') } })
++    const second = bench({ embedded: true, addressed: { rootSessionId: sid('second-root') } })
++    const rows = [
++      { id: 'first-root' },
++      { id: 'second-root' },
++      { id: 'other-root' },
++    ]
++    await feedList(first, rows)
++    await feedList(second, rows)
++    expect(first.svc.list.getSnapshot().current).toBe('first-root')
++    expect(second.svc.list.getSnapshot().current).toBe('second-root')
++
++    expect(() => { second.svc.open(sid('first-root')) }).toThrow(/outside addressed root/)
++    expect(() => { first.svc.open(sid('other-root')) }).toThrow(/outside addressed root/)
++    second.svc.clear()
++    expect(second.svc.list.getSnapshot().current).toBe('second-root')
++
++    second.api.onSubagentList = (payload) => {
++      const parentSessionId = (payload as { parentSessionId: SessionId }).parentSessionId
++      return Promise.resolve(ok({
++        parentAvailable: true,
++        entries: parentSessionId === sid('second-root')
++          ? [{ kind: 'child' as const, id: sid('second-child'), mode: 'continuable' as const, activity: 'inactive' as const, hasChildren: false }]
++          : parentSessionId === sid('second-child')
++            ? [{ kind: 'child' as const, id: sid('second-grandchild'), mode: 'continuable' as const, activity: 'inactive' as const, hasChildren: false }]
++            : [],
++      }) as never)
++    }
++    await second.svc.refreshSubagents(sid('second-root'))
++    second.svc.openSubagent({
++      parentSessionId: sid('second-root'), childSessionId: sid('second-child'), mode: 'continuable',
++    })
++    expect(second.svc.list.getSnapshot().current).toBe('second-child')
++    expect(first.svc.list.getSnapshot().current).toBe('first-root')
++
++    await second.svc.refreshSubagents(sid('second-child'))
++    second.svc.openSubagent({
++      parentSessionId: sid('second-child'), childSessionId: sid('second-grandchild'), mode: 'continuable',
++    })
++    expect(second.svc.list.getSnapshot().current).toBe('second-grandchild')
++    expect(first.svc.list.getSnapshot().current).toBe('first-root')
++
++    second.svc.clear()
++    expect(second.svc.list.getSnapshot().current).toBe('second-root')
++
++    second.svc.open(sid('second-root'))
++    expect(second.svc.list.getSnapshot().current).toBe('second-root')
++    expect(() => {
++      second.svc.openSubagent({
++        parentSessionId: sid('first-root'), childSessionId: sid('forged-child'), mode: 'continuable',
++      })
++    }).toThrow(/not a current Host-proven catalog child/)
++
++    expect(() => {
++      second.svc.openSubagent({
++        parentSessionId: sid('second-root'), childSessionId: sid('forged-child'), mode: 'continuable',
++      })
++    }).toThrow(/not a current Host-proven catalog child/)
++    expect(() => { second.svc.open(sid('forged-child')) }).toThrow(/outside addressed root/)
++
++    const reloadedSecond = bench({ embedded: true, addressed: { rootSessionId: sid('second-root') } })
++    await feedList(reloadedSecond, rows)
++    expect(reloadedSecond.svc.list.getSnapshot().current).toBe('second-root')
++    expect(first.svc.list.getSnapshot().current).toBe('first-root')
++  })
++
++  it('revokes visited descendants when the current Host catalog removes or errors their edge', async () => {
++    const b = bench({ embedded: true, addressed: { rootSessionId: sid('root') } })
++    await feedList(b, [{ id: 'root' }])
++    let rootEntries: never[] = [{
++      kind: 'child', id: sid('child'), mode: 'continuable', activity: 'inactive', hasChildren: true,
++    }] as never[]
++    let rootError = false
++    b.api.onSubagentList = (payload) => {
++      const { parentSessionId } = payload as { parentSessionId: SessionId }
++      if (parentSessionId === sid('root') && rootError) {
++        return Promise.resolve(err({ code: 'internal', message: 'catalog failed', details: {} }))
++      }
++      return Promise.resolve(ok({
++        parentAvailable: true,
++        entries: parentSessionId === sid('root') ? rootEntries : [],
++      }) as never)
++    }
++
++    await b.svc.refreshSubagents(sid('root'))
++    b.svc.openSubagent({
++      parentSessionId: sid('root'), childSessionId: sid('child'), mode: 'continuable',
++    })
++    expect(b.svc.list.getSnapshot().current).toBe('child')
++
++    rootEntries = []
++    await b.svc.refreshSubagents(sid('root'))
++    expect(b.svc.list.getSnapshot().current).toBe('root')
++    expect(() => { b.svc.open(sid('child')) }).toThrow(/outside addressed root/)
++    expect(() => {
++      b.svc.openSubagent({
++        parentSessionId: sid('root'), childSessionId: sid('child'), mode: 'continuable',
++      })
++    }).toThrow(/not a current Host-proven catalog child/)
++
++    await b.svc.refreshSubagents(sid('root'))
++    rootEntries = [{
++      kind: 'child', id: sid('child'), mode: 'continuable', activity: 'inactive', hasChildren: false,
++    }] as never[]
++    await b.svc.refreshSubagents(sid('root'))
++    b.svc.openSubagent({
++      parentSessionId: sid('root'), childSessionId: sid('child'), mode: 'continuable',
++    })
++    b.svc.clear()
++    await b.svc.refreshSubagents(sid('root'))
++    rootError = true
++    await b.svc.refreshSubagents(sid('root'))
++    expect(() => { b.svc.open(sid('child')) }).toThrow(/outside addressed root/)
++  })
++
++  it('uses the last-success Host graph while refresh is loading, then applies the settled removal', async () => {
++    const b = bench({ embedded: true, addressed: { rootSessionId: sid('root') } })
++    await feedList(b, [{ id: 'root' }])
++    b.api.onSubagentList = () => Promise.resolve(ok({
++      parentAvailable: true,
++      entries: [{
++        kind: 'child', id: sid('child'), mode: 'continuable', activity: 'inactive', hasChildren: false,
++      }] as never[],
++    }))
++    await b.svc.refreshSubagents(sid('root'))
++
++    const gate = deferred<Awaited<ReturnType<FakeApiClient['onSubagentList']>>>()
++    b.api.onSubagentList = () => gate.promise
++    const refresh = b.svc.refreshSubagents(sid('root'))
++    await Promise.resolve()
++    expect(b.svc.list.getSnapshot().subagentsByParent[sid('root')]?.state).toBe('loading')
++    b.svc.open(sid('child'))
++    expect(b.svc.list.getSnapshot().current).toBe('child')
++
++    gate.resolve(ok({ entries: [], parentAvailable: true }))
++    await refresh
++    await Promise.resolve()
++    expect(b.svc.list.getSnapshot().current).toBe('root')
++    expect(() => { b.svc.open(sid('child')) }).toThrow(/outside addressed root/)
++  })
++
++  it('revokes a grandchild when an ancestor edge changes and rejects cyclic catalog authority', async () => {
++    const b = bench({ embedded: true, addressed: { rootSessionId: sid('root') } })
++    await feedList(b, [{ id: 'root' }])
++    let rootEntries: never[] = [{
++      kind: 'child', id: sid('child'), mode: 'continuable', activity: 'inactive', hasChildren: true,
++    }] as never[]
++    let childEntries: never[] = [{
++      kind: 'child', id: sid('grandchild'), mode: 'continuable', activity: 'inactive', hasChildren: false,
++    }] as never[]
++    b.api.onSubagentList = (payload) => {
++      const { parentSessionId } = payload as { parentSessionId: SessionId }
++      return Promise.resolve(ok({
++        parentAvailable: true,
++        entries: parentSessionId === sid('root')
++          ? rootEntries
++          : parentSessionId === sid('child') ? childEntries : [],
++      }) as never)
++    }
++    await b.svc.refreshSubagents(sid('root'))
++    await b.svc.refreshSubagents(sid('child'))
++    b.svc.openSubagent({
++      parentSessionId: sid('child'), childSessionId: sid('grandchild'), mode: 'continuable',
++    })
++    b.svc.clear()
++    await b.svc.refreshSubagents(sid('root'))
++
++    rootEntries = []
++    await b.svc.refreshSubagents(sid('root'))
++    expect(() => { b.svc.open(sid('grandchild')) }).toThrow(/outside addressed root/)
++
++    rootEntries = [{
++      kind: 'child', id: sid('child'), mode: 'continuable', activity: 'inactive', hasChildren: true,
++    }] as never[]
++    childEntries = [{
++      kind: 'child', id: sid('root'), mode: 'continuable', activity: 'inactive', hasChildren: true,
++    }] as never[]
++    await b.svc.refreshSubagents(sid('root'))
++    await b.svc.refreshSubagents(sid('child'))
++    expect(() => {
++      b.svc.openSubagent({
++        parentSessionId: sid('root'), childSessionId: sid('child'), mode: 'continuable',
++      })
++    }).toThrow(/catalog graph is not a valid DAG/)
++  })
++
++  it.each([true, false])('rejects create and fork before Host RPC in addressed mode (embedded=%s)', async (embedded) => {
++    const b = bench({ embedded, addressed: { rootSessionId: sid('root') } })
++    await feedList(b, [{ id: 'root' }])
++
++    await expect(b.svc.create({ cwd: '/forbidden' })).rejects.toThrow(/fixed addressed root/)
++    await expect(b.svc.fork({ sessionId: sid('root') })).rejects.toThrow(/fixed addressed root/)
++    expect(b.api.callsOf('session.create')).toEqual([])
++    expect(b.api.callsOf('session.fork')).toEqual([])
++  })
++
++  it('fails closed when the addressed root is absent instead of selecting another session', async () => {
++    const b = bench({ embedded: true, addressed: { rootSessionId: sid('missing-root') } })
++    await feedList(b, [{ id: 'other-root' }])
++    expect(b.svc.list.getSnapshot()).toMatchObject({ current: undefined, phase: 'ready' })
++  })
++})
++
+ describe('slot-store scope prune hook', () => {
+   it('notifies ctx.slots.pruneStoreScope when a scope dies (both teardown paths)', async () => {
+     const b = bench()
+diff --git a/packages/client/runtime/tests/web-boot-options.client.spec.ts b/packages/client/runtime/tests/web-boot-options.client.spec.ts
+new file mode 100644
+index 0000000000..e0ae212360
+--- /dev/null
++++ b/packages/client/runtime/tests/web-boot-options.client.spec.ts
+@@ -0,0 +1,28 @@
++import { describe, expect, it } from 'vitest'
++import { parseWebSessionBoot } from '../src/client/web-session-boot.ts'
++
++describe('parseWebSessionBoot', () => {
++  it('preserves the standard baseline when no boot options are present', () => {
++    expect(parseWebSessionBoot('')).toEqual({ embedded: false })
++  })
++
++  it('parses an addressed embedded root without trusting pane labels', () => {
++    expect(parseWebSessionBoot('?embedded=1&session=root-a&expectedSession=root-a&pane=right')).toEqual({
++      embedded: true,
++      addressed: { rootSessionId: 'root-a' },
++    })
++  })
++
++  it.each([
++    ['?embedded=true', /embedded/],
++    ['?embedded=1', /requires session/],
++    ['?session=', /session/],
++    ['?expectedSession=root-a', /expectedSession/],
++    ['?session=root-a&expectedSession=root-b', /does not match/],
++    ['?session=root-a&session=root-b', /duplicate/],
++    ['?embedded=1&embedded=1&session=root-a', /duplicate/],
++    ['?session=root%00a', /control/],
++  ])('rejects malformed or contradictory boot input: %s', (search, error) => {
++    expect(() => parseWebSessionBoot(search)).toThrow(error)
++  })
++})
+diff --git a/packages/client/runtime/tests/workspaces-service.client.spec.ts b/packages/client/runtime/tests/workspaces-service.client.spec.ts
+index cfdfa98e9b..45eb641c02 100644
+--- a/packages/client/runtime/tests/workspaces-service.client.spec.ts
++++ b/packages/client/runtime/tests/workspaces-service.client.spec.ts
+@@ -549,6 +549,52 @@ describe('startInitialSelection', () => {
+     stop()
+   })
+ 
++  it('does not create or select a recent Workspace session under addressed boot', async () => {
++    const ctx = new Context()
++    const api = new FakeApiClient()
++    const sessions = new SessionRuntime(
++      ctx,
++      api,
++      fakeRemote(),
++      undefined,
++      { embedded: true, addressed: { rootSessionId: sid('fixed-root') } },
++    )
++    const workspaces = new WorkspaceRuntime(ctx, api, sessions)
++    const stop = workspaces.startInitialSelection()
++    api.onWorkspaceList = () => Promise.resolve(ok({
++      items: [workspace('recent', [], '2026-01-02T00:00:00.000Z')] as never[],
++    }))
++    await workspaces.refresh()
++    await sessions.refresh()
++    await new Promise(resolve => setTimeout(resolve, 0))
++
++    expect(api.callsOf('session.create')).toHaveLength(0)
++    expect(sessions.list.getSnapshot().current).toBeUndefined()
++    stop()
++  })
++
++  it.each([true, false])('rejects addressed Workspace connect/create and makes New Session inert before Host mutation (embedded=%s)', async (embedded) => {
++    const ctx = new Context()
++    const api = new FakeApiClient()
++    const sessions = new SessionRuntime(
++      ctx,
++      api,
++      fakeRemote(),
++      undefined,
++      { embedded, addressed: { rootSessionId: sid('fixed-root') } },
++    )
++    const workspaces = new WorkspaceRuntime(ctx, api, sessions)
++    api.onWorkspaceList = () => Promise.resolve(ok({ items: [workspace('target')] as never[] }))
++    await workspaces.refresh()
++
++    await expect(workspaces.connectWorkspace(wid('target'))).rejects.toThrow(/fixed addressed root/)
++    workspaces.startSession(wid('target'))
++    await Promise.resolve()
++    await expect(workspaces.create({ path: '/w/new' })).rejects.toThrow(/fixed addressed root/)
++    expect(api.callsOf('session.create')).toEqual([])
++    expect(api.callsOf('workspace.create')).toEqual([])
++  })
++
+   it('stays idle when a session is already current or no recent Workspace exists', async () => {
+     const withCurrent = bench()
+     withCurrent.api.onList = () => Promise.resolve(ok({
+diff --git a/packages/client/ui-conversation/src/client/apply.ts b/packages/client/ui-conversation/src/client/apply.ts
+index 7920104d68..8f18e1de54 100644
+--- a/packages/client/ui-conversation/src/client/apply.ts
++++ b/packages/client/ui-conversation/src/client/apply.ts
+@@ -212,6 +212,7 @@ export function apply(ctx: Context): void {
+     },
+     inject: (sessionId: SessionId | undefined): ConversationInjected => ({
+       hooks: { composerBlock: sessionId === undefined ? ABSENT_BLOCK : composerBlocks.storeFor(sessionId) },
++      sessionMutationEnabled: !sessions.fixedRoot,
+       selectWorkspace: async (workspaceId) => {
+         const nextId = await workspaces.connectWorkspace(workspaceId)
+         if (sessionId !== undefined && nextId !== sessionId) {
+@@ -392,6 +393,7 @@ export function apply(ctx: Context): void {
+       const conversation = concreteConversation(ctx)
+       const scoped = scopedConversation(sessions, sessionId)
+       return {
++        sessionMutationEnabled: !sessions.fixedRoot,
+         openDetails: (target) => {
+           actions.select(target)
+           layout.openDetails()
+diff --git a/packages/client/ui-conversation/src/client/chat/ChatView.tsx b/packages/client/ui-conversation/src/client/chat/ChatView.tsx
+index 80f9bc2d73..2a3df6b7de 100644
+--- a/packages/client/ui-conversation/src/client/chat/ChatView.tsx
++++ b/packages/client/ui-conversation/src/client/chat/ChatView.tsx
+@@ -156,7 +156,8 @@ function TurnStatus({ startTime, t }: {
+  * ordered business Node crosses the keyed renderer seat.
+  */
+ export function ChatView({
+-  useSession, useSessions, useStore, renderSlot, sessionId, openFile, loadOlder, loadImage, inspectCall, chatScroll, forkAt,
++  useSession, useSessions, useStore, renderSlot, sessionId, openFile, loadOlder, loadImage, inspectCall, chatScroll,
++  sessionMutationEnabled, forkAt,
+   fileMentions, t,
+ }: ChatViewSlotProps) {
+   const order = useSession(s => s.chat.order)
+@@ -438,7 +439,7 @@ export function ChatView({
+               cwd={cwd}
+               openFile={requestOpenFile}
+               inspectCall={inspectCall}
+-              forkAt={forkAt}
++              forkAt={sessionMutationEnabled ? forkAt : undefined}
+               renderMessageImages={renderMessageImages}
+               fileMentions={fileMentions}
+               renderSlot={renderSlot}
+diff --git a/packages/client/ui-conversation/src/client/chat/TurnTailNodeView.tsx b/packages/client/ui-conversation/src/client/chat/TurnTailNodeView.tsx
+index d4d27570f9..56541fd277 100644
+--- a/packages/client/ui-conversation/src/client/chat/TurnTailNodeView.tsx
++++ b/packages/client/ui-conversation/src/client/chat/TurnTailNodeView.tsx
+@@ -42,7 +42,7 @@ export const TurnTailNodeView = memo(function TurnTailNodeView({
+         ttftMs={data.ttftMs}
+         tokensPerSecond={data.tokensPerSecond}
+         clock="end"
+-        onBranch={() => { forkAt(closing.finalNode.seq) }}
++        onBranch={forkAt === undefined ? undefined : () => { forkAt(closing.finalNode.seq) }}
+         branchUnavailable={data.branchUnavailable || hasLaterChatNode}
+         className={css.actions}
+         extraActions={assistantActions}
+diff --git a/packages/client/ui-conversation/src/client/contract/slots.ts b/packages/client/ui-conversation/src/client/contract/slots.ts
+index 307ac38482..47c20b9a7b 100644
+--- a/packages/client/ui-conversation/src/client/contract/slots.ts
++++ b/packages/client/ui-conversation/src/client/contract/slots.ts
+@@ -420,7 +420,7 @@ export interface ChatNodeOwnerProps {
+   cwd?: string | undefined
+   openFile: (path: string) => void
+   inspectCall: (callId: CallId) => void
+-  forkAt: (seq: number) => void
++  forkAt?: ((seq: number) => void) | undefined
+   /** Render a historical image group through the attachment slot. */
+   renderMessageImages: RenderMessageImages
+   fileMentions: (owner: TurnTailOwnerProps) => MarkdownFileMentions | undefined
+@@ -471,6 +471,12 @@ export type ChatStore = ReturnType<typeof createChatStore>
+ 
+ /** Business callbacks injected into the conversation slot. */
+ export interface ConversationInjected {
++  /**
++   * Whether this presentation may replace the current Session by selecting a
++   * Workspace. Addressed roots are immutable conversation targets: an
++   * existing root remains composable even when no Workspace owns it.
++   */
++  sessionMutationEnabled: boolean
+   /**
+    * Connect the selected Workspace and open its reusable/new blank session.
+    * When a blank session is already current, carry its draft to the target.
+@@ -748,6 +754,8 @@ export interface ChatScrollPosition {
+  * outside the view (layout orchestration; the session object layer).
+  */
+ export interface ChatViewInjected {
++  /** Whether transcript branch affordances may fork this Session. */
++  sessionMutationEnabled: boolean
+   /** Selection write + details panel opening in one gesture (store action + layout orchestration). */
+   openDetails: (target: SelectionTarget) => void
+   /**
+@@ -774,7 +782,7 @@ export interface ChatViewInjected {
+     read: () => ChatScrollPosition | null
+   }
+   /** Fork through the completed turn ending at the eligible message `seq`, then open the child. */
+-  forkAt: (seq: number) => void
++  forkAt?: ((seq: number) => void) | undefined
+   /**
+    * Prose file-mention vocabulary for one closing message, from the optional
+    * {@link ChatFileMentions} service (resolved lazily per call, so composing
+diff --git a/packages/client/ui-conversation/src/client/skeleton/ConversationRoot.tsx b/packages/client/ui-conversation/src/client/skeleton/ConversationRoot.tsx
+index 07655d7dba..de6c6e4039 100644
+--- a/packages/client/ui-conversation/src/client/skeleton/ConversationRoot.tsx
++++ b/packages/client/ui-conversation/src/client/skeleton/ConversationRoot.tsx
+@@ -14,7 +14,7 @@ export type ConversationRootProps = ConversationSlotProps
+ 
+ export function ConversationRoot({
+   sessionId, useSession, useSessions, useWorkspaces, useInput, useComposerBlock,
+-  renderSlot, renderSlotChain, selectWorkspace, t,
++  renderSlot, renderSlotChain, sessionMutationEnabled, selectWorkspace, t,
+ }: ConversationRootProps) {
+   const openState = useSession(s => s.openState)
+   const composerPhase = useSession(s => s.composerPhase)
+@@ -99,26 +99,28 @@ export function ConversationRoot({
+ 
+   const heroWorkspaceRow = (
+     <div className={css.heroWorkspaceRow}>
+-      <WorkspaceChip
+-        buttonRef={pickerAnchor}
+-        label={chipTitle}
+-        menuOpen={pickerOpen}
+-        onClick={() => { setPickerOpen(open => !open) }}
+-        t={t}
+-      />
+-      {renderSlot('conversation.hero.workspace', {
+-        open: pickerOpen,
+-        anchorRef: pickerAnchor,
+-        selectedId: pendingWorkspaceId ?? sessionWorkspace?.workspaceId,
+-        onPick: (workspaceId) => {
+-          setPickerOpen(false)
+-          setPendingWorkspaceId(workspaceId)
+-          void selectWorkspace(workspaceId).catch(() => {
+-            setPendingWorkspaceId(current => current === workspaceId ? undefined : current)
+-          })
+-        },
+-        onClose: () => { setPickerOpen(false) },
+-      })}
++      {sessionMutationEnabled && <>
++        <WorkspaceChip
++          buttonRef={pickerAnchor}
++          label={chipTitle}
++          menuOpen={pickerOpen}
++          onClick={() => { setPickerOpen(open => !open) }}
++          t={t}
++        />
++        {renderSlot('conversation.hero.workspace', {
++          open: pickerOpen,
++          anchorRef: pickerAnchor,
++          selectedId: pendingWorkspaceId ?? sessionWorkspace?.workspaceId,
++          onPick: (workspaceId) => {
++            setPickerOpen(false)
++            setPendingWorkspaceId(workspaceId)
++            void selectWorkspace(workspaceId).catch(() => {
++              setPendingWorkspaceId(current => current === workspaceId ? undefined : current)
++            })
++          },
++          onClose: () => { setPickerOpen(false) },
++        })}
++      </>}
+       {renderSlot('conversation.hero.agentPreset', {})}
+     </div>
+   )
+@@ -128,7 +130,8 @@ export function ConversationRoot({
+   // blank session whose workspace vanished (deleted from the sidebar). The
+   // bar is ONE session-maybe slot rendered unconditionally — inert is a prop,
+   // not a different tree, so the textarea DOM survives the transition.
+-  const inert = sessionId === undefined || (hero && chipTitle === undefined)
++  const inert = sessionId === undefined
++    || (sessionMutationEnabled && hero && chipTitle === undefined)
+   // A raised block is the same inert posture with the blocker's own reason:
+   // one disabled textarea, never a second tree. The no-workspace state wins
+   // when both hold — picking a workspace is the earlier prerequisite.
+diff --git a/packages/client/ui-conversation/tests/apply-inject.client.spec.tsx b/packages/client/ui-conversation/tests/apply-inject.client.spec.tsx
+index 1f61399fda..632fa90790 100644
+--- a/packages/client/ui-conversation/tests/apply-inject.client.spec.tsx
++++ b/packages/client/ui-conversation/tests/apply-inject.client.spec.tsx
+@@ -140,7 +140,7 @@ describe('conversation slot inject API', () => {
+     const chatView = b.chatViewApi(ROOT)
+     chatView.injected.loadOlder()
+     expect(b.sessionFake.loadOlder).toHaveBeenCalledTimes(1)
+-    chatView.injected.forkAt(17)
++    chatView.injected.forkAt?.(17)
+     await vi.waitFor(() => {
+       expect(b.runtime.sessions.calls).toContainEqual({ method: 'open', args: [ROOT] })
+     })
+diff --git a/packages/client/ui-conversation/tests/chat-view.client.spec.tsx b/packages/client/ui-conversation/tests/chat-view.client.spec.tsx
+index b81dff8e6e..c1ce05fff8 100644
+--- a/packages/client/ui-conversation/tests/chat-view.client.spec.tsx
++++ b/packages/client/ui-conversation/tests/chat-view.client.spec.tsx
+@@ -278,6 +278,7 @@ function makeHarness(init?: Partial<ConversationSnapshot>) {
+     },
+     useStore: bindSnapshotSelector(chat),
+     actions: chat.actions,
++    sessionMutationEnabled: true,
+     renderSlot,
+     SessionProvider: SessionProviderStub,
+     openDetails,
+@@ -741,6 +742,16 @@ describe('ChatView', () => {
+     expect(h.forkAt.mock.calls).toEqual([[2]])
+   })
+ 
++  it('hides transcript fork affordances when the runtime is fixed-root', () => {
++    const h = makeHarness({
++      nodes: [user(1, 'question'), assistant(2, 'answer')],
++      turnEnds: new Map([[1, 3]]),
++    })
++    const view = render(<h.ChatView {...h.props} sessionMutationEnabled={false} forkAt={undefined} />)
++    expect(view.queryByRole('button', { name: '在新对话中分支' })).toBeNull()
++    expect(h.forkAt).not.toHaveBeenCalled()
++  })
++
+   it('disables fork when the indexed Turn has a later steering Node', () => {
+     const base = chatSnapshotFixture({
+       nodes: [user(1, 'question'), assistant(2, 'answer')],
+diff --git a/packages/client/ui-conversation/tests/skeleton.client.spec.tsx b/packages/client/ui-conversation/tests/skeleton.client.spec.tsx
+index 76450d1805..6b740b9659 100644
+--- a/packages/client/ui-conversation/tests/skeleton.client.spec.tsx
++++ b/packages/client/ui-conversation/tests/skeleton.client.spec.tsx
+@@ -103,6 +103,8 @@ function mount(
+     composerBlock?: { reason: string }
+     /** Mutable view ledger used by registration-order regressions. */
+     viewTabs?: ViewTab[]
++    /** Whether this presentation may retarget the current Session. */
++    sessionMutationEnabled?: boolean
+   } = {},
+ ) {
+   const root = sid('root')
+@@ -268,6 +270,7 @@ function mount(
+     renderSlotChain,
+     selectWorkspace: retargetWorkspace,
+     t,
++    sessionMutationEnabled: options.sessionMutationEnabled ?? true,
+   }
+   const view = render(<ConversationRoot {...props} />)
+   return {
+@@ -332,6 +335,40 @@ describe('ConversationRoot resident composer', () => {
+     expect(modelSeat).toEqual({ locked: true })
+   })
+ 
++  it('keeps an existing fixed-root blank session directly composable without a Workspace picker', () => {
++    const b = mount(conversationSnapshot({ composerPhase: 'blank', blank: true }), [], undefined, {
++      summaryBlank: true,
++      sessionMutationEnabled: false,
++    })
++    const box = b.view.getByRole('textbox') as HTMLTextAreaElement
++
++    expect(b.view.queryByRole('button', { name: '选择工作区' })).toBeNull()
++    expect(b.slotCalls).not.toContain('conversation.hero.workspace')
++    expect(box.disabled).toBe(false)
++    expect(box.readOnly).toBe(false)
++    expect(box.getAttribute('aria-haspopup')).toBeNull()
++
++    fireEvent.change(box, { target: { value: 'send to the fixed root' } })
++    fireEvent.keyDown(box, { key: 'Enter' })
++    expect(b.sink).toHaveBeenCalledWith(
++      'send to the fixed root', [], 'queue', expect.any(AbortSignal),
++    )
++    expect(b.retargetWorkspace).not.toHaveBeenCalled()
++  })
++
++  it('keeps an ordinary no-workspace blank session on the Workspace-selection posture', () => {
++    const b = mount(conversationSnapshot({ composerPhase: 'blank', blank: true }), [], undefined, {
++      summaryBlank: true,
++      sessionMutationEnabled: true,
++    })
++    const box = b.view.getByRole('textbox') as HTMLTextAreaElement
++
++    expect(b.view.getByRole('button', { name: '选择工作区' })).toBeTruthy()
++    expect(b.slotCalls).toContain('conversation.hero.workspace')
++    expect(box.readOnly).toBe(true)
++    expect(box.getAttribute('aria-haspopup')).toBe('menu')
++  })
++
+   it('keeps composer text in the machine, mirrors to the chat store, and submits through the sink', () => {
+     const b = mount(conversationSnapshot())
+     const box = b.view.getByRole('textbox')
+diff --git a/packages/client/ui-layout/README.i18n.yaml b/packages/client/ui-layout/README.i18n.yaml
+index d52d995ca1..fd9929b71f 100644
+--- a/packages/client/ui-layout/README.i18n.yaml
++++ b/packages/client/ui-layout/README.i18n.yaml
+@@ -2,5 +2,5 @@
+ # side as of the last confirmed-consistent state. Both languages carry equal authority;
+ # after editing either side, bring the other along and re-record with:
+ #   pnpm run verify-translation-pairing --write packages/client/ui-layout/README.md
+-README.md: 7c9d64b9ca7a5fada492c37200a283904466c36d
+-README.zh.md: a2604d865977c495d2a3d2362b25f05e34142c97
++README.md: 1f1451f6b7c07dd95be3599de4f82bf13f7c7c61
++README.zh.md: 98c5d7ecbd71ec32f8fda391af3fa14fe9216498
+diff --git a/packages/client/ui-layout/README.md b/packages/client/ui-layout/README.md
+index 7c9d64b9ca..1f1451f6b7 100644
+--- a/packages/client/ui-layout/README.md
++++ b/packages/client/ui-layout/README.md
+@@ -6,6 +6,8 @@ Shell plugin: three-column AppFrame (drag handles and concession chain) plus the
+ 
+ AppFrame always mounts the conversation and details columns; a connected Session renders through `SessionProvider`. The transient layout store starts the sidebar at its default width and details closed, and it never reads or writes `localStorage`. Hero and other unselected states also derive a zero rendered details width without changing that stored preference. AppFrame retains the last non-blank Session id across those states: the first Session remains closed, an explicit details action opens the contract default width, returning to the same Session restores its unchanged width, and selecting a different Session closes details before paint. The conversation owner share is empty, while the sidebar owner share contains only `collapsed` and `width`; registrants obtain business data from standard hooks and actions from their own inject faces.
+ 
++When the runtime exposes `embedded: true`, AppFrame suppresses the global sidebar content and its resize handle while retaining an empty zero-width first grid item, so conversation and details remain in their ordinary second and third columns. It preserves the complete current-Session conversation, composer, details/tool/plan/trajectory surfaces, overlay layer, and details handle; embedded presentation does not alter any input or tool semantics. For an addressed boot, AppFrame gates the whole session-scoped frame until the Host Session list is ready and contains the requested root. Pending and missing roots therefore cannot mount a Composer. URL labels and presentation state do not participate in permission decisions.
++
+ The `/client` exports are the plugin body (`apply`/`inject`), `LayoutController`, and the four owner-share interfaces. AppFrame, the panel store, and the concession solver remain package-internal.
+ 
+ ## Model Experience
+diff --git a/packages/client/ui-layout/README.zh.md b/packages/client/ui-layout/README.zh.md
+index a2604d8659..98c5d7ecbd 100644
+--- a/packages/client/ui-layout/README.zh.md
++++ b/packages/client/ui-layout/README.zh.md
+@@ -6,6 +6,8 @@
+ 
+ AppFrame 始终挂载会话栏和详情栏；已连接 Session 通过 `SessionProvider` 渲染。布局 store 是瞬时状态，侧边栏以默认宽度启动，详情栏则保持关闭，且该 store 从不读写 `localStorage`。hero 和其他未选中状态也会将详情栏的渲染宽度派生为零，但不会改变存储的宽度偏好。AppFrame 会跨越这些状态保留最后一个非 blank 会话 id：首个会话保持关闭；显式打开详情栏的操作会使用约定默认宽度；返回同一会话时恢复其未改变的宽度；选择不同会话时，详情栏会在绘制前关闭。会话 owner share 为空，侧边栏 owner share 只包含 `collapsed` 和 `width`；注册方通过标准钩子获取业务数据，并从各自的 inject 接口获取操作。
+ 
++runtime 暴露 `embedded: true` 时，AppFrame 会隐藏全局 sidebar 内容及其缩放手柄，同时保留一个空的零宽第一列 grid item，使 conversation 与 details 仍分别位于原有第二、第三列。当前 Session 的完整 conversation、composer、details／tool／plan／trajectory 表面、overlay 层和 details 手柄都会保留；embedded 展示不会改变任何输入或 tool 语义。对于定址启动，AppFrame 会阻止整个 Session 作用域 frame 挂载，直到 Host Session 列表 ready 且包含请求的 root。因此 pending 或缺失 root 都无法挂载 Composer。URL 标签和展示状态不参与权限判断。
++
+ `/client` 导出表层包含插件主体（`apply`／`inject`）、`LayoutController` 和四个 owner-share 接口。AppFrame、面板 store 与让步求解器仍属于包内部。
+ 
+ ## 模型体验
+diff --git a/packages/client/ui-layout/src/client/AppFrame.module.css b/packages/client/ui-layout/src/client/AppFrame.module.css
+index ae56780133..a760433a15 100644
+--- a/packages/client/ui-layout/src/client/AppFrame.module.css
++++ b/packages/client/ui-layout/src/client/AppFrame.module.css
+@@ -117,3 +117,10 @@
+ .overlayLayer > * {
+   pointer-events: auto;
+ }
++.addressedGate {
++  display: grid;
++  min-height: 100%;
++  place-items: center;
++  color: var(--dsw-alias-label-secondary);
++  background: var(--dsw-alias-bg-base);
++}
+diff --git a/packages/client/ui-layout/src/client/AppFrame.tsx b/packages/client/ui-layout/src/client/AppFrame.tsx
+index 2696dc91fa..320ec0c0a1 100644
+--- a/packages/client/ui-layout/src/client/AppFrame.tsx
++++ b/packages/client/ui-layout/src/client/AppFrame.tsx
+@@ -15,6 +15,7 @@ import type { ReactNode } from 'react'
+ import type { PropsRenderSlots, PropsRuntime, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
+ import { computeColumns, SIDEBAR_AUTO_COLLAPSE, SIDEBAR_DEFAULT } from './columns.ts'
+ import type { createLayoutStore } from './stores.ts'
++import type { WebSessionBoot } from '@deepseek-ai/dsh-client-runtime/client'
+ import css from './AppFrame.module.css'
+ 
+ /** Full composed props: runtime share + child-slot render share + store share. */
+@@ -22,6 +23,7 @@ export type AppFrameProps =
+   & PropsRuntime<'root'>
+   & PropsRenderSlots<'sidebar' | 'conversation' | 'details' | 'shell.overlay'>
+   & PropsStore<ReturnType<typeof createLayoutStore>>
++  & { webSessionBoot: WebSessionBoot }
+ 
+ /** Center column grid item (session-body building block). */
+ function CenterColumn(props: { children?: ReactNode }) {
+@@ -89,12 +91,19 @@ export function AppFrame({
+   useSessions,
+   actions,
+   renderSlot,
++  webSessionBoot,
+ }: AppFrameProps) {
+   const panels = useStore(s => s)
+   const detailsSession = useSessions((s) => {
+     const current = s.current
+     return current !== undefined && s.byId[current]?.blank === false ? current : undefined
+   })
++  const addressedGate = useSessions((s) => {
++    const root = webSessionBoot.addressed?.rootSessionId
++    if (root === undefined) return 'ready' as const
++    if (s.phase !== 'ready') return 'pending' as const
++    return s.ids.includes(root) ? 'ready' as const : 'missing' as const
++  })
+   const frameRef = useRef<HTMLDivElement | null>(null)
+   const [viewport, setViewport] = useState(() => window.innerWidth)
+ 
+@@ -108,9 +117,11 @@ export function AppFrame({
+   }, [actions, detailsSession])
+ 
+   // Track the frame's own box (not the window): rAF-throttled ResizeObserver.
++  // Addressed boot renders a gate instead of the frame until validation
++  // settles, so the effect follows that mount boundary rather than assuming
++  // the ref exists on the first commit.
+   useEffect(() => {
+     const el = frameRef.current
+-    /* v8 ignore next -- the ref is always attached by effect time: the frame div renders unconditionally. */
+     if (el === null) return
+     let raf: number | null = null
+     const observer = new ResizeObserver(() => {
+@@ -125,7 +136,7 @@ export function AppFrame({
+       observer.disconnect()
+       if (raf !== null) cancelAnimationFrame(raf)
+     }
+-  }, [])
++  }, [addressedGate])
+ 
+   // Narrow viewports auto-collapse the sidebar; the store mirror keeps
+   // toggleSidebar's semantics right (narrow toggles flip the manual
+@@ -161,11 +172,24 @@ export function AppFrame({
+     actions.setDetails(detailsBase.current - dx)
+   }, [actions])
+ 
++  if (addressedGate !== 'ready') {
++    return (
++      <div
++        className={css.addressedGate}
++        role={addressedGate === 'missing' ? 'alert' : 'status'}
++        data-addressed-session-gate={addressedGate}
++      >
++        {addressedGate === 'missing' ? '无法打开指定会话。' : '正在验证指定会话…'}
++      </div>
++    )
++  }
++
+   return (
+     <div
+       ref={frameRef}
+       className={css.frame}
+-      style={{ gridTemplateColumns: `${cols.sidebar}px minmax(0, 1fr) ${cols.details}px` }}
++      style={{ gridTemplateColumns: `${webSessionBoot.embedded ? 0 : cols.sidebar}px minmax(0, 1fr) ${cols.details}px` }}
++      data-embedded={webSessionBoot.embedded ? 'true' : undefined}
+       data-sidebar-collapsed={sidebarCollapsed || undefined}
+       data-details-collapsed={cols.details === 0 || undefined}
+       data-dragging={dragging || undefined}
+@@ -176,7 +200,7 @@ export function AppFrame({
+             component sees its rendered state as owner params decided here
+             (collapsed follows the resolved rail, so a derived auto-collapse
+             renders the rail UI too). */}
+-        {renderSlot('sidebar', {
++        {!webSessionBoot.embedded && renderSlot('sidebar', {
+           collapsed: sidebarCollapsed,
+           width: cols.sidebar,
+         })}
+@@ -194,7 +218,7 @@ export function AppFrame({
+         {renderSlot('shell.overlay', {})}
+       </div>
+       {/* The collapsed rail is fixed-width: no resize handle while closed. */}
+-      {!sidebarCollapsed && <DragHandle side="sidebar" left={cols.sidebar} onStart={onSidebarStart} onDrag={onSidebarDrag} onEnd={onDragEnd} />}
++      {!webSessionBoot.embedded && !sidebarCollapsed && <DragHandle side="sidebar" left={cols.sidebar} onStart={onSidebarStart} onDrag={onSidebarDrag} onEnd={onDragEnd} />}
+       {cols.details > 0 && <DragHandle side="details" left={viewport - cols.details} onStart={onDetailsStart} onDrag={onDetailsDrag} onEnd={onDragEnd} />}
+     </div>
+   )
+diff --git a/packages/client/ui-layout/src/client/index.ts b/packages/client/ui-layout/src/client/index.ts
+index c56d83bfbb..bcb1b6258c 100644
+--- a/packages/client/ui-layout/src/client/index.ts
++++ b/packages/client/ui-layout/src/client/index.ts
+@@ -105,7 +105,7 @@ export interface ConvOwnerProps {}
+ export interface DetailsOwnerProps {}
+ 
+ /** Required services (cordis fiber inject — the loader passes all module exports as an object plugin). */
+-export const inject = ['slots', 'theme']
++export const inject = ['slots', 'theme', 'sessions']
+ 
+ /**
+  * Client plugin body: provide ctx.layout, then one register() call — AppFrame
+@@ -132,7 +132,7 @@ export function apply(ctx: ClientContext): void {
+       // conversation business actions belong to their registrants.
+       inject: (actions: PanelActions) => {
+         layout.attachPanels(actions)
+-        return {}
++        return { webSessionBoot: ctx.sessions.webSessionBoot }
+       },
+     }, AppFrame)
+     return () => {
+diff --git a/packages/client/ui-layout/tests/app-frame.client.spec.tsx b/packages/client/ui-layout/tests/app-frame.client.spec.tsx
+index d865a5c186..d298dcf678 100644
+--- a/packages/client/ui-layout/tests/app-frame.client.spec.tsx
++++ b/packages/client/ui-layout/tests/app-frame.client.spec.tsx
+@@ -25,6 +25,7 @@ import type {
+ const selectedSession = { current: 's-test' as SessionId | undefined }
+ const selectedSessionBlank = { current: false }
+ const baselinesReady = { current: true }
++const sessionPhase = { current: 'ready' as SessionListState['phase'] }
+ 
+ // Render-prop contract stub fed through the standard seat prop (the renderer
+ // injects the real one in production): session mode runs children(id), empty
+@@ -52,7 +53,7 @@ function hookOf<T>(inst: { subscribe: (fn: () => void) => () => void; getSnapsho
+   return function useSelector<S>(sel: (s: T) => S): S { return sel(useSyncExternalStore(inst.subscribe, inst.getSnapshot)) }
+ }
+ 
+-function mountFrame() {
++function mountFrame(boot: AppFrameProps['webSessionBoot'] = { embedded: false }) {
+   window.innerWidth = frameWidth // first-render viewport source before the observer fires
+   const instance = createLayoutStore().create()
+   const slotCalls: { key: string; props: unknown }[] = []
+@@ -72,7 +73,7 @@ function mountFrame() {
+         ? {}
+         : { [current]: { id: current, displayTitle: 'Test', running: false, blank: selectedSessionBlank.current, updatedAt: 1 } },
+       current,
+-      phase: 'ready',
++      phase: sessionPhase.current,
+     } as SessionListState
+     return sel(sessionState)
+   }) as never
+@@ -88,6 +89,7 @@ function mountFrame() {
+       useSessions={useSessions}
+       useWorkspaces={((sel: (s: WorkspaceListState) => unknown) => sel(workspaceState)) as never}
+       SessionProvider={SessionProviderStub}
++      webSessionBoot={boot}
+     />
+   )
+   const utils = render(element())
+@@ -115,6 +117,7 @@ beforeEach(() => {
+   selectedSession.current = 's-test' as SessionId
+   selectedSessionBlank.current = false
+   baselinesReady.current = true
++  sessionPhase.current = 'ready'
+   vi.useFakeTimers()
+   vi.stubGlobal('ResizeObserver', ResizeObserverStub)
+   vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => setTimeout(() => { cb(0) }, 16) as unknown as number)
+@@ -137,6 +140,62 @@ afterEach(() => {
+ })
+ 
+ describe('AppFrame', () => {
++  it('hides global sidebar chrome but preserves conversation and details in embedded mode', () => {
++    const { frame, instance, slotCalls, getByTestId } = mountFrame({
++      embedded: true,
++      addressed: { rootSessionId: 's-test' as SessionId },
++    })
++    expect(frame.getAttribute('data-embedded')).toBe('true')
++    expect(getByTestId('center-content')).toBeTruthy()
++    expect(slotCalls.map(call => call.key)).not.toContain('sidebar')
++    expect(getByTestId('details-content')).toBeTruthy()
++    expect(slotCalls.map(call => call.key)).toContain('details')
++    expect(frame.querySelectorAll('[class*="handle"]')).toHaveLength(0)
++    act(() => { instance.actions.openDetails() })
++    expect(frame.querySelectorAll('[class*="handle"]')).toHaveLength(1)
++  })
++
++  it('does not mount the conversation or composer tree before an addressed root is validated', () => {
++    selectedSession.current = undefined
++    sessionPhase.current = 'pending'
++    const pending = mountFrame({
++      embedded: true,
++      addressed: { rootSessionId: 's-addressed' as SessionId },
++    })
++    expect(pending.container.querySelector('[data-addressed-session-gate="pending"]')).toBeTruthy()
++    expect(pending.slotCalls.map(call => call.key)).not.toContain('conversation')
++    pending.unmount()
++
++    sessionPhase.current = 'ready'
++    const missing = mountFrame({
++      embedded: true,
++      addressed: { rootSessionId: 's-addressed' as SessionId },
++    })
++    expect(missing.container.querySelector('[data-addressed-session-gate="missing"]')).toBeTruthy()
++    expect(missing.slotCalls.map(call => call.key)).not.toContain('conversation')
++  })
++
++  it('starts observing when the same addressed frame moves from pending to ready', () => {
++    selectedSession.current = undefined
++    sessionPhase.current = 'pending'
++    const mounted = mountFrame({
++      embedded: true,
++      addressed: { rootSessionId: 's-addressed' as SessionId },
++    })
++    expect(mounted.container.querySelector('[data-addressed-session-gate="pending"]')).toBeTruthy()
++
++    selectedSession.current = 's-addressed' as SessionId
++    sessionPhase.current = 'ready'
++    act(() => { mounted.rerenderFrame() })
++    const frame = mounted.container.firstElementChild as HTMLElement
++    act(() => { mounted.instance.actions.openDetails() })
++    expect(tracks(frame)).toEqual([0, 360])
++
++    frameWidth = 1250
++    act(() => { fireResize?.(); vi.advanceTimersByTime(20) })
++    expect(tracks(frame)).toEqual([0, 330])
++  })
++
+   it('renders three tracks from store state', () => {
+     const { frame } = mountFrame()
+     expect(tracks(frame)).toEqual([280, 0])
+diff --git a/packages/client/ui-layout/tests/apply.client.spec.ts b/packages/client/ui-layout/tests/apply.client.spec.ts
+index 95f8cad439..303ddfec4d 100644
+--- a/packages/client/ui-layout/tests/apply.client.spec.ts
++++ b/packages/client/ui-layout/tests/apply.client.spec.ts
+@@ -27,6 +27,7 @@ async function bench() {
+   // seam for persistence; model this bench as a remote, memory-only browser.
+   ctx.provide('locale', new LocaleRuntime(ctx))
+   ctx.provide('connection', { api: { settings: {} }, isLoopback: false } as never)
++  ctx.provide('sessions', { webSessionBoot: { embedded: false } } as never)
+   // ui-theme's Appearance row binds a durable scope through these two.
+   ctx.provide('remote', { $on: () => () => {} } as never)
+   ctx.provide('settingsScope', { bind: () => stubSettingsScope().scope } as never)
+@@ -37,7 +38,7 @@ async function bench() {
+ 
+ describe('ui-layout client apply', () => {
+   it('declares its service dependencies', () => {
+-    expect(inject).toEqual(['slots', 'theme'])
++    expect(inject).toEqual(['slots', 'theme', 'sessions'])
+   })
+ 
+   it('provides ctx.layout and registers AppFrame into root with the three child declarations', async () => {
+@@ -53,7 +54,7 @@ describe('ui-layout client apply', () => {
+     expect(slots.spec('details')).toEqual({ kind: 'single', scope: 'session' })
+   })
+ 
+-  it('injects no business face and attaches the layout actions', async () => {
++  it('injects immutable Web presentation data and attaches the layout actions', async () => {
+     const { ctx, slots } = await bench()
+     const fiber = ctx.plugin({ inject: [...inject], apply })
+     await fiber.await()
+@@ -61,7 +62,7 @@ describe('ui-layout client apply', () => {
+       setSidebar: vi.fn(), setDetails: vi.fn(), toggleSidebar: vi.fn(), openDetails: vi.fn(), closeDetails: vi.fn(),
+     }
+     const injected = (slots.entries('root')[0]!.inject as (actions: never) => object)(actions as never)
+-    expect(injected).toEqual({})
++    expect(injected).toEqual({ webSessionBoot: { embedded: false } })
+     const layout = ctx.get('layout') as LayoutController
+     layout.toggleSidebar()
+     expect(actions.toggleSidebar).toHaveBeenCalledOnce()
+diff --git a/packages/client/ui-sidebar/src/client/SidebarRoot.tsx b/packages/client/ui-sidebar/src/client/SidebarRoot.tsx
+index a7ef74eaa6..cd042034aa 100644
+--- a/packages/client/ui-sidebar/src/client/SidebarRoot.tsx
++++ b/packages/client/ui-sidebar/src/client/SidebarRoot.tsx
+@@ -42,6 +42,7 @@ const SCROLLBAR_LINGER_MS = 2000
+ export function SidebarRoot({
+   collapsed,
+   width,
++  sessionMutationEnabled,
+   startSession,
+   toggleSidebar,
+   t,
+@@ -131,6 +132,7 @@ export function SidebarRoot({
+         {wide && (
+           <button
+             type="button"
++            disabled={!sessionMutationEnabled}
+             className={clsx(css.brand, css.wide)}
+             aria-label={t('session.new.label')}
+             onClick={() => { startSession() }}
+@@ -178,6 +180,7 @@ export function SidebarRoot({
+       <Tooltip label={t('session.new.label')} delayMs={500} disabled={wide}>
+         <button
+           type="button"
++          disabled={!sessionMutationEnabled}
+           className={css.newSession}
+           aria-label={t('session.new.label')}
+           onClick={() => { startSession() }}
+diff --git a/packages/client/ui-sidebar/src/client/contract/slots.ts b/packages/client/ui-sidebar/src/client/contract/slots.ts
+index 65f0102543..4ee9a8b412 100644
+--- a/packages/client/ui-sidebar/src/client/contract/slots.ts
++++ b/packages/client/ui-sidebar/src/client/contract/slots.ts
+@@ -91,6 +91,8 @@ export interface SidebarFooterActionOwnerProps {
+  * the New Session button and toggling the column.
+  */
+ export type SidebarRootInjected = {
++  /** Whether Session-creation affordances are available in this browser runtime. */
++  sessionMutationEnabled: boolean
+   /**
+    * Start a New Session: with a workspace, reuse-or-create its blank session
+    * and open it; without one, inherit the current Session Workspace, then the
+diff --git a/packages/client/ui-sidebar/src/client/index.ts b/packages/client/ui-sidebar/src/client/index.ts
+index 5b8ac288f7..f12996fe22 100644
+--- a/packages/client/ui-sidebar/src/client/index.ts
++++ b/packages/client/ui-sidebar/src/client/index.ts
+@@ -32,6 +32,7 @@ export function apply(ctx: ClientContext): void {
+   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-sidebar: dictionaries')
+ 
+   const injectProps = (): SidebarRootInjected => ({
++    sessionMutationEnabled: !ctx.sessions.fixedRoot,
+     // The shell's New Session button rides the runtime's shared action
+     // (current Session Workspace, then recent Workspace).
+     startSession: (workspaceId) => { ctx.workspaces.startSession(workspaceId) },
+diff --git a/packages/client/ui-sidebar/tests/apply.client.spec.tsx b/packages/client/ui-sidebar/tests/apply.client.spec.tsx
+index ed40b6e1b4..bcd94c298a 100644
+--- a/packages/client/ui-sidebar/tests/apply.client.spec.tsx
++++ b/packages/client/ui-sidebar/tests/apply.client.spec.tsx
+@@ -43,7 +43,8 @@ describe('ui-sidebar apply', () => {
+     // Copy rides the standard locale seat, not the inject face.
+     expect(b.slots.entries('sidebar')[0]!.locale).toBe('sidebar')
+     const injected = (b.slots.entries('sidebar')[0]!.inject as () => SidebarRootInjected)()
+-    expect(Object.keys(injected)).toEqual(['startSession', 'toggleSidebar'])
++    expect(Object.keys(injected)).toEqual(['sessionMutationEnabled', 'startSession', 'toggleSidebar'])
++    expect(injected.sessionMutationEnabled).toBe(true)
+     // Both arms delegate to the runtime's shared New Session action.
+     injected.startSession('workspace' as never)
+     expect(b.workspaces.startSession).toHaveBeenCalledWith('workspace')
+diff --git a/packages/client/ui-sidebar/tests/pointer-scrollbars.client.spec.tsx b/packages/client/ui-sidebar/tests/pointer-scrollbars.client.spec.tsx
+index dace9db04a..f24cb37b71 100644
+--- a/packages/client/ui-sidebar/tests/pointer-scrollbars.client.spec.tsx
++++ b/packages/client/ui-sidebar/tests/pointer-scrollbars.client.spec.tsx
+@@ -33,6 +33,7 @@ function mountColumn(): { column: HTMLElement; quiet: () => boolean } {
+     <SidebarRoot
+       collapsed={false} width={300}
+       useSessions={neverHook} useWorkspaces={neverHook}
++      sessionMutationEnabled
+       startSession={vi.fn()} toggleSidebar={vi.fn()} t={t}
+       renderSlot={((_key: string, owner: SidebarSectionOwnerProps) =>
+         <div data-testid="region" data-wide={owner.wide} />) as SidebarRootComponentProps['renderSlot']}
+diff --git a/packages/client/ui-sidebar/tests/sidebar-root.client.spec.tsx b/packages/client/ui-sidebar/tests/sidebar-root.client.spec.tsx
+index 99ae7e4d5e..86410985c0 100644
+--- a/packages/client/ui-sidebar/tests/sidebar-root.client.spec.tsx
++++ b/packages/client/ui-sidebar/tests/sidebar-root.client.spec.tsx
+@@ -23,7 +23,11 @@ afterEach(() => {
+ // props share; stub them as never-called functions.
+ const neverHook = (() => { throw new Error('shell must not read global hooks') }) as never
+ 
+-function mountShell({ collapsed = false, width = 300 }: { collapsed?: boolean; width?: number } = {}) {
++function mountShell({ collapsed = false, width = 300, sessionMutationEnabled = true }: {
++  collapsed?: boolean
++  width?: number
++  sessionMutationEnabled?: boolean
++} = {}) {
+   const startSession = vi.fn()
+   const toggleSidebar = vi.fn()
+   let regionOwner: SidebarSectionOwnerProps | undefined
+@@ -36,6 +40,7 @@ function mountShell({ collapsed = false, width = 300 }: { collapsed?: boolean; w
+     <SidebarRoot
+       collapsed={current.collapsed} width={current.width}
+       useSessions={neverHook} useWorkspaces={neverHook}
++      sessionMutationEnabled={sessionMutationEnabled}
+       startSession={startSession} toggleSidebar={toggleSidebar} t={t}
+       renderSlot={((
+         key: string,
+@@ -93,11 +98,23 @@ describe('SidebarRoot shell', () => {
+     expect(b.toggleSidebar).toHaveBeenCalledOnce()
+   })
+ 
++  it('disables Session creation controls when the runtime is fixed-root', () => {
++    const b = mountShell({ sessionMutationEnabled: false })
++    const starters = screen.getAllByRole('button', { name: 'New session' })
++    expect(starters).toHaveLength(2)
++    for (const button of starters) {
++      expect(button).toHaveProperty('disabled', true)
++      fireEvent.click(button)
++    }
++    expect(b.startSession).not.toHaveBeenCalled()
++  })
++
+   it('renders generic brand fallbacks when no package fills the slots', () => {
+     vi.stubEnv('DSH_CLIENT_COMMIT_HASH', '0123456')
+     const { container } = render(<SidebarRoot
+       collapsed={false} width={300}
+       useSessions={neverHook} useWorkspaces={neverHook}
++      sessionMutationEnabled
+       startSession={vi.fn()} toggleSidebar={vi.fn()} t={t}
+       renderSlot={((_key: string, _owner: unknown, options?: { fallback?: ReactNode }) =>
+         options?.fallback ?? null) as SidebarRootComponentProps['renderSlot']}
+diff --git a/packages/client/ui-workspace/src/client/WorkspaceBrowser.tsx b/packages/client/ui-workspace/src/client/WorkspaceBrowser.tsx
+index 08f22ed400..4ca511501e 100644
+--- a/packages/client/ui-workspace/src/client/WorkspaceBrowser.tsx
++++ b/packages/client/ui-workspace/src/client/WorkspaceBrowser.tsx
+@@ -215,7 +215,7 @@ function workspaceGroupHalf(e: { clientY: number; currentTarget: HTMLElement }):
+ 
+ type SessionTreeProps = Pick<
+   WorkspaceBrowserProps,
+-  'useSessions' | 'startSession' | 'open' | 'forkSession'
++  'useSessions' | 'sessionMutationEnabled' | 'startSession' | 'open' | 'forkSession'
+   | 'insertWorkspaceBefore' | 'insertSessionBefore' | 't'
+ > & {
+   /** Host account home for POSIX hover-path abbreviation. */
+@@ -249,7 +249,7 @@ type SessionTreeProps = Pick<
+ 
+ /** The scrolling session tree; unmounting drops the sessions subscription and expand-all state. */
+ function SessionTree({
+-  useSessions, startSession, open, forkSession, workspaces, archivedSessionIds,
++  useSessions, sessionMutationEnabled, startSession, open, forkSession, workspaces, archivedSessionIds,
+   onRenameRequest, onDeleteRequest, onSessionRename, onSessionArchive,
+   insertWorkspaceBefore, insertSessionBefore, orderBy,
+   groupExpansion, setGroupExpanded,
+@@ -460,7 +460,7 @@ function SessionTree({
+                   }
+                   setGroupExpanded(group.key, !group.expanded)
+                 }}
+-                onCreate={() => {
++                onCreate={!sessionMutationEnabled ? undefined : () => {
+                   if (group.workspaceId !== undefined) {
+                     setGroupExpanded(group.key, true)
+                     startSession(group.workspaceId)
+@@ -517,7 +517,7 @@ function SessionTree({
+                     now={now}
+                     onOpen={open}
+                     onRename={onSessionRename}
+-                    onFork={forkSession}
++                    onFork={sessionMutationEnabled ? forkSession : undefined}
+                     onArchive={onSessionArchive}
+                     drag={dragProps}
+                     t={t}
+@@ -547,11 +547,12 @@ function SessionTree({
+ 
+ /** The flat "In one list" body: every session is one draggable top-level row. */
+ function FlatList({
+-  useSessions, open, forkSession, onSessionRename, onSessionArchive, archivedSessionIds,
++  useSessions, sessionMutationEnabled, open, forkSession, onSessionRename, onSessionArchive, archivedSessionIds,
+   orderBy, sessionOrderByAccount, sessionUpdatedAtByAccount, syncSessionOrderAccount, setSessionOrder, t,
+ }: Pick<
+   SessionTreeProps,
+   | 'useSessions'
++  | 'sessionMutationEnabled'
+   | 'open'
+   | 'forkSession'
+   | 'onSessionRename'
+@@ -633,7 +634,7 @@ function FlatList({
+               now={now}
+               onOpen={open}
+               onRename={onSessionRename}
+-              onFork={forkSession}
++              onFork={sessionMutationEnabled ? forkSession : undefined}
+               onArchive={onSessionArchive}
+               flat
+               drag={{
+@@ -748,6 +749,7 @@ export function WorkspaceBrowser({
+   useWorkspaces,
+   useStore,
+   actions,
++  sessionMutationEnabled,
+   startSession,
+   open,
+   renameSession,
+@@ -1085,7 +1087,7 @@ export function WorkspaceBrowser({
+           {/* Adding is the button's one action, so a composition with no
+               picking affordance has nothing to offer here: the region hides the
+               button rather than leaving a dead one in the header. */}
+-          {directoryFlowAvailable && (
++          {directoryFlowAvailable && sessionMutationEnabled && (
+             <Tooltip label={t('workspace.add')} side="bottom" delayMs={500}>
+               <button
+                 ref={wsPlusRef}
+@@ -1157,7 +1159,8 @@ export function WorkspaceBrowser({
+           : groupBy === 'flat'
+             ? (
+               <FlatList
+-                useSessions={useSessions} open={open} forkSession={forkSession}
++                useSessions={useSessions} sessionMutationEnabled={sessionMutationEnabled}
++                open={open} forkSession={forkSession}
+                 onSessionRename={onSessionRename} onSessionArchive={onSessionArchive}
+                 archivedSessionIds={archivedSessionIds}
+                 orderBy={orderBy}
+@@ -1171,6 +1174,7 @@ export function WorkspaceBrowser({
+             : (
+               <SessionTree
+                 useSessions={useSessions}
++                sessionMutationEnabled={sessionMutationEnabled}
+                 onSessionRename={onSessionRename}
+                 onSessionArchive={onSessionArchive}
+                 forkSession={forkSession}
+diff --git a/packages/client/ui-workspace/src/client/contract/slots.ts b/packages/client/ui-workspace/src/client/contract/slots.ts
+index bdd85052a0..12b6935582 100644
+--- a/packages/client/ui-workspace/src/client/contract/slots.ts
++++ b/packages/client/ui-workspace/src/client/contract/slots.ts
+@@ -88,6 +88,8 @@ export type DirectoryPickingHooks = PropsHooks<DirectoryPickingInjected['hooks']
+  * browsing region drives.
+  */
+ export type WorkspaceBrowserInjected = {
++  /** Whether create/fork affordances are available in this browser runtime. */
++  sessionMutationEnabled: boolean
+   hooks: DirectoryPickingInjected['hooks'] & {
+     /** Current generation's Host description, bound by the slot renderer. */
+     hostDescription: HostDescriptionSource
+diff --git a/packages/client/ui-workspace/src/client/index.ts b/packages/client/ui-workspace/src/client/index.ts
+index 93269c22c1..9352756f72 100644
+--- a/packages/client/ui-workspace/src/client/index.ts
++++ b/packages/client/ui-workspace/src/client/index.ts
+@@ -71,6 +71,7 @@ export function apply(ctx: ClientContext): void {
+   const browserFlowSource = flowSource('sidebar.workspaces.directoryFlow')
+   const pickerFlowSource = flowSource('conversation.hero.workspace.directoryFlow')
+   const browserInjected = (): WorkspaceBrowserInjected => ({
++    sessionMutationEnabled: !ctx.sessions.fixedRoot,
+     // Explicit group actions keep their target; unscoped New Session inherits
+     // the current Session Workspace before the recent-Workspace fallback.
+     startSession: (workspaceId) => { ctx.workspaces.startSession(workspaceId) },
+diff --git a/packages/client/ui-workspace/src/client/rows/Rows.tsx b/packages/client/ui-workspace/src/client/rows/Rows.tsx
+index d2d121fe4d..10b4001b3d 100644
+--- a/packages/client/ui-workspace/src/client/rows/Rows.tsx
++++ b/packages/client/ui-workspace/src/client/rows/Rows.tsx
+@@ -112,7 +112,7 @@ function rowHalf(e: { clientY: number; currentTarget: HTMLElement }): 'before' |
+ export function ProjectRowItem({ group, onToggle, onCreate, actions, drag, home, t }: {
+   group: GroupNode
+   onToggle: () => void
+-  onCreate: () => void
++  onCreate?: (() => void) | undefined
+   /** Real-Workspace actions; absent for the ungrouped bucket (no menu shown). */
+   actions?: { rename: () => void; delete: () => void } | undefined
+   /** Present only for real Workspace rows in the grouped view. */
+@@ -184,14 +184,16 @@ export function ProjectRowItem({ group, onToggle, onCreate, actions, drag, home,
+             )}
+           />
+         )}
+-        <button
+-          type="button"
+-          className={css.iconButton}
+-          aria-label={t('actions.newSession.aria', { name: label })}
+-          onClick={(e) => { e.stopPropagation(); onCreate() }}
+-        >
+-          <IconPlusOutline16 />
+-        </button>
++        {onCreate !== undefined && (
++          <button
++            type="button"
++            className={css.iconButton}
++            aria-label={t('actions.newSession.aria', { name: label })}
++            onClick={(e) => { e.stopPropagation(); onCreate() }}
++          >
++            <IconPlusOutline16 />
++          </button>
++        )}
+       </span>
+     </div>
+   )
+@@ -367,7 +369,7 @@ export function SessionNodeItem({ node, currentId, now, onOpen, onRename, onFork
+   /** Open the browser-owned session rename dialog (row menu action). */
+   onRename: (id: SessionNode['id'], currentTitle: string) => void
+   /** Fork a session at its last completed turn (row menu action). */
+-  onFork: (id: SessionNode['id']) => void
++  onFork?: ((id: SessionNode['id']) => void) | undefined
+   /** Archive this session (row menu action; commits without a dialog). */
+   onArchive: (id: SessionNode['id']) => void
+   /** Present only on draggable rows (workspace-group sessions outside search). */
+@@ -388,7 +390,9 @@ export function SessionNodeItem({ node, currentId, now, onOpen, onRename, onFork
+   // confirmation dialog.
+   const sessionMenuItems = [
+     { id: 'rename', label: t('rename'), icon: <IconEditOutline16 /> },
+-    { id: 'fork', label: t('menu.fork'), icon: <IconBranchOutline16 /> },
++    ...(onFork === undefined ? [] : [
++      { id: 'fork', label: t('menu.fork'), icon: <IconBranchOutline16 /> },
++    ]),
+     // 20-native glyph in the menu's 16px icon slot (Menu.module.css .itemIcon).
+     { id: 'archive', label: t('menu.archiveSession'), icon: <IconArchiveOutline20 size={16} /> },
+   ]
+@@ -451,7 +455,7 @@ export function SessionNodeItem({ node, currentId, now, onOpen, onRename, onFork
+             onSelect={(id) => {
+               setMenuOpen(false)
+               if (id === 'rename') onRename(node.id, row.title)
+-              if (id === 'fork') onFork(node.id)
++              if (id === 'fork') onFork?.(node.id)
+               if (id === 'archive') onArchive(node.id)
+             }}
+             portal
+diff --git a/packages/client/ui-workspace/tests/workspace-browser.client.spec.tsx b/packages/client/ui-workspace/tests/workspace-browser.client.spec.tsx
+index 820d2bd66b..4a39a3a520 100644
+--- a/packages/client/ui-workspace/tests/workspace-browser.client.spec.tsx
++++ b/packages/client/ui-workspace/tests/workspace-browser.client.spec.tsx
+@@ -67,6 +67,7 @@ function mount(overrides: Partial<WorkspaceBrowserProps> = {}) {
+     useWorkspaces: hook(workspaceState([])),
+     useStore: bindSnapshotSelector(store),
+     actions: store.actions,
++    sessionMutationEnabled: true,
+     startSession: vi.fn(),
+     open: vi.fn(),
+     searchSessions: vi.fn(async () => ({ items: [], hasMore: false })),
+@@ -409,6 +410,19 @@ describe('WorkspaceBrowser', () => {
+     expect(startSession).toHaveBeenCalledWith(wid('alpha'))
+   })
+ 
++  it('hides create and fork affordances when the runtime is fixed-root', () => {
++    mount({
++      sessionMutationEnabled: false,
++      useSessions: hook(sessionState([summary('alpha-s', 1)])),
++      useWorkspaces: hook(workspaceState([workspace('alpha', ['alpha-s'])])),
++    })
++    expect(screen.queryByRole('button', { name: '在“alpha”中新建会话' })).toBeNull()
++    expect(screen.queryByRole('button', { name: '添加工作区' })).toBeNull()
++    fireEvent.click(screen.getByText('alpha'))
++    fireEvent.click(screen.getByRole('button', { name: '会话“alpha-s”的操作' }))
++    expect(screen.queryByText('分叉会话')).toBeNull()
++  })
++
+   it('auto-expands the Ungrouped bucket for a loose current session; its header has no menu and its ＋ is inert', () => {
+     const startSession = vi.fn()
+     mount({
+diff --git a/packages/extensions/cordis-client-runner/src/client/slot-catalog.ts b/packages/extensions/cordis-client-runner/src/client/slot-catalog.ts
+index 08b22ffdef..908d5905fc 100644
+--- a/packages/extensions/cordis-client-runner/src/client/slot-catalog.ts
++++ b/packages/extensions/cordis-client-runner/src/client/slot-catalog.ts
+@@ -216,7 +216,7 @@ export const CLIENT_SLOT_API: readonly ClientSlotEntry[] = [
+       },
+     ],
+     ownerProps: [
+-      '/** Stable owner currency delivered to one keyed Chat business renderer. */\nexport interface ChatNodeOwnerProps {\n  /** Selected Tool call, when the shared details store names one. */\n  selectedCallId?: CallId | undefined\n  /** Session workspace root; Tool summaries display paths relative to it. */\n  cwd?: string | undefined\n  openFile: (path: string) => void\n  inspectCall: (callId: CallId) => void\n  forkAt: (seq: number) => void\n  /** Render a historical image group through the attachment slot. */\n  renderMessageImages: RenderMessageImages\n  fileMentions: (owner: TurnTailOwnerProps) => MarkdownFileMentions | undefined\n}',
++      '/** Stable owner currency delivered to one keyed Chat business renderer. */\nexport interface ChatNodeOwnerProps {\n  /** Selected Tool call, when the shared details store names one. */\n  selectedCallId?: CallId | undefined\n  /** Session workspace root; Tool summaries display paths relative to it. */\n  cwd?: string | undefined\n  openFile: (path: string) => void\n  inspectCall: (callId: CallId) => void\n  forkAt?: ((seq: number) => void) | undefined\n  /** Render a historical image group through the attachment slot. */\n  renderMessageImages: RenderMessageImages\n  fileMentions: (owner: TurnTailOwnerProps) => MarkdownFileMentions | undefined\n}',
+     ],
+     ownerPropsReferences: [
+       'MarkdownFileMentions',
+diff --git a/packages/test-support/client-runtime/src/sessions.ts b/packages/test-support/client-runtime/src/sessions.ts
+index c014d6f002..1c2e9d6822 100644
+--- a/packages/test-support/client-runtime/src/sessions.ts
++++ b/packages/test-support/client-runtime/src/sessions.ts
+@@ -169,6 +169,10 @@ export interface TestSessionBinding {
+  * the legacy provideInfo/maybeProvideInfo lookups) are bench-only surface.
+  */
+ export class TestSessions implements ISessions {
++  /** Fixture runtime uses the ordinary non-addressed browser baseline. */
++  readonly webSessionBoot = { embedded: false } as const
++  /** Test fixtures model the ordinary mutable Session browser. */
++  readonly fixedRoot = false
+   /** The useSessions standard feed (list rows + current selection). */
+   readonly list: SnapshotStore<SessionListState>
+   /**
+diff --git a/tsconfig.host.json b/tsconfig.host.json
+index f37b98ea57..32b2a3216f 100644
+--- a/tsconfig.host.json
++++ b/tsconfig.host.json
+@@ -87,6 +87,7 @@
+     "apps/web/tests/complex-history.perf.ts",
+     "apps/web/tests/pwsh-terminal.e2e.ts",
+     "apps/web/tests/workflow-run.e2e.ts",
++    "apps/web/tests/addressed-embedded-session.e2e.ts",
+     "apps/web/stress-tests/reasoning-chunks.stress.ts",
+     "apps/cli/tests/**/*.ts",
+     "examples/*/src/**/*.ts",
+-- 
+2.50.1 (Apple Git-155)
+

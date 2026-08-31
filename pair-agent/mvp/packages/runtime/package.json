@@ -1,0 +1,19 @@
+{
+  "name": "@pair-agent/runtime",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run tests",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@pair-agent/context": "workspace:*",
+    "@pair-agent/contracts": "workspace:*",
+    "@pair-agent/ledger": "workspace:*"
+  }
+}

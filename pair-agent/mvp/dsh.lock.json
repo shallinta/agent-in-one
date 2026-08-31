@@ -1,0 +1,27 @@
+{
+  "upstreamRepository": "https://github.com/deepseek-ai/deepseek-harness.git",
+  "tag": "dsh-v0.1.1-rc.2",
+  "upstreamCommit": "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
+  "sourceRepository": "local/pair-agent-phase-0",
+  "requestLayoutSeamVersion": 1,
+  "supportedNode": ">=22.19.0",
+  "pnpmVersion": "11.7.0",
+  "patchSeries": [
+    "patches/deepseek-harness/0001-agent-request-layout.patch",
+    "patches/deepseek-harness/0002-web-addressed-session.patch"
+  ],
+  "expectedDerivedCommit": "7ebde0e88467701ae57071bc2eb08a1aab75359e",
+  "runtimeArtifacts": {
+    "schemaVersion": 1,
+    "buildProfile": "official",
+    "roots": [
+      "apps",
+      "native",
+      "packages",
+      "vendor"
+    ],
+    "include": "lib/**/*.{js,cjs,mjs}",
+    "fileCount": 1936,
+    "digest": "sha256:47cc81493b3b630872b72f8398cf5c9de18ea745da6903f0be94d1636286c0b3"
+  }
+}

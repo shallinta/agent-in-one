@@ -1,0 +1,29 @@
+{
+  "name": "@pair-agent/pair-web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run tests",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "vite build",
+    "build:check": "cross-env VITE_PAIR_SHELL_ORIGIN=https://pair-shell.build.invalid VITE_DSH_WEB_ORIGIN=https://dsh-web.build.invalid vite build"
+  },
+  "dependencies": {
+    "@pair-agent/contracts": "workspace:*",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "6.6.3",
+    "@testing-library/react": "16.2.0",
+    "@types/react": "18.3.18",
+    "@types/react-dom": "18.3.5",
+    "@vitejs/plugin-react": "4.3.4",
+    "cross-env": "7.0.3",
+    "jsdom": "25.0.1",
+    "typescript": "5.9.2",
+    "vite": "6.1.0",
+    "vitest": "3.0.5"
+  }
+}

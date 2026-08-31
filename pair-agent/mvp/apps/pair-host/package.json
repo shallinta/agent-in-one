@@ -1,0 +1,19 @@
+{
+  "name": "@pair-agent/pair-host",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/server.ts"
+  },
+  "scripts": {
+    "test": "vitest run tests",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@pair-agent/contracts": "workspace:*",
+    "@pair-agent/ledger": "workspace:*",
+    "@pair-agent/runtime": "workspace:*"
+  }
+}

@@ -1,0 +1,2056 @@
+From 14ee2741d5da0d83d5b61fbe959b1d64c4f30dbb Mon Sep 17 00:00:00 2001
+From: Pair Agent DSH Patch Applicator <pair-agent-dsh@example.invalid>
+Date: Thu, 27 Aug 2026 00:00:00 +0000
+Subject: [PATCH] feat(agent-loop): add request layout projection
+
+---
+ ...-08-27-request-layout-projection.i18n.yaml |   6 +
+ .../2026-08-27-request-layout-projection.md   |  39 ++
+ ...2026-08-27-request-layout-projection.zh.md |  39 ++
+ docs/architecture.i18n.yaml                   |   4 +-
+ docs/architecture.md                          |  10 +-
+ docs/architecture.zh.md                       |  10 +-
+ docs/event-producer-consumer.i18n.yaml        |   4 +-
+ docs/event-producer-consumer.md               |  25 +-
+ docs/event-producer-consumer.zh.md            |  25 +-
+ docs/subsystems/core.i18n.yaml                |   4 +-
+ docs/subsystems/core.md                       |  70 +++
+ docs/subsystems/core.zh.md                    |  70 +++
+ packages/core/agent-loop/README.i18n.yaml     |   4 +-
+ packages/core/agent-loop/README.md            |   8 +-
+ packages/core/agent-loop/README.zh.md         |   8 +-
+ packages/core/agent-loop/src/agent.ts         |  32 +-
+ packages/core/agent-loop/src/invariant.ts     |  14 +-
+ .../core/agent-loop/src/request-layout.ts     | 184 ++++++
+ .../agent-loop/tests/request-layout.spec.ts   | 574 ++++++++++++++++++
+ packages/core/agent/README.i18n.yaml          |   4 +-
+ packages/core/agent/README.md                 |   2 +-
+ packages/core/agent/README.zh.md              |   2 +-
+ packages/core/agent/src/runtime-types.ts      |  59 +-
+ .../core/scope/src/scoped-events.generated.ts |   1 +
+ packages/core/scope/tests/invariant.spec.ts   |  11 +
+ packages/core/session/src/index.ts            |   3 +-
+ .../extensions/tool-cordis/src/api-catalog.ts |  16 +
+ packages/llm/llm/README.i18n.yaml             |   4 +-
+ packages/llm/llm/README.md                    |   2 +-
+ packages/llm/llm/README.zh.md                 |   2 +-
+ packages/llm/llm/src/message.ts               | 110 ++++
+ packages/llm/llm/tests/message.spec.ts        | 137 +++++
+ scripts/gen-cordis-catalog.ts                 |   2 +
+ scripts/type-equiv.manifest.json              |  10 +
+ 34 files changed, 1432 insertions(+), 63 deletions(-)
+ create mode 100644 .agents/notes/implemented/feature/2026-08-27-request-layout-projection.i18n.yaml
+ create mode 100644 .agents/notes/implemented/feature/2026-08-27-request-layout-projection.md
+ create mode 100644 .agents/notes/implemented/feature/2026-08-27-request-layout-projection.zh.md
+ create mode 100644 packages/core/agent-loop/src/request-layout.ts
+ create mode 100644 packages/core/agent-loop/tests/request-layout.spec.ts
+
+diff --git a/.agents/notes/implemented/feature/2026-08-27-request-layout-projection.i18n.yaml b/.agents/notes/implemented/feature/2026-08-27-request-layout-projection.i18n.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..4a197ee446d09fb9c149a4eda001165b81bd0568
+--- /dev/null
++++ b/.agents/notes/implemented/feature/2026-08-27-request-layout-projection.i18n.yaml
+@@ -0,0 +1,6 @@
++# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
++# side as of the last confirmed-consistent state. Both languages carry equal authority;
++# after editing either side, bring the other along and re-record with:
++#   pnpm run verify-translation-pairing --write .agents/notes/implemented/feature/2026-08-27-request-layout-projection.md
++2026-08-27-request-layout-projection.md: 4db276b9a8cfe1955fd212b58810207b4da1bc4b
++2026-08-27-request-layout-projection.zh.md: 131c1328cbf49218c704bd0fbe5f1d2306a1b452
+diff --git a/.agents/notes/implemented/feature/2026-08-27-request-layout-projection.md b/.agents/notes/implemented/feature/2026-08-27-request-layout-projection.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..4db276b9a8cfe1955fd212b58810207b4da1bc4b
+--- /dev/null
++++ b/.agents/notes/implemented/feature/2026-08-27-request-layout-projection.md
+@@ -0,0 +1,39 @@
++# Agent Note: Provider request message projection
++
++Status: implemented
++
++English | [中文](2026-08-27-request-layout-projection.zh.md)
++
++## Problem
++
++`agent/pre-step` runs before entered messages become durable, while `agent/request` owns only call configuration. Neither event sees the complete Session-derived messages after current input and tool results join history. A plugin that needs a different Provider message order would otherwise rebuild the request inside an LLM adapter, separating the request header, invariant observation, and actual Provider input.
++
++The Session reconstruction invariant also compared the final request messages directly with `deriveMessages()`. That comparison correctly rejected unlogged content but could not distinguish a validated projection from corruption of its durable source boundary.
++
++## Decision
++
++`dsh-agent` declares the scoped `agent/request-layout` waterfall. Every payload carries the Agent and Session identity, turn, step, a one-based attempt that resets on each new step, effective call config, system text, tools, the complete frozen `messages` boundary, and the turn signal. The default result returns that `messages` array; listeners can replace only the array and use ordinary waterfall composition through `next()`.
++
++AgentLoop dispatches the waterfall after config and adapter-default resolution but before `request/header`, request-context logging, final freezing, and Provider dispatch. Returning the exact source array takes an identity path that reuses the already validated, deep-frozen boundary. A replacement is read once, cloned once into the only detached snapshot, and then validated and deep-frozen without consulting listener-owned values again. Validation checks each core content-block shape, conservatively permits plain extension blocks with a non-empty type, and tracks only pending top-level tool calls while checking result order. A result closes and removes its pending id, so a later settled span may reuse that opaque id; duplicates within one open span, interleaving, and unmatched results remain invalid. Invalid output ends the turn before a header or Provider call. The snapshot is frozen before any synchronous Session event, so a listener or event observer cannot change Provider input after validation.
++
++A package-private WeakMap associates each live loop request with its frozen Session-derived source boundary and whether the waterfall returned another array. The request invariant always reconstructs the source boundary from the live Session and still reconstructs config, system text, and tools from the folded header. Identity requests reuse that exact source boundary; transformed requests are accepted only with loop-recorded provenance and a frozen final messages array. The WeakMap is diagnostic process state, not durable history; neither the projection nor a complete request is written as a Session event.
++
++A plugin whose projection depends on another durable source owns that source, its request snapshot, and recovery validation. The core event and provenance contain no plugin domain fields.
++
++## Alternatives considered
++
++**Project during `agent/pre-step`.** Rejected because current claimed messages are not yet in the Session-derived boundary and tool results from the preceding step are outside the claimed batch. A projection built there can silently omit the exact input that triggered the request.
++
++**Rebuild inside an LLM adapter.** Rejected because an adapter would send data different from the frozen request observed by `llm/stream`, request-header reconstruction, and diagnostics. The adapter also owns Provider translation rather than Agent history policy.
++
++**Write every final projection into the Session log.** Rejected because the Session owns local conversation history, while projection plugins may reconstruct from another durable source. Copying complete requests into Session events would duplicate potentially large content and introduce plugin provenance into the core log.
++
++**Allow mutable request middleware.** Rejected because a listener could change messages after validation or change config, tools, and system text without matching header facts. A result-only waterfall followed by deep freezing keeps the mutation point explicit.
++
++## Testing
++
++Agent-loop tests pin default identity, complete claimed and tool-result boundaries, message reordering, validation before Provider dispatch, detached freezing before synchronous Session observers, settled call-id reuse across steps, one-based retry attempts and step reset, transformed invariant acceptance, and source-boundary mismatch rejection. The existing Agent and Agent Loop suites retain ordinary tool-call/result, retry, cancellation, and resume coverage without a layout listener.
++
++## Consequences
++
++Plugins can project a complete request without copying the Agent Loop or replacing Provider adapters, and ordinary agents keep byte-equivalent messages, system text, and tools without another message clone or validation pass. Every Provider attempt still pays for the awaited waterfall; transformed attempts additionally pay for one snapshot clone and validation. Process-local provenance can diagnose live dispatch but cannot reconstruct a projection after restart; a plugin that needs durable audit or recovery must persist and verify its own inputs and output identity.
+diff --git a/.agents/notes/implemented/feature/2026-08-27-request-layout-projection.zh.md b/.agents/notes/implemented/feature/2026-08-27-request-layout-projection.zh.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..131c1328cbf49218c704bd0fbe5f1d2306a1b452
+--- /dev/null
++++ b/.agents/notes/implemented/feature/2026-08-27-request-layout-projection.zh.md
+@@ -0,0 +1,39 @@
++# Agent Note: Provider 请求消息投影
++
++Status: implemented
++
++[English](2026-08-27-request-layout-projection.md) | 中文
++
++## Problem
++
++`agent/pre-step` 在进入步骤的消息持久化前运行，而 `agent/request` 只拥有调用配置。当前输入和工具结果加入历史后，两者都看不到由 Session 派生的完整消息。需要采用不同 Provider 消息顺序的插件只能在 LLM 适配器内重建请求，使请求 header、不变量观测与实际 Provider 输入彼此分离。
++
++Session 重建不变量还会把最终请求消息直接与 `deriveMessages()` 比较。该比较能正确拒绝未记录内容，却无法区分经过校验的投影与其持久来源边界损坏。
++
++## Decision
++
++`dsh-agent` 声明带作用域的 `agent/request-layout` waterfall。每份 payload 都携带 Agent 与 Session 身份、turn、step、在每个新 step 重置且从一开始计数的 attempt、生效调用配置、系统文本、工具、冻结的完整 `messages` 边界以及轮次信号。默认结果返回该 `messages` 数组；监听器只能替换该数组，并通过 `next()` 采用普通 waterfall 组合方式。
++
++AgentLoop 在配置与适配器默认值解析后、`request/header`、请求上下文日志记录、最终冻结与 Provider 分发前执行该 waterfall。返回确切来源数组会进入 identity 路径，复用已经校验并深冻结的边界。替换结果只读取一次，并只克隆一次以形成唯一的分离快照；此后系统不再读取监听器拥有的值，只校验并深冻结该快照。校验会检查每种核心内容块的结构，保守允许带非空 type 的普通扩展块，并且在检查 result 顺序时只跟踪待闭合的顶层 tool call。result 会闭合并移除其待处理 id，因此后续已闭合 span 可以复用该不透明 id；同一未闭合 span 内的重复、交错和无匹配 result 仍属非法。非法输出会在记录 header 或调用 Provider 前结束轮次。该快照会在任何同步 Session 事件之前冻结，因此监听器或事件观察方无法在校验后改变 Provider 输入。
++
++一个包私有 WeakMap 将每份实时循环请求关联到其冻结的 Session 派生来源边界，并记录 waterfall 是否返回了另一数组。请求不变量始终从实时 Session 重建来源边界，同时继续从折叠 header 重建配置、系统文本和工具。identity 请求复用确切的来源边界；变换请求只有在携带循环记录的 provenance 且最终 messages 数组已冻结时才会被接受。WeakMap 是诊断用进程状态，不是持久历史；投影与完整请求都不会写成 Session 事件。
++
++如果插件的投影依赖另一份持久来源，该插件拥有该来源、请求快照与恢复校验。核心事件与 provenance 不包含任何插件领域字段。
++
++## Alternatives considered
++
++**在 `agent/pre-step` 中投影。** 未采用，因为当前 claimed 消息尚未进入 Session 派生边界，而前一步工具结果也不在 claimed 批次中。此处构建的投影可能静默遗漏恰好触发请求的输入。
++
++**在 LLM 适配器内重建。** 未采用，因为适配器会发送与 `llm/stream`、请求 header 重建和诊断所观察的冻结请求不同的数据。适配器还负责 Provider 转换，而不是 Agent 历史策略。
++
++**把每份最终投影写入 Session 日志。** 未采用，因为 Session 拥有本地对话历史，而投影插件可能从另一份持久来源重建。把完整请求复制到 Session 事件会重复可能很大的内容，并把插件 provenance 引入核心日志。
++
++**允许可变请求 middleware。** 未采用，因为监听器可以在校验后继续改变消息，或者修改与 header 事实不匹配的配置、工具和系统文本。只返回结果的 waterfall 加后续深冻结使修改点保持显式。
++
++## Testing
++
++Agent-loop 测试固定默认 identity、完整 claimed 与工具结果边界、消息重排、Provider 分发前校验、同步 Session 观察方运行前的分离冻结、跨 step 复用已闭合 call id、从一开始计数的重试 attempt 与 step 重置、变换后的不变量接受，以及来源边界不匹配拒绝。现有 Agent 与 Agent Loop suite 在没有 layout 监听器时继续覆盖普通 tool-call/result、重试、取消与恢复。
++
++## Consequences
++
++插件无需复制 Agent Loop 或替换 Provider 适配器即可投影完整请求，普通 agent 则保持 messages、系统文本和工具逐字节等价，且不会增加一次消息克隆或校验遍历。每次 Provider attempt 仍需等待一次 waterfall；变换 attempt 还会增加一次快照克隆与校验。进程本地 provenance 可以诊断实时分发，却无法在重启后重建投影；需要持久审计或恢复的插件必须自行持久化并校验其输入与输出身份。
+diff --git a/docs/architecture.i18n.yaml b/docs/architecture.i18n.yaml
+index 09ec41159b4bed49d69a36ea2fadf0164e9776d7..b56c0fdb442c49a2d6ee7d2c78736fc6f415eb9d 100644
+--- a/docs/architecture.i18n.yaml
++++ b/docs/architecture.i18n.yaml
+@@ -2,5 +2,5 @@
+ # side as of the last confirmed-consistent state. Both languages carry equal authority;
+ # after editing either side, bring the other along and re-record with:
+ #   pnpm run verify-translation-pairing --write docs/architecture.md
+-architecture.md: 622d074c3d873181d764cfe53f64485a2c2e0372
+-architecture.zh.md: b6981b3f5056138c2ffe8dab95f27e4c63776dd7
++architecture.md: 85e920cb55f8a350ddb65683ddf1515560e1843c
++architecture.zh.md: ab1eec7ff4d6a2d742bb6b5eece4ec1fd7f9c197
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 622d074c3d873181d764cfe53f64485a2c2e0372..85e920cb55f8a350ddb65683ddf1515560e1843c 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -73,7 +73,7 @@ turn/start
+      step/start
+      append entered messages as user/message
+      derive model history from the log
+-     agent/request -> llm/stream -> assistant/chunk* -> assistant/message
++     agent/request -> agent/request-layout -> llm/stream -> assistant/chunk* -> assistant/message
+      tool/call* -> tools/pre-execute -> tools/execute -> tools/post-execute -> tool/result*
+      step/end
+      tools owe another request, or next-step input arrived -> claim -> next step
+@@ -81,19 +81,21 @@ turn/start
+ turn/end
+ ```
+ 
+-`turn/*`, `step/*`, `user/message`, `assistant/*`, and `tool/*` are durable session events; the rest are live extension points across three domains. `agent/pre-step`, `agent/request`, `llm/stream`, and the three `tools/*` events are waterfalls, whose listeners must call `next()` to delegate; `agent/turn-stopping` is serial and has no `next()`.
++`turn/*`, `step/*`, `user/message`, `assistant/*`, and `tool/*` are durable session events; the rest are live extension points across three domains. `agent/pre-step`, `agent/request`, `agent/request-layout`, `llm/stream`, and the three `tools/*` events are waterfalls, whose listeners must call `next()` to delegate; `agent/turn-stopping` is serial and has no `next()`.
+ 
+ Input reaches the driver through one inbox. Some messages wake it immediately; injected context waits in the inbox until another message does.
+ 
+ `agent/pre-step` decides what the model sees. Listeners may rewrite the claimed messages or reject them outright; a rejected or empty first claim still closes a durable turn that spent no step, so the log records the attempt. Each step reads the prompt sections and tool schemas that plugins registered.
+ 
++`agent/request-layout` receives the complete Session-derived message boundary after entered input and tool results are durable. Its default is identity; a listener may return another ordered message projection, while call configuration, system text, tools, request-header logging, freezing, and Provider dispatch remain loop-owned. The loop validates the projection and retains process-local source provenance for its invariant; a plugin whose projection depends on another durable source owns reconstruction from that source.
++
+ Details: the [sequence diagram](agent-lifecycle.md), the [tool pipeline](tool-execution-pipeline.md), and [cancellation and error recovery](subsystems/core.md#the-agent-handle).
+ 
+ ## Session log
+ 
+-The session log is the source of the context the model sees. `deriveMessages()` projects model history from it, and raw `assistant/chunk` events preserve replay and UI fidelity. Fork, resume, transcripts, telemetry, and persistence all derive from this stream.
++The session log is the source of the local message boundary. `deriveMessages()` projects model history from it, and raw `assistant/chunk` events preserve replay and UI fidelity. Fork, resume, transcripts, telemetry, and persistence all derive from this stream.
+ 
+-**Model-visible means logged.** Anything that reaches a model request must be reconstructable from the log, and a runtime invariant asserts it. This is why a new model-visible input requires a new session event: extend `SessionEventMap` and render from the log.
++**Model-visible means durably reconstructable.** Ordinary request content is reconstructed from the Session log, and a runtime invariant asserts its source boundary. A request-layout plugin may project that boundary only when it owns any additional durable inputs and reconstruction checks; process-local provenance does not replace that durability. New Session-owned model-visible input still requires a `SessionEventMap` event rendered by `deriveMessages()`.
+ 
+ ## Capability seams
+ 
+diff --git a/docs/architecture.zh.md b/docs/architecture.zh.md
+index b6981b3f5056138c2ffe8dab95f27e4c63776dd7..ab1eec7ff4d6a2d742bb6b5eece4ec1fd7f9c197 100644
+--- a/docs/architecture.zh.md
++++ b/docs/architecture.zh.md
+@@ -77,7 +77,7 @@ turn/start
+      step/start
+      append entered messages as user/message
+      derive model history from the log
+-     agent/request -> llm/stream -> assistant/chunk* -> assistant/message
++     agent/request -> agent/request-layout -> llm/stream -> assistant/chunk* -> assistant/message
+      tool/call* -> tools/pre-execute -> tools/execute -> tools/post-execute -> tool/result*
+      step/end
+      tools owe another request, or next-step input arrived -> claim -> next step
+@@ -85,19 +85,21 @@ turn/start
+ turn/end
+ ```
+ 
+-`turn/*`、`step/*`、`user/message`、`assistant/*` 和 `tool/*` 是持久会话事件；其余是分属三个事件域的实时扩展点。`agent/pre-step`、`agent/request`、`llm/stream` 和三个 `tools/*` 事件是 waterfall（瀑布式事件），其监听器必须调用 `next()` 才能委托下去；`agent/turn-stopping` 是 serial 事件，没有 `next()`。
++`turn/*`、`step/*`、`user/message`、`assistant/*` 和 `tool/*` 是持久会话事件；其余是分属三个事件域的实时扩展点。`agent/pre-step`、`agent/request`、`agent/request-layout`、`llm/stream` 和三个 `tools/*` 事件是 waterfall（瀑布式事件），其监听器必须调用 `next()` 才能委托下去；`agent/turn-stopping` 是 serial 事件，没有 `next()`。
+ 
+ 输入通过同一个 inbox 到达驱动器。有些消息会立即唤醒它；注入的上下文会留在 inbox 中，直到另一条消息将其唤醒。
+ 
+ `agent/pre-step` 决定模型看到什么。监听器可以改写已领取的消息，也可以直接拒绝它们；首次领取被拒绝或被改写为空时，仍会关闭一个不含步骤的持久轮次，因此日志会记录这次尝试。每个步骤读取插件注册的提示词片段和工具 schema。
+ 
++`agent/request-layout` 在已进入的输入和工具结果完成持久化后，接收由 Session 派生的完整消息边界。其默认结果保持不变；监听器可以返回另一份有序消息投影，而调用配置、系统文本、工具、请求 header 日志记录、冻结与 Provider 分发仍由循环拥有。循环会校验投影，并为不变量保留进程本地的来源 provenance；如果插件的投影依赖另一份持久来源，该插件负责从该来源重建。
++
+ 详情见[时序图](agent-lifecycle.zh.md)、[工具流水线](tool-execution-pipeline.zh.md)和[取消与错误恢复](subsystems/core.zh.md#the-agent-handle)。
+ 
+ ## 会话日志
+ 
+-会话日志是模型所见上下文的来源。`deriveMessages()` 从中投影出模型历史，原始 `assistant/chunk` 事件则保证回放和 UI 保真。fork、恢复、transcript（文本记录）、遥测和持久化都派生自该事件流。
++会话日志是本地消息边界的来源。`deriveMessages()` 从中投影出模型历史，原始 `assistant/chunk` 事件则保证回放和 UI 保真。fork、恢复、transcript（文本记录）、遥测和持久化都派生自该事件流。
+ 
+-**模型可见即已记录。** 抵达模型请求的一切都必须能从日志重建，并由一项运行时不变量断言这一点。因此，新增一项模型可见输入就需要新增一个会话事件：扩展 `SessionEventMap` 并从日志渲染。
++**模型可见即能够持久重建。** 普通请求内容从 Session 日志重建，运行时不变量会断言其来源边界。request-layout 插件只有在自行拥有额外持久输入与重建检查时，才能投影该边界；进程本地 provenance 不能替代持久性。新增由 Session 拥有的模型可见输入仍需增加一项 `SessionEventMap` 事件，并由 `deriveMessages()` 渲染。
+ 
+ ## 能力 seam
+ 
+diff --git a/docs/event-producer-consumer.i18n.yaml b/docs/event-producer-consumer.i18n.yaml
+index c37d706383640b16d3fb34da33e3c5dbe704da6f..31faabbc8016973065cb71431733888364a3c1a1 100644
+--- a/docs/event-producer-consumer.i18n.yaml
++++ b/docs/event-producer-consumer.i18n.yaml
+@@ -2,5 +2,5 @@
+ # side as of the last confirmed-consistent state. Both languages carry equal authority;
+ # after editing either side, bring the other along and re-record with:
+ #   pnpm run verify-translation-pairing --write docs/event-producer-consumer.md
+-event-producer-consumer.md: 1fb65d55f5a0d8121f4f171c956196fde746103f
+-event-producer-consumer.zh.md: d8db21e5266f83a5fc403a9b825bc05530e61b8d
++event-producer-consumer.md: 847fb0373f77b9038e50cbe89cd71d52714f46b2
++event-producer-consumer.zh.md: 00382b13d30e6131540eb0feeb091d03d5a6a7b3
+diff --git a/docs/event-producer-consumer.md b/docs/event-producer-consumer.md
+index 1fb65d55f5a0d8121f4f171c956196fde746103f..847fb0373f77b9038e50cbe89cd71d52714f46b2 100644
+--- a/docs/event-producer-consumer.md
++++ b/docs/event-producer-consumer.md
+@@ -9,18 +9,19 @@ This matrix shows which packages dispatch each harness-owned event and which pac
+ | --- | --- | --- | --- | --- |
+ | `agent-loop/config-start-failed` | `emit` | [`packages/core/agent-loop/src/index.ts:183`](../packages/core/agent-loop/src/index.ts) | [`agent-loop`](../packages/core/agent-loop) (`events.dispatch`) | - |
+ | `agent-preset/selected` | `emit` | [`packages/preset/agent-presets/src/types.ts:13`](../packages/preset/agent-presets/src/types.ts) | [`agent-presets`](../packages/preset/agent-presets) (`emit`) | `apiproxy` |
+-| `agent/created` | `emit` | [`packages/core/agent/src/runtime-types.ts:159`](../packages/core/agent/src/runtime-types.ts) | [`agent`](../packages/core/agent) (`events.dispatch`) | [`agent-presets`](../packages/preset/agent-presets), [`file-reference-local`](../packages/context/file-reference-local), [`goal-round-driver`](../packages/goal/goal-round-driver), [`schedule`](../packages/schedule/schedule), `tool-agent-team` |
+-| `agent/disposed` | `emit` | [`packages/core/agent/src/runtime-types.ts:168`](../packages/core/agent/src/runtime-types.ts) | [`agent`](../packages/core/agent) (`events.dispatch`) | [`agent-loop`](../packages/core/agent-loop), [`file-reference-local`](../packages/context/file-reference-local), [`goal-round-driver`](../packages/goal/goal-round-driver), [`subagent`](../packages/subagent/subagent), `tool-agent-team` |
+-| `agent/error` | `emit` | [`packages/core/agent/src/runtime-types.ts:290`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`acp`](../packages/acp/acp), `apiproxy`, [`goal-round-driver`](../packages/goal/goal-round-driver), [`session-telemetry`](../packages/session/session-telemetry) |
+-| `agent/inbox/claimed` | `emit` | [`packages/core/agent/src/runtime-types.ts:197`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`acp`](../packages/acp/acp), [`goal-round-driver`](../packages/goal/goal-round-driver), [`subagent`](../packages/subagent/subagent), [`tool-jobs`](../packages/jobs/tool-jobs) |
+-| `agent/inbox/discarded` | `emit` | [`packages/core/agent/src/runtime-types.ts:205`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`goal-round-driver`](../packages/goal/goal-round-driver), [`subagent`](../packages/subagent/subagent) |
+-| `agent/inbox/inserted` | `emit` | [`packages/core/agent/src/runtime-types.ts:186`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`goal-round-driver`](../packages/goal/goal-round-driver) |
+-| `agent/pre-step` | `waterfall` | [`packages/core/agent/src/runtime-types.ts:231`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`waterfall`) | [`agent-instructions`](../packages/context/agent-instructions), [`compaction-basic`](../packages/compaction/compaction-basic), [`goal-round-driver`](../packages/goal/goal-round-driver), [`hooks-claude-code`](../packages/hooks/hooks-claude-code), [`hooks-codex`](../packages/hooks/hooks-codex), [`plan-mode`](../packages/plan/plan-mode), [`repeat-tool-reminder`](../packages/guard/repeat-tool-reminder), [`session-checkpoint-policy`](../packages/session/session-checkpoint-policy), [`session-reference`](../packages/context/session-reference), [`subagent-in-process-driver`](../packages/subagent/subagent-in-process-driver), [`time-context`](../packages/context/time-context), [`tmux-context`](../packages/context/tmux-context), [`tool-cordis`](../packages/extensions/tool-cordis), [`tool-skill`](../packages/skill/tool-skill) |
+-| `agent/request` | `waterfall` | [`packages/core/agent/src/runtime-types.ts:244`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`waterfall`) | [`agent`](../packages/core/agent) |
+-| `agent/request-error` | `waterfall` | [`packages/core/agent/src/runtime-types.ts:260`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`waterfall`) | [`compaction-basic`](../packages/compaction/compaction-basic), [`llm-retry`](../packages/llm/llm-retry) |
+-| `agent/session-start` | `emit` | [`packages/core/agent/src/runtime-types.ts:217`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emitAgentEvent`) | `agent-team`, [`goal`](../packages/goal/goal), [`goal-round-driver`](../packages/goal/goal-round-driver), [`hooks-claude-code`](../packages/hooks/hooks-claude-code), [`hooks-codex`](../packages/hooks/hooks-codex) |
+-| `agent/status` | `emit` | [`packages/core/agent/src/runtime-types.ts:178`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`agent`](../packages/core/agent), `agent-team`, `apiproxy`, [`compaction-basic`](../packages/compaction/compaction-basic), [`goal-round-driver`](../packages/goal/goal-round-driver), [`schedule`](../packages/schedule/schedule), `server` |
+-| `agent/turn-stopping` | `serial` | [`packages/core/agent/src/runtime-types.ts:278`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`serial`) | [`hooks-claude-code`](../packages/hooks/hooks-claude-code), [`hooks-codex`](../packages/hooks/hooks-codex) |
++| `agent/created` | `emit` | [`packages/core/agent/src/runtime-types.ts:195`](../packages/core/agent/src/runtime-types.ts) | [`agent`](../packages/core/agent) (`events.dispatch`) | [`agent-presets`](../packages/preset/agent-presets), [`file-reference-local`](../packages/context/file-reference-local), [`goal-round-driver`](../packages/goal/goal-round-driver), [`schedule`](../packages/schedule/schedule), `tool-agent-team` |
++| `agent/disposed` | `emit` | [`packages/core/agent/src/runtime-types.ts:204`](../packages/core/agent/src/runtime-types.ts) | [`agent`](../packages/core/agent) (`events.dispatch`) | [`agent-loop`](../packages/core/agent-loop), [`file-reference-local`](../packages/context/file-reference-local), [`goal-round-driver`](../packages/goal/goal-round-driver), [`subagent`](../packages/subagent/subagent), `tool-agent-team` |
++| `agent/error` | `emit` | [`packages/core/agent/src/runtime-types.ts:347`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`acp`](../packages/acp/acp), `apiproxy`, [`goal-round-driver`](../packages/goal/goal-round-driver), [`session-telemetry`](../packages/session/session-telemetry) |
++| `agent/inbox/claimed` | `emit` | [`packages/core/agent/src/runtime-types.ts:233`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`acp`](../packages/acp/acp), [`goal-round-driver`](../packages/goal/goal-round-driver), [`subagent`](../packages/subagent/subagent), [`tool-jobs`](../packages/jobs/tool-jobs) |
++| `agent/inbox/discarded` | `emit` | [`packages/core/agent/src/runtime-types.ts:241`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`goal-round-driver`](../packages/goal/goal-round-driver), [`subagent`](../packages/subagent/subagent) |
++| `agent/inbox/inserted` | `emit` | [`packages/core/agent/src/runtime-types.ts:222`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`goal-round-driver`](../packages/goal/goal-round-driver) |
++| `agent/pre-step` | `waterfall` | [`packages/core/agent/src/runtime-types.ts:267`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`waterfall`) | [`agent-instructions`](../packages/context/agent-instructions), [`compaction-basic`](../packages/compaction/compaction-basic), [`goal-round-driver`](../packages/goal/goal-round-driver), [`hooks-claude-code`](../packages/hooks/hooks-claude-code), [`hooks-codex`](../packages/hooks/hooks-codex), [`plan-mode`](../packages/plan/plan-mode), [`repeat-tool-reminder`](../packages/guard/repeat-tool-reminder), [`session-checkpoint-policy`](../packages/session/session-checkpoint-policy), [`session-reference`](../packages/context/session-reference), [`subagent-in-process-driver`](../packages/subagent/subagent-in-process-driver), [`time-context`](../packages/context/time-context), [`tmux-context`](../packages/context/tmux-context), [`tool-cordis`](../packages/extensions/tool-cordis), [`tool-skill`](../packages/skill/tool-skill) |
++| `agent/request` | `waterfall` | [`packages/core/agent/src/runtime-types.ts:280`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`waterfall`) | [`agent`](../packages/core/agent) |
++| `agent/request-error` | `waterfall` | [`packages/core/agent/src/runtime-types.ts:317`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`waterfall`) | [`compaction-basic`](../packages/compaction/compaction-basic), [`llm-retry`](../packages/llm/llm-retry) |
++| `agent/request-layout` | `waterfall` | [`packages/core/agent/src/runtime-types.ts:301`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`waterfall`) | - |
++| `agent/session-start` | `emit` | [`packages/core/agent/src/runtime-types.ts:253`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emitAgentEvent`) | `agent-team`, [`goal`](../packages/goal/goal), [`goal-round-driver`](../packages/goal/goal-round-driver), [`hooks-claude-code`](../packages/hooks/hooks-claude-code), [`hooks-codex`](../packages/hooks/hooks-codex) |
++| `agent/status` | `emit` | [`packages/core/agent/src/runtime-types.ts:214`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`agent`](../packages/core/agent), `agent-team`, `apiproxy`, [`compaction-basic`](../packages/compaction/compaction-basic), [`goal-round-driver`](../packages/goal/goal-round-driver), [`schedule`](../packages/schedule/schedule), `server` |
++| `agent/turn-stopping` | `serial` | [`packages/core/agent/src/runtime-types.ts:335`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`serial`) | [`hooks-claude-code`](../packages/hooks/hooks-claude-code), [`hooks-codex`](../packages/hooks/hooks-codex) |
+ | `approval/request` | `waterfall` | [`packages/interaction/user-approval/src/index.ts:30`](../packages/interaction/user-approval/src/index.ts) | [`user-approval`](../packages/interaction/user-approval) (`waterfall`) | [`acp`](../packages/acp/acp), `apiproxy` |
+ | `authorization/settled` | `emit` | [`packages/credentials/authorization/src/index.ts:57`](../packages/credentials/authorization/src/index.ts) | [`authorization`](../packages/credentials/authorization) (`events.dispatch`) | [`authorization`](../packages/credentials/authorization) |
+ | `commands/change` | `emit` | [`packages/interaction/commands/src/types.ts:80`](../packages/interaction/commands/src/types.ts) | [`commands`](../packages/interaction/commands) (`events.dispatch`) | `apiproxy` |
+diff --git a/docs/event-producer-consumer.zh.md b/docs/event-producer-consumer.zh.md
+index d8db21e5266f83a5fc403a9b825bc05530e61b8d..00382b13d30e6131540eb0feeb091d03d5a6a7b3 100644
+--- a/docs/event-producer-consumer.zh.md
++++ b/docs/event-producer-consumer.zh.md
+@@ -11,18 +11,19 @@
+ | --- | --- | --- | --- | --- |
+ | `agent-loop/config-start-failed` | `emit` | [`packages/core/agent-loop/src/index.ts:183`](../packages/core/agent-loop/src/index.ts) | [`agent-loop`](../packages/core/agent-loop) (`events.dispatch`) | - |
+ | `agent-preset/selected` | `emit` | [`packages/preset/agent-presets/src/types.ts:13`](../packages/preset/agent-presets/src/types.ts) | [`agent-presets`](../packages/preset/agent-presets) (`emit`) | `apiproxy` |
+-| `agent/created` | `emit` | [`packages/core/agent/src/runtime-types.ts:159`](../packages/core/agent/src/runtime-types.ts) | [`agent`](../packages/core/agent) (`events.dispatch`) | [`agent-presets`](../packages/preset/agent-presets), [`file-reference-local`](../packages/context/file-reference-local), [`goal-round-driver`](../packages/goal/goal-round-driver), [`schedule`](../packages/schedule/schedule), `tool-agent-team` |
+-| `agent/disposed` | `emit` | [`packages/core/agent/src/runtime-types.ts:168`](../packages/core/agent/src/runtime-types.ts) | [`agent`](../packages/core/agent) (`events.dispatch`) | [`agent-loop`](../packages/core/agent-loop), [`file-reference-local`](../packages/context/file-reference-local), [`goal-round-driver`](../packages/goal/goal-round-driver), [`subagent`](../packages/subagent/subagent), `tool-agent-team` |
+-| `agent/error` | `emit` | [`packages/core/agent/src/runtime-types.ts:290`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`acp`](../packages/acp/acp), `apiproxy`, [`goal-round-driver`](../packages/goal/goal-round-driver), [`session-telemetry`](../packages/session/session-telemetry) |
+-| `agent/inbox/claimed` | `emit` | [`packages/core/agent/src/runtime-types.ts:197`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`acp`](../packages/acp/acp), [`goal-round-driver`](../packages/goal/goal-round-driver), [`subagent`](../packages/subagent/subagent), [`tool-jobs`](../packages/jobs/tool-jobs) |
+-| `agent/inbox/discarded` | `emit` | [`packages/core/agent/src/runtime-types.ts:205`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`goal-round-driver`](../packages/goal/goal-round-driver), [`subagent`](../packages/subagent/subagent) |
+-| `agent/inbox/inserted` | `emit` | [`packages/core/agent/src/runtime-types.ts:186`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`goal-round-driver`](../packages/goal/goal-round-driver) |
+-| `agent/pre-step` | `waterfall` | [`packages/core/agent/src/runtime-types.ts:231`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`waterfall`) | [`agent-instructions`](../packages/context/agent-instructions), [`compaction-basic`](../packages/compaction/compaction-basic), [`goal-round-driver`](../packages/goal/goal-round-driver), [`hooks-claude-code`](../packages/hooks/hooks-claude-code), [`hooks-codex`](../packages/hooks/hooks-codex), [`plan-mode`](../packages/plan/plan-mode), [`repeat-tool-reminder`](../packages/guard/repeat-tool-reminder), [`session-checkpoint-policy`](../packages/session/session-checkpoint-policy), [`session-reference`](../packages/context/session-reference), [`subagent-in-process-driver`](../packages/subagent/subagent-in-process-driver), [`time-context`](../packages/context/time-context), [`tmux-context`](../packages/context/tmux-context), [`tool-cordis`](../packages/extensions/tool-cordis), [`tool-skill`](../packages/skill/tool-skill) |
+-| `agent/request` | `waterfall` | [`packages/core/agent/src/runtime-types.ts:244`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`waterfall`) | [`agent`](../packages/core/agent) |
+-| `agent/request-error` | `waterfall` | [`packages/core/agent/src/runtime-types.ts:260`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`waterfall`) | [`compaction-basic`](../packages/compaction/compaction-basic), [`llm-retry`](../packages/llm/llm-retry) |
+-| `agent/session-start` | `emit` | [`packages/core/agent/src/runtime-types.ts:217`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emitAgentEvent`) | `agent-team`, [`goal`](../packages/goal/goal), [`goal-round-driver`](../packages/goal/goal-round-driver), [`hooks-claude-code`](../packages/hooks/hooks-claude-code), [`hooks-codex`](../packages/hooks/hooks-codex) |
+-| `agent/status` | `emit` | [`packages/core/agent/src/runtime-types.ts:178`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`agent`](../packages/core/agent), `agent-team`, `apiproxy`, [`compaction-basic`](../packages/compaction/compaction-basic), [`goal-round-driver`](../packages/goal/goal-round-driver), [`schedule`](../packages/schedule/schedule), `server` |
+-| `agent/turn-stopping` | `serial` | [`packages/core/agent/src/runtime-types.ts:278`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`serial`) | [`hooks-claude-code`](../packages/hooks/hooks-claude-code), [`hooks-codex`](../packages/hooks/hooks-codex) |
++| `agent/created` | `emit` | [`packages/core/agent/src/runtime-types.ts:195`](../packages/core/agent/src/runtime-types.ts) | [`agent`](../packages/core/agent) (`events.dispatch`) | [`agent-presets`](../packages/preset/agent-presets), [`file-reference-local`](../packages/context/file-reference-local), [`goal-round-driver`](../packages/goal/goal-round-driver), [`schedule`](../packages/schedule/schedule), `tool-agent-team` |
++| `agent/disposed` | `emit` | [`packages/core/agent/src/runtime-types.ts:204`](../packages/core/agent/src/runtime-types.ts) | [`agent`](../packages/core/agent) (`events.dispatch`) | [`agent-loop`](../packages/core/agent-loop), [`file-reference-local`](../packages/context/file-reference-local), [`goal-round-driver`](../packages/goal/goal-round-driver), [`subagent`](../packages/subagent/subagent), `tool-agent-team` |
++| `agent/error` | `emit` | [`packages/core/agent/src/runtime-types.ts:347`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`acp`](../packages/acp/acp), `apiproxy`, [`goal-round-driver`](../packages/goal/goal-round-driver), [`session-telemetry`](../packages/session/session-telemetry) |
++| `agent/inbox/claimed` | `emit` | [`packages/core/agent/src/runtime-types.ts:233`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`acp`](../packages/acp/acp), [`goal-round-driver`](../packages/goal/goal-round-driver), [`subagent`](../packages/subagent/subagent), [`tool-jobs`](../packages/jobs/tool-jobs) |
++| `agent/inbox/discarded` | `emit` | [`packages/core/agent/src/runtime-types.ts:241`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`goal-round-driver`](../packages/goal/goal-round-driver), [`subagent`](../packages/subagent/subagent) |
++| `agent/inbox/inserted` | `emit` | [`packages/core/agent/src/runtime-types.ts:222`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`goal-round-driver`](../packages/goal/goal-round-driver) |
++| `agent/pre-step` | `waterfall` | [`packages/core/agent/src/runtime-types.ts:267`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`waterfall`) | [`agent-instructions`](../packages/context/agent-instructions), [`compaction-basic`](../packages/compaction/compaction-basic), [`goal-round-driver`](../packages/goal/goal-round-driver), [`hooks-claude-code`](../packages/hooks/hooks-claude-code), [`hooks-codex`](../packages/hooks/hooks-codex), [`plan-mode`](../packages/plan/plan-mode), [`repeat-tool-reminder`](../packages/guard/repeat-tool-reminder), [`session-checkpoint-policy`](../packages/session/session-checkpoint-policy), [`session-reference`](../packages/context/session-reference), [`subagent-in-process-driver`](../packages/subagent/subagent-in-process-driver), [`time-context`](../packages/context/time-context), [`tmux-context`](../packages/context/tmux-context), [`tool-cordis`](../packages/extensions/tool-cordis), [`tool-skill`](../packages/skill/tool-skill) |
++| `agent/request` | `waterfall` | [`packages/core/agent/src/runtime-types.ts:280`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`waterfall`) | [`agent`](../packages/core/agent) |
++| `agent/request-error` | `waterfall` | [`packages/core/agent/src/runtime-types.ts:317`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`waterfall`) | [`compaction-basic`](../packages/compaction/compaction-basic), [`llm-retry`](../packages/llm/llm-retry) |
++| `agent/request-layout` | `waterfall` | [`packages/core/agent/src/runtime-types.ts:301`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`waterfall`) | - |
++| `agent/session-start` | `emit` | [`packages/core/agent/src/runtime-types.ts:253`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emitAgentEvent`) | `agent-team`, [`goal`](../packages/goal/goal), [`goal-round-driver`](../packages/goal/goal-round-driver), [`hooks-claude-code`](../packages/hooks/hooks-claude-code), [`hooks-codex`](../packages/hooks/hooks-codex) |
++| `agent/status` | `emit` | [`packages/core/agent/src/runtime-types.ts:214`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`emit`) | [`agent`](../packages/core/agent), `agent-team`, `apiproxy`, [`compaction-basic`](../packages/compaction/compaction-basic), [`goal-round-driver`](../packages/goal/goal-round-driver), [`schedule`](../packages/schedule/schedule), `server` |
++| `agent/turn-stopping` | `serial` | [`packages/core/agent/src/runtime-types.ts:335`](../packages/core/agent/src/runtime-types.ts) | [`agent-loop`](../packages/core/agent-loop) (`serial`) | [`hooks-claude-code`](../packages/hooks/hooks-claude-code), [`hooks-codex`](../packages/hooks/hooks-codex) |
+ | `approval/request` | `waterfall` | [`packages/interaction/user-approval/src/index.ts:30`](../packages/interaction/user-approval/src/index.ts) | [`user-approval`](../packages/interaction/user-approval) (`waterfall`) | [`acp`](../packages/acp/acp), `apiproxy` |
+ | `authorization/settled` | `emit` | [`packages/credentials/authorization/src/index.ts:57`](../packages/credentials/authorization/src/index.ts) | [`authorization`](../packages/credentials/authorization) (`events.dispatch`) | [`authorization`](../packages/credentials/authorization) |
+ | `commands/change` | `emit` | [`packages/interaction/commands/src/types.ts:80`](../packages/interaction/commands/src/types.ts) | [`commands`](../packages/interaction/commands) (`events.dispatch`) | `apiproxy` |
+diff --git a/docs/subsystems/core.i18n.yaml b/docs/subsystems/core.i18n.yaml
+index 62f63c4e3139f527284d914949a51c0490c0a3cb..e2441357cd4f36d0632ca3f07ddd38b65ed0c1a6 100644
+--- a/docs/subsystems/core.i18n.yaml
++++ b/docs/subsystems/core.i18n.yaml
+@@ -2,5 +2,5 @@
+ # side as of the last confirmed-consistent state. Both languages carry equal authority;
+ # after editing either side, bring the other along and re-record with:
+ #   pnpm run verify-translation-pairing --write docs/subsystems/core.md
+-core.md: 18057c9a9a308e439bb6a08f598f51f158243496
+-core.zh.md: dfb1d8ad482b2cf9c6de94bde04c4dbff83a0082
++core.md: 2c3032a1cab0286fd66dca1e6c7bbba5e5ebf8f1
++core.zh.md: 5cf84a5480172a98463261998e5c48c5a6c93c69
+diff --git a/docs/subsystems/core.md b/docs/subsystems/core.md
+index 18057c9a9a308e439bb6a08f598f51f158243496..2c3032a1cab0286fd66dca1e6c7bbba5e5ebf8f1 100644
+--- a/docs/subsystems/core.md
++++ b/docs/subsystems/core.md
+@@ -232,6 +232,42 @@ type PreStepDecision =
+ type RequestErrorAction = { kind: 'retry' } | undefined
+ ```
+ 
++`agent/request-layout` runs after the complete Session-derived messages exist and before request-header logging or Provider dispatch. Its one-based `attempt` increments when `agent/request-error` retries the same step and resets to one on the next step. Listeners can replace only `messages`; the loop validates message roles and tool-call/result order before deep-freezing the final request:
++
++```ts type-equiv
++/** Complete immutable inputs available to one provider-request message projection. */
++interface RequestLayoutInput {
++  /** Agent whose request is being projected. */
++  readonly agent: Agent
++  /** Durable Session identity stamped on the request. */
++  readonly sessionId: SessionId
++  /** Open turn containing this request. */
++  readonly turn: number
++  /** Open step containing this request. */
++  readonly step: number
++  /** One-based provider attempt within this step; a new step starts again at one. */
++  readonly attempt: number
++  /** Effective provider/model call configuration recorded by the request header. */
++  readonly config: Readonly<LlmCallConfig>
++  /** Rendered system prompt, absent when the request has none. */
++  readonly system?: string
++  /** Complete tool schemas for the request. */
++  readonly tools: readonly ToolSchema[]
++  /** Session-derived messages at the dispatch boundary, before projection. */
++  readonly messages: readonly Message[]
++  /** Current turn's cancellation signal. */
++  readonly signal: AbortSignal
++}
++```
++
++```ts type-equiv
++/** Message projection returned by `agent/request-layout`. */
++interface RequestLayoutResult {
++  /** Complete ordered messages to send to the Provider. */
++  readonly messages: readonly Message[]
++}
++```
++
+ `agent/pre-step` is the only serial listener chain before request derivation. `agent/turn-stopping` runs when a turn has no tool or steering continuation, before one final steering drain.
+ 
+ `agent/session-start` carries a `SessionStartSource` (why the session lifecycle began; a bridge keys its SessionStart matcher on it):
+@@ -942,6 +978,40 @@ Types: [LlmFailure](llm-streaming.md) · [ResolvedRetryPolicy](llm-streaming.md)
+ 
+ Source: [`packages/core/agent/src/runtime-types.ts`](../../packages/core/agent/src/runtime-types.ts)
+ 
++<a id="agentrequest-layout--waterfall"></a>
++
++#### `agent/request-layout` — waterfall
++
++Replace only the ordered messages of one complete model request. The default result is `payload.messages`; listeners call `next()` to obtain and wrap the downstream projection. The loop validates message roles and tool-call/result ordering, then deep-freezes the final request before Provider dispatch. Configuration, system text, tools, Session history, and Provider invocation remain loop-owned.
++
++```ts cordis-catalog
++/**
++ * Replace only the ordered messages of one complete model request. The
++ * default result is `payload.messages`; listeners call `next()` to obtain
++ * and wrap the downstream projection. The loop validates message roles and
++ * tool-call/result ordering, then deep-freezes the final request before
++ * Provider dispatch. Configuration, system text, tools, Session history,
++ * and Provider invocation remain loop-owned.
++ * @param payload.agent - the agent making the model call.
++ * @param payload.sessionId - the durable Session identity stamped on the request.
++ * @param payload.turn - the open turn number.
++ * @param payload.step - the open step number.
++ * @param payload.attempt - one-based Provider attempt within this step; a new step resets it to one.
++ * @param payload.config - the effective request configuration recorded by the request header.
++ * @param payload.system - the rendered system prompt, when non-empty.
++ * @param payload.tools - the complete immutable tool-schema list.
++ * @param payload.messages - the complete immutable Session-derived messages before projection.
++ * @param payload.signal - the current turn's explicit abort signal.
++ * Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent.
++ * @mode waterfall
++ */
++'agent/request-layout'(this: Scoped<Agent>, payload: RequestLayoutInput, next: () => Promise<RequestLayoutResult>): Promise<RequestLayoutResult>
++```
++
++Types: [Scoped](scope.md)
++
++Source: [`packages/core/agent/src/runtime-types.ts`](../../packages/core/agent/src/runtime-types.ts)
++
+ <a id="agentsession-start--emit"></a>
+ 
+ #### `agent/session-start` — emit
+diff --git a/docs/subsystems/core.zh.md b/docs/subsystems/core.zh.md
+index dfb1d8ad482b2cf9c6de94bde04c4dbff83a0082..5cf84a5480172a98463261998e5c48c5a6c93c69 100644
+--- a/docs/subsystems/core.zh.md
++++ b/docs/subsystems/core.zh.md
+@@ -240,6 +240,42 @@ type PreStepDecision =
+ type RequestErrorAction = { kind: 'retry' } | undefined
+ ```
+ 
++`agent/request-layout` 在由 Session 派生的完整消息存在后、请求 header 日志记录或 Provider 分发前运行。其从一开始计数的 `attempt` 会在 `agent/request-error` 重试同一 step 时递增，并在下一 step 重置为一。监听器只能替换 `messages`；循环会先校验消息 role 与 tool-call/result 顺序，再对最终请求执行深冻结：
++
++```ts type-equiv
++/** Complete immutable inputs available to one provider-request message projection. */
++interface RequestLayoutInput {
++  /** Agent whose request is being projected. */
++  readonly agent: Agent
++  /** Durable Session identity stamped on the request. */
++  readonly sessionId: SessionId
++  /** Open turn containing this request. */
++  readonly turn: number
++  /** Open step containing this request. */
++  readonly step: number
++  /** One-based provider attempt within this step; a new step starts again at one. */
++  readonly attempt: number
++  /** Effective provider/model call configuration recorded by the request header. */
++  readonly config: Readonly<LlmCallConfig>
++  /** Rendered system prompt, absent when the request has none. */
++  readonly system?: string
++  /** Complete tool schemas for the request. */
++  readonly tools: readonly ToolSchema[]
++  /** Session-derived messages at the dispatch boundary, before projection. */
++  readonly messages: readonly Message[]
++  /** Current turn's cancellation signal. */
++  readonly signal: AbortSignal
++}
++```
++
++```ts type-equiv
++/** Message projection returned by `agent/request-layout`. */
++interface RequestLayoutResult {
++  /** Complete ordered messages to send to the Provider. */
++  readonly messages: readonly Message[]
++}
++```
++
+ `agent/pre-step` 是请求推导前唯一的串行监听器链。`agent/turn-stopping` 在轮次没有工具或 steering（中途引导）后续时运行，先于最后一次 steering 排空。
+ 
+ `agent/session-start` 携带 `SessionStartSource`（会话生命周期为何开始；桥接层据此匹配其 SessionStart）：
+@@ -952,6 +988,40 @@ Types: [LlmFailure](llm-streaming.zh.md) · [ResolvedRetryPolicy](llm-streaming.
+ 
+ Source: [`packages/core/agent/src/runtime-types.ts`](../../packages/core/agent/src/runtime-types.ts)
+ 
++<a id="agentrequest-layout--waterfall"></a>
++
++#### `agent/request-layout` — waterfall
++
++Replace only the ordered messages of one complete model request. The default result is `payload.messages`; listeners call `next()` to obtain and wrap the downstream projection. The loop validates message roles and tool-call/result ordering, then deep-freezes the final request before Provider dispatch. Configuration, system text, tools, Session history, and Provider invocation remain loop-owned.
++
++```ts cordis-catalog
++/**
++ * Replace only the ordered messages of one complete model request. The
++ * default result is `payload.messages`; listeners call `next()` to obtain
++ * and wrap the downstream projection. The loop validates message roles and
++ * tool-call/result ordering, then deep-freezes the final request before
++ * Provider dispatch. Configuration, system text, tools, Session history,
++ * and Provider invocation remain loop-owned.
++ * @param payload.agent - the agent making the model call.
++ * @param payload.sessionId - the durable Session identity stamped on the request.
++ * @param payload.turn - the open turn number.
++ * @param payload.step - the open step number.
++ * @param payload.attempt - one-based Provider attempt within this step; a new step resets it to one.
++ * @param payload.config - the effective request configuration recorded by the request header.
++ * @param payload.system - the rendered system prompt, when non-empty.
++ * @param payload.tools - the complete immutable tool-schema list.
++ * @param payload.messages - the complete immutable Session-derived messages before projection.
++ * @param payload.signal - the current turn's explicit abort signal.
++ * Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent.
++ * @mode waterfall
++ */
++'agent/request-layout'(this: Scoped<Agent>, payload: RequestLayoutInput, next: () => Promise<RequestLayoutResult>): Promise<RequestLayoutResult>
++```
++
++Types: [Scoped](scope.zh.md)
++
++Source: [`packages/core/agent/src/runtime-types.ts`](../../packages/core/agent/src/runtime-types.ts)
++
+ <a id="agentsession-start--emit"></a>
+ 
+ #### `agent/session-start` — emit
+diff --git a/packages/core/agent-loop/README.i18n.yaml b/packages/core/agent-loop/README.i18n.yaml
+index 2a5445de6baa70f5c0697cc468e26722667e315b..113278c57a007d603d018f14583b2921ee828f5e 100644
+--- a/packages/core/agent-loop/README.i18n.yaml
++++ b/packages/core/agent-loop/README.i18n.yaml
+@@ -2,5 +2,5 @@
+ # side as of the last confirmed-consistent state. Both languages carry equal authority;
+ # after editing either side, bring the other along and re-record with:
+ #   pnpm run verify-translation-pairing --write packages/core/agent-loop/README.md
+-README.md: 907bbe75fd687388be044916f4c4509e1c552177
+-README.zh.md: 76a73155a3d9f811931cf0f86c227e6ab3dc1c32
++README.md: 3b4b1ea664fd632e128d266672e9ed10e05d4526
++README.zh.md: 5a2bab9b3e8ba9138408ed3733722b8e29f8992b
+diff --git a/packages/core/agent-loop/README.md b/packages/core/agent-loop/README.md
+index 907bbe75fd687388be044916f4c4509e1c552177..3b4b1ea664fd632e128d266672e9ed10e05d4526 100644
+--- a/packages/core/agent-loop/README.md
++++ b/packages/core/agent-loop/README.md
+@@ -31,7 +31,7 @@ The config-driven `ctx.agentLoop.create()` path keeps its agent owned by the loo
+ 
+ ### Invariant companion
+ 
+-The optional `@deepseek-ai/dsh-agent-loop/invariant` companion registers request reconstruction with `ctx.invariants`. The loop records each exact frozen request in the process-local identity set owned by `dsh-llm`; the companion then requires a live session and independently rebuilds the message boundary and folded request header from the log. Direct one-shot calls remain outside this contract even when callers freeze them or attach a session id.
++The optional `@deepseek-ai/dsh-agent-loop/invariant` companion registers request reconstruction with `ctx.invariants`. The loop records each exact frozen request in the process-local identity set owned by `dsh-llm` and keeps its frozen Session-derived source boundary in a package-private WeakMap. The companion requires a live session, rebuilds that source boundary and the folded request header from the log, and accepts a validated transformed projection only when the request carries this provenance. Neither the projection nor a complete request is appended to the Session log. Direct one-shot calls remain outside this contract even when callers freeze them or attach a session id.
+ 
+ ### Configuration (schemastery)
+ 
+@@ -65,7 +65,7 @@ The driver owns one agent for its lifetime and runs inside `ctx.agents.withIniti
+ 
+ Every provider call that reaches a successful finish appends exactly one `assistant/message` completion anchor, including content-less calls and `max-tokens` finishes. The anchor records the assembled content as-is, lists the exact chunk seqs in `sourceEventSeqs` (`[]` for a stream with no chunks), and includes usage when available; empty content stays out of derived message history. A turn cancellation that interrupts streaming also appends an `interrupted: true` anchor when non-empty text or reasoning has reached the user. The anchor cites those chunk seqs and places the rendered prefix in derived message history, so the next request contains what the user saw. Undispatched tool calls are omitted, and an empty or tool-only stream produces no anchor; provider failures still commit no assistant content ([decision](../../../.agents/notes/implemented/architecture/2026-08-10-cancelled-stream-prefix-finalize.md)).
+ 
+-After `agent/request` returns a provider/model call config, the loop asks `ctx.llm.prepareCall()` to validate adapter-owned fields and materialize configured reasoning-effort and output-token defaults under the active turn signal. The prepared call retains the exact adapter registration across this asynchronous resolution, `request/header` logging, and terminal dispatch, so HMR cannot mix one adapter's capability result with another adapter's request. The header records the effective config and which fields came from the adapter. Before the next waterfall, the loop removes those marked fields from the proposal so the current exact route rematerializes its own defaults; unmarked explicit settings persist across steps and route changes. A route with no registered adapter preserves the proposed config so an `llm/stream` listener can own and short-circuit it; unhandled terminal dispatch still fails with `NO_ADAPTER`. A new loop instance follows the same adapter-default marker rule when resuming.
++After `agent/request` returns a provider/model call config, the loop asks `ctx.llm.prepareCall()` to validate adapter-owned fields and materialize configured reasoning-effort and output-token defaults under the active turn signal. It then runs `agent/request-layout` with the complete Session-derived boundary and one-based attempt before appending `request/header` or reaching the Provider. The default returns and reuses the same validated, deep-frozen messages array. A replacement is read and cloned once into the only detached snapshot, then checked for core content-block shapes and pending tool-call/result ordering; plain extension blocks with a non-empty type remain valid, and a settled opaque call id may appear in a later span. The loop deep-freezes that snapshot before publishing `request/header`, `request/context`, or another synchronous Session event. The listener receives no prepared-call or Provider capability and cannot replace config, system text, or tools through this event. A handled `agent/request-error` retry increments the attempt, while each new step starts at one. The prepared call retains the exact adapter registration across asynchronous resolution, header logging, and terminal dispatch, so HMR cannot mix one adapter's capability result with another adapter's request. The header records the effective config and which fields came from the adapter. Before the next waterfall, the loop removes those marked fields from the proposal so the current exact route rematerializes its own defaults; unmarked explicit settings persist across steps and route changes. A route with no registered adapter preserves the proposed config so an `llm/stream` listener can own and short-circuit it; unhandled terminal dispatch still fails with `NO_ADAPTER`. A new loop instance follows the same adapter-default marker rule when resuming.
+ 
+ Plugin failure ends the current turn, not the loop. Final adapter selection, dispatch, and iteration failures arrive from `ctx.llm` as terminal error or aborted finishes and enter `agent/request-error`; middleware, result processing, tools, and other extension failures remain thrown and close directly. Recovery receives request coordinates, immutable provider facts, the immutable retry policy captured by the prepared adapter registration, and the turn signal; the policy is absent when middleware owns an unprepared route. A handling listener returns `{ kind: 'retry' }`; an unhandled failure is terminal. AgentLoop owns one cancellation signal for the current admission or turn. An effective `cancel(cause)` clears pending work unless `keepInbox` is set and cooperatively aborts that signal; idle cancellation is a no-op. Waking input that lands after the abort fires but before the activity converges to idle is latched (`wakeRequested`) and replayed at the driver's own convergence boundary, so it runs without a further waking send; a `disposed` cancel never latches, and a wake submitted while already idle always opens its turn boundary (status shows a transient `idle → running → idle` pair even when the message was cleared). Durable `turn/end` records `aborted` for `user` and `parent`, while disposal records `disposed`; undispatched model tool calls receive synthetic `tool/call` and `ABORTED_BEFORE_DISPATCH` result pairs. The cancellation cause changes reporting, not how result context finalized after cancellation is handled. Disposal waits for signal-ignoring work before registry removal. The [explicit-cancellation decision](../../../.agents/notes/implemented/architecture/2026-07-16-explicit-turn-cancellation.md) and the [cancel-convergence wake latch](../../../.agents/notes/implemented/bug-fix/2026-08-07-cancel-convergence-wake-latch.md) own the lifecycle and race contract.
+ 
+@@ -88,11 +88,11 @@ Everything that goes beyond "call the model, run the tools, repeat" belongs to p
+ 
+ #### What the model sees
+ 
+-For each step, the loop sends the rendered per-agent system prompt, visible tool schemas, and the session's derived messages. It supplies `provider`, `model`, and `cwd` variable values but no additional fixed prose.
++For each attempt, the loop sends the rendered per-agent system prompt, visible tool schemas, and the validated result of `agent/request-layout`. Without a listener, that result is the Session's derived messages. It supplies `provider`, `model`, and `cwd` variable values but no additional fixed prose.
+ 
+ #### Token effect
+ 
+-System text and schemas are paid again on every step. Per-agent scoping chooses the contributions, while the authoritative assembly waterfall can alter the final request and makes its listener responsible for protocol coherence.
++System text and schemas are paid again on every attempt. Per-agent scoping chooses the contributions, while the request-layout waterfall can change the final messages and makes its listener responsible for the projection's durable reconstruction.
+ 
+ #### KV Cache effect
+ 
+diff --git a/packages/core/agent-loop/README.zh.md b/packages/core/agent-loop/README.zh.md
+index 76a73155a3d9f811931cf0f86c227e6ab3dc1c32..5a2bab9b3e8ba9138408ed3733722b8e29f8992b 100644
+--- a/packages/core/agent-loop/README.zh.md
++++ b/packages/core/agent-loop/README.zh.md
+@@ -31,7 +31,7 @@ agent（智能体）的唯一具体实现插件和循环驱动器。其包内部
+ 
+ ### 不变量配套入口
+ 
+-可选的 `@deepseek-ai/dsh-agent-loop/invariant` 配套入口会向 `ctx.invariants` 注册请求重建。循环会把每个确切的冻结请求记录在 `dsh-llm` 拥有的进程本地身份集合中；随后，配套入口要求存在实时会话，并根据日志独立重建消息边界和折叠后的请求 header。即使调用方冻结直接的一次性调用，或为其附加会话 id，这类调用仍不属于该约定。
++可选的 `@deepseek-ai/dsh-agent-loop/invariant` 配套入口会向 `ctx.invariants` 注册请求重建。循环会把每个确切的冻结请求记录在 `dsh-llm` 拥有的进程本地身份集合中，并在包私有 WeakMap 中保留其冻结的 Session 派生来源边界。配套入口要求存在实时会话，根据日志重建该来源边界与折叠后的请求 header，并且只在请求携带这份 provenance 时接受经过校验的变换投影。投影与完整请求都不会追加到 Session 日志。即使调用方冻结直接的一次性调用，或为其附加会话 id，这类调用仍不属于该约定。
+ 
+ ### 配置（Schemastery）
+ 
+@@ -65,7 +65,7 @@ interface Config {
+ 
+ 每次提供方调用成功结束时，都会恰好追加一个 `assistant/message` 完成锚点，包括无内容调用和以 `max-tokens` 结束的调用。该锚点原样记录组装后的内容，在 `sourceEventSeqs` 中列出确切的分片 seq（流没有分片时为 `[]`），并在用量可用时包含用量；空内容不会进入派生消息历史。轮次取消打断流式输出时，如果非空文本或推理内容已送达用户，循环也会追加一个带 `interrupted: true` 的锚点。该锚点引用对应的分片 seq，并把已渲染的前缀放入派生消息历史，使下一次请求包含用户看到的内容。未分派的工具调用会被省略，空流或只包含工具调用的流不会生成锚点；提供方故障也不提交 assistant 内容（[决策](../../../.agents/notes/implemented/architecture/2026-08-10-cancelled-stream-prefix-finalize.zh.md)）。
+ 
+-在 `agent/request` 返回提供方／模型调用配置后，循环会调用 `ctx.llm.prepareCall()`，在活跃轮次信号的控制下校验由适配器负责的字段，并填入配置的推理（reasoning）强度和输出 token 默认值。准备完成的调用会在这次异步解析、`request/header` 日志记录和最终分派期间保留同一项确切的适配器注册，因此 HMR（热模块替换）不会把某个适配器的能力解析结果与另一适配器的请求混用。请求 header 会记录生效配置以及哪些字段来自适配器。下一次 waterfall（瀑布式事件）前，循环会从提议中移除这些带标记字段，使当前精确路由重新填入自身默认值；未带标记的显式设置会跨步骤和路由变化保留。没有已注册适配器的路由会保留原定配置，使 `llm/stream` 监听器可以接管并短路该请求；最终分派仍会以 `NO_ADAPTER` 拒绝未得到处理的路由。新循环实例在恢复时会遵循同一套适配器默认值标记规则。
++在 `agent/request` 返回提供方／模型调用配置后，循环会调用 `ctx.llm.prepareCall()`，在活跃轮次信号的控制下校验由适配器负责的字段，并填入配置的推理（reasoning）强度和输出 token 默认值。随后，循环会在追加 `request/header` 或抵达 Provider 之前，以由 Session 派生的完整边界和从一开始计数的 attempt 运行 `agent/request-layout`。默认结果返回并复用同一个已经校验且深冻结的 messages 数组。替换结果只读取和克隆一次以形成唯一的分离快照，随后校验核心内容块结构与待闭合 tool-call/result 顺序；带非空 type 的普通扩展块仍然有效，已闭合的不透明 call id 可以在后续 span 中再次出现。循环会在发布 `request/header`、`request/context` 或其他同步 Session 事件前深冻结该快照。监听器不会收到 prepared call 或 Provider 能力，也不能通过该事件替换配置、系统文本或工具。得到处理的 `agent/request-error` 重试会递增 attempt，每个新 step 则从一开始。准备完成的调用会在异步解析、header 日志记录和最终分派期间保留同一项确切的适配器注册，因此 HMR（热模块替换）不会把某个适配器的能力解析结果与另一适配器的请求混用。请求 header 会记录生效配置以及哪些字段来自适配器。下一次 waterfall 前，循环会从提议中移除这些带标记字段，使当前精确路由重新填入自身默认值；未带标记的显式设置会跨步骤和路由变化保留。没有已注册适配器的路由会保留原定配置，使 `llm/stream` 监听器可以接管并短路该请求；最终分派仍会以 `NO_ADAPTER` 拒绝未得到处理的路由。新循环实例在恢复时会遵循同一套适配器默认值标记规则。
+ 
+ 插件失败会结束当前轮次，而不是结束循环。最终适配器选择、分发与迭代失败会以终止错误或中止结束的形式由 `ctx.llm` 传来，并进入 `agent/request-error`；middleware、结果处理、工具及其他扩展失败仍会抛出并直接关闭轮次。恢复逻辑会接收请求坐标、不可变的提供方事实、准备完成的适配器注册所捕获的不可变重试策略以及轮次信号；middleware 接管未准备路由时，该策略缺失。处理失败的监听器返回 `{ kind: 'retry' }`；未被处理的失败是终态。AgentLoop 为当前准入操作或轮次拥有一个取消信号。有效的 `cancel(cause)` 在未设置 `keepInbox` 时清除待处理工作，并以协作方式中止该信号；空闲取消是空操作。abort 触发后、活动收敛到空闲前到达的唤醒输入会被锁存（`wakeRequested`），并在 driver 自身的收敛边界重放，无需再发一条唤醒 send 即可执行；`disposed` 取消从不锁存，而 agent 已处于空闲时发送的唤醒总是打开自己的 turn 边界（即使消息已被清除，状态也会显示瞬态 `idle → running → idle` 对）。持久 `turn/end` 为 `user` 和 `parent` 记录 `aborted`，dispose 则记录 `disposed`；未分发的模型工具调用会收到合成的 `tool/call` 与 `ABORTED_BEFORE_DISPATCH` 结果对。取消原因只影响报告方式，不影响如何处理在取消后完成终结的结果上下文。dispose 会等待忽略信号的工作完成，然后才从注册表移除。[显式取消决策](../../../.agents/notes/implemented/architecture/2026-07-16-explicit-turn-cancellation.zh.md)与[取消收敛窗口唤醒锁存](../../../.agents/notes/implemented/bug-fix/2026-08-07-cancel-convergence-wake-latch.zh.md)规定生命周期与竞态约定。
+ 
+@@ -88,11 +88,11 @@ interface Config {
+ 
+ #### 模型看到的内容
+ 
+-每个步骤中，循环会发送针对该 agent 呈现的系统提示词、可见工具 schema 和会话派生消息。它提供 `provider`、`model` 与 `cwd` 变量值，但不添加固定文案。
++每次 attempt 中，循环会发送针对该 agent 呈现的系统提示词、可见工具 schema，以及通过校验的 `agent/request-layout` 结果。没有监听器时，该结果就是 Session 派生消息。它提供 `provider`、`model` 与 `cwd` 变量值，但不添加固定文案。
+ 
+ #### Token 影响
+ 
+-每个步骤都会再次计入系统文本与 schema。逐 agent 作用域决定贡献，而权威组装 waterfall 可以改变最终请求，并使其监听器负责保持协议连贯。
++每次 attempt 都会再次计入系统文本与 schema。逐 agent 作用域决定贡献，而 request-layout waterfall 可以改变最终消息，并使其监听器负责投影的持久重建。
+ 
+ #### KV Cache 影响
+ 
+diff --git a/packages/core/agent-loop/src/agent.ts b/packages/core/agent-loop/src/agent.ts
+index 3ef1ec7aa462ee561485a7472f4347d31bbd88bb..9f8b34c567695d5f9b130d3fab2ebeed6645ac17 100644
+--- a/packages/core/agent-loop/src/agent.ts
++++ b/packages/core/agent-loop/src/agent.ts
+@@ -14,6 +14,7 @@ import type {
+   InboxTarget,
+   PreStepDecision,
+   RequestErrorAction,
++  RequestLayoutResult,
+ } from '@deepseek-ai/dsh-agent'
+ import { Inbox, agentEvents, assembleContextFor } from '@deepseek-ai/dsh-agent'
+ import type { GenerateOptions, LlmCallConfig, Message, PreparedLlmCall } from '@deepseek-ai/dsh-llm'
+@@ -33,6 +34,7 @@ import { joinContextSections, renderContextSections, renderPrompt } from '@deeps
+ import type { PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
+ import type { Context } from '@deepseek-ai/cordis'
+ import { RuntimeContextProjection } from './runtime-context.ts'
++import { finalizeRequestLayout, recordRequestLayoutProvenance } from './request-layout.ts'
+ import { executeToolCalls } from './tool-calls.ts'
+ 
+ type Phase =
+@@ -336,9 +338,10 @@ export class ReactLoopAgent implements Agent {
+     signal.throwIfAborted()
+     const system = renderPrompt(assembly)
+ 
++    let attempt = 1
+     while (true) {
+       const { request, preparedCall } = await this.buildRequest(
+-        turn, step, assembly.tools, system, this.session.deriveMessages(), signal,
++        turn, step, attempt, assembly.tools, system, this.session.deriveMessages(), signal,
+       )
+       const assembler = new BlockAssembler()
+       const chunkSeqs: number[] = []
+@@ -386,6 +389,7 @@ export class ReactLoopAgent implements Agent {
+         if (action?.kind !== 'retry') {
+           throw new LlmError(finish.failure.message, finish.failure.code, finish.failure)
+         }
++        attempt += 1
+         continue
+       }
+ 
+@@ -426,6 +430,7 @@ export class ReactLoopAgent implements Agent {
+   private async buildRequest(
+     turn: number,
+     step: number,
++    attempt: number,
+     tools: GenerateOptions['tools'] & object,
+     system: string,
+     boundaryMessages: Message[],
+@@ -470,7 +475,7 @@ export class ReactLoopAgent implements Agent {
+     } catch (error: unknown) {
+       // Middleware may serve an unregistered route; terminal dispatch still requires an adapter.
+       if (!(error instanceof LlmError) || error.code !== 'NO_ADAPTER') throw error
+-      config = proposedConfig
++      config = deepFreeze(structuredClone(proposedConfig))
+     }
+     signal.throwIfAborted()
+ 
+@@ -480,6 +485,23 @@ export class ReactLoopAgent implements Agent {
+       ...system ? { system } : {},
+       ...tools.length > 0 ? { tools } : {},
+     })
++    const sourceBoundaryMessages = deepFreeze(boundaryMessages)
++    const layout = await this.dispatch.waterfall(
++      'agent/request-layout', {
++        sessionId: session.id,
++        turn,
++        step,
++        attempt,
++        config: header.config,
++        ...header.system === undefined ? {} : { system: header.system },
++        tools: deepFreeze(header.tools ?? []),
++        messages: sourceBoundaryMessages,
++        signal,
++      },
++      (): Promise<RequestLayoutResult> => Promise.resolve({ messages: sourceBoundaryMessages }),
++    )
++    signal.throwIfAborted()
++    const { messages, layoutApplied } = finalizeRequestLayout(layout, sourceBoundaryMessages)
+     const baseline = this.session.requestHeader()
+     if (!this.requestHeaderLogged) {
+       this.session.append('request/header', { header, reason: baseline === undefined ? 'initial' : 'resume' })
+@@ -504,12 +526,16 @@ export class ReactLoopAgent implements Agent {
+ 
+     const request = markAgentLoopRequest(deepFreeze({
+       ...header.config,
+-      messages: boundaryMessages,
++      messages,
+       ...header.system !== undefined ? { system: header.system } : {},
+       ...header.tools !== undefined ? { tools: header.tools } : {},
+       sessionId: this.session.id,
+       signal,
+     }))
++    recordRequestLayoutProvenance(request, {
++      sourceBoundaryMessages,
++      layoutApplied,
++    })
+     return { request, ...preparedCall === undefined ? {} : { preparedCall } }
+   }
+ }
+diff --git a/packages/core/agent-loop/src/invariant.ts b/packages/core/agent-loop/src/invariant.ts
+index 80fdfba8f900a471b8d9c7d65d99b5eeedd2841b..3f382a420c81c7314d27f01bfd972e2868d1a366 100644
+--- a/packages/core/agent-loop/src/invariant.ts
++++ b/packages/core/agent-loop/src/invariant.ts
+@@ -7,6 +7,7 @@ import type { Context } from '@deepseek-ai/cordis'
+ import { isAgentLoopRequest, type GenerateOptions } from '@deepseek-ai/dsh-llm'
+ import type { InvariantFailure, InvariantInstaller } from '@deepseek-ai/dsh-invariants'
+ import { foldRequestHeader } from '@deepseek-ai/dsh-session'
++import { getRequestLayoutProvenance } from './request-layout.ts'
+ 
+ const PACKAGE_NAME = '@deepseek-ai/dsh-agent-loop'
+ 
+@@ -36,9 +37,18 @@ const install: InvariantInstaller = Object.assign((ctx: Context, fail: Invariant
+     if (header === undefined) {
+       return fail('a loop-built request with no request/header event in its session log')
+     }
++    const provenance = getRequestLayoutProvenance(options)
++    const sourceBoundaryMessages = provenance?.sourceBoundaryMessages ?? options.messages
++    if (!Object.isFrozen(sourceBoundaryMessages)) {
++      fail('a loop-built request must carry a frozen source boundary')
++    }
+     const expected = session.deriveMessages()
+-    if (JSON.stringify(options.messages) !== JSON.stringify(expected)) {
+-      fail(`llm request for session "${String(session.id)}" diverges from the dispatch-time durable derivation (log-reconstruction desync)`)
++    if (JSON.stringify(sourceBoundaryMessages) !== JSON.stringify(expected)) {
++      fail(`llm request for session "${String(session.id)}" has a source boundary that diverges from the dispatch-time durable derivation (log-reconstruction desync)`)
++    }
++    if (provenance?.layoutApplied !== true
++      && JSON.stringify(options.messages) !== JSON.stringify(sourceBoundaryMessages)) {
++      fail(`llm request for session "${String(session.id)}" changed messages without request-layout provenance`)
+     }
+ 
+     const headerMatches = options.model === header.config.model
+diff --git a/packages/core/agent-loop/src/request-layout.ts b/packages/core/agent-loop/src/request-layout.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..be01a32709cd8649f30da79e58d09fb787d0ff81
+--- /dev/null
++++ b/packages/core/agent-loop/src/request-layout.ts
+@@ -0,0 +1,184 @@
++/** Request-layout validation and process-local reconstruction provenance. */
++
++import {
++  assertContentBlocks,
++  deepFreeze,
++  type AssistantMessage,
++  type GenerateOptions,
++  type Message,
++  type ToolResultMessage,
++  type UserMessage,
++} from '@deepseek-ai/dsh-llm'
++import { adoptSessionEvent } from '@deepseek-ai/dsh-session'
++
++/** Source derivation retained outside the durable log for one live request. */
++export interface RequestLayoutProvenance {
++  /** Frozen Session-derived messages supplied to the layout waterfall. */
++  readonly sourceBoundaryMessages: readonly Message[]
++  /** Whether the waterfall returned a different messages array. */
++  readonly layoutApplied: boolean
++}
++
++const requestLayoutProvenance = new WeakMap<GenerateOptions, RequestLayoutProvenance>()
++
++/**
++ * Record package-private source derivation for one loop-built request.
++ *
++ * @param request - Final frozen provider request.
++ * @param provenance - Frozen source-boundary metadata for the request.
++ */
++export function recordRequestLayoutProvenance(
++  request: GenerateOptions,
++  provenance: RequestLayoutProvenance,
++): void {
++  requestLayoutProvenance.set(request, Object.freeze(provenance))
++}
++
++/**
++ * Read package-private source derivation for invariant checking.
++ *
++ * @param request - Final frozen provider request.
++ * @returns The request provenance when the loop constructed the request.
++ */
++export function getRequestLayoutProvenance(
++  request: GenerateOptions,
++): RequestLayoutProvenance | undefined {
++  return requestLayoutProvenance.get(request)
++}
++
++/** Narrow an unknown value to a non-null object record. */
++function objectRecord(value: unknown): Record<string, unknown> | undefined {
++  return typeof value === 'object' && value !== null
++    ? value as Record<string, unknown>
++    : undefined
++}
++
++/** Reuse Session's message validator without publishing a synthetic event. */
++function validateMessage(message: unknown, index: number): asserts message is Message {
++  const record = objectRecord(message)
++  if (record === undefined) {
++    throw new Error(`agent/request-layout message at index ${index} is not an object`)
++  }
++  const base = { seq: index, time: 0, surfaceOp: 'append' as const }
++  if (record['role'] === 'assistant') {
++    adoptSessionEvent({
++      ...base,
++      type: 'assistant/message',
++      data: { turn: 1, step: 1, message: message as AssistantMessage },
++    })
++    return
++  }
++  const source = objectRecord(record['source'])
++  const content = record['content']
++  const hasToolResult = Array.isArray(content)
++    && content.some(block => objectRecord(block)?.['type'] === 'tool-result')
++  if (source?.['kind'] === 'tool' || hasToolResult) {
++    adoptSessionEvent({
++      ...base,
++      type: 'tool/result',
++      data: { turn: 1, step: 1, message: message as ToolResultMessage },
++    })
++    return
++  }
++  if (record['role'] === 'user') {
++    adoptSessionEvent({
++      ...base,
++      type: 'user/message',
++      data: message as UserMessage,
++    })
++    return
++  }
++  if (record['role'] !== 'system') {
++    throw new Error(`agent/request-layout message at index ${index} has an invalid role`)
++  }
++  if (typeof record['id'] !== 'string' || record['id'].length === 0) {
++    throw new Error(`agent/request-layout message at index ${index} lacks an identified message`)
++  }
++  if (!Array.isArray(content)
++    || source === undefined
++    || typeof source['kind'] !== 'string'
++    || source['kind'].length === 0) {
++    throw new Error(`agent/request-layout system message at index ${index} has invalid content or source`)
++  }
++  assertContentBlocks(content, `agent/request-layout system message at index ${index} content`)
++  deepFreeze(message)
++}
++
++/** Validate top-level tool calls and results in projected message order. */
++function validateToolProtocol(messages: readonly Message[]): void {
++  const pending = new Set<string>()
++  for (const [messageIndex, message] of messages.entries()) {
++    const calls: Record<string, unknown>[] = []
++    const results: Record<string, unknown>[] = []
++    for (const value of message.content as unknown[]) {
++      const block = objectRecord(value)
++      if (block?.['type'] === 'tool-call') calls.push(block)
++      if (block?.['type'] === 'tool-result') results.push(block)
++    }
++    if (pending.size > 0 && (calls.length > 0 || results.length === 0)) {
++      throw new Error('agent/request-layout tool-call messages must be followed immediately by tool-result messages')
++    }
++    if (calls.length > 0) {
++      if (message.role !== 'assistant' || message.source.kind !== 'model') {
++        throw new Error(`agent/request-layout tool-call at message index ${messageIndex} must belong to an assistant model message`)
++      }
++      for (const block of calls) {
++        const id = block['id']
++        if (typeof id !== 'string' || id.length === 0
++          || typeof block['name'] !== 'string' || block['name'].length === 0
++          || typeof block['arguments'] !== 'string') {
++          throw new Error(`agent/request-layout tool-call at message index ${messageIndex} is invalid`)
++        }
++        if (pending.has(id)) {
++          throw new Error(`agent/request-layout tool-call "${id}" occurs more than once`)
++        }
++        pending.add(id)
++      }
++    }
++    if (results.length === 0) continue
++    if (message.role !== 'user' || message.source.kind !== 'tool') {
++      throw new Error(`agent/request-layout tool-result at message index ${messageIndex} must belong to a user tool message`)
++    }
++    for (const block of results) {
++      const toolCallId = block['toolCallId']
++      if (typeof toolCallId !== 'string' || !pending.delete(toolCallId)) {
++        throw new Error(`agent/request-layout tool-result "${String(toolCallId)}" has no matching tool-call`)
++      }
++    }
++  }
++  const [missing] = pending
++  if (missing !== undefined) {
++    throw new Error(`agent/request-layout tool-call "${missing}" has no matching tool-result`)
++  }
++}
++
++/**
++ * Select identity or create and validate one detached transformed snapshot.
++ *
++ * @param result - Untrusted waterfall result returned by request-layout listeners.
++ * @param sourceBoundaryMessages - Frozen Session-derived identity result.
++ * @returns Frozen final messages and whether a transformed array was supplied.
++ */
++export function finalizeRequestLayout(
++  result: unknown,
++  sourceBoundaryMessages: Message[],
++): { messages: Message[]; layoutApplied: boolean } {
++  const record = objectRecord(result)
++  if (record === undefined) {
++    throw new Error('agent/request-layout must return an object with a messages array')
++  }
++  const candidate = record['messages']
++  if (candidate === sourceBoundaryMessages) {
++    return { messages: sourceBoundaryMessages, layoutApplied: false }
++  }
++  if (!Array.isArray(candidate)) {
++    throw new Error('agent/request-layout must return an object with a messages array')
++  }
++  const snapshot: unknown[] = structuredClone(candidate)
++  snapshot.forEach((message, index) => {
++    validateMessage(message, index)
++  })
++  const messages = snapshot as Message[]
++  validateToolProtocol(messages)
++  return { messages: deepFreeze(messages), layoutApplied: true }
++}
+diff --git a/packages/core/agent-loop/tests/request-layout.spec.ts b/packages/core/agent-loop/tests/request-layout.spec.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1af285f7d70c218fc0a245bb0e6f4636c9f71068
+--- /dev/null
++++ b/packages/core/agent-loop/tests/request-layout.spec.ts
+@@ -0,0 +1,574 @@
++import { describe, expect, it, vi } from 'vitest'
++import { Context } from '@deepseek-ai/cordis'
++import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
++import AgentLoop from '@deepseek-ai/dsh-agent-loop'
++import * as AgentLoopInvariant from '@deepseek-ai/dsh-agent-loop/invariant'
++import InvariantRegistry from '@deepseek-ai/dsh-invariants'
++import LlmRuntime, {
++  CallId,
++  createAssistantMessage,
++  createToolResultMessage,
++  createUserMessage,
++  LlmError,
++  type Message,
++} from '@deepseek-ai/dsh-llm'
++import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
++import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
++import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
++import { MockAdapter, textResponse, toolCallResponse } from './mock-adapter.ts'
++import { finalizeRequestLayout } from '../src/request-layout.ts'
++
++async function harness(adapter: MockAdapter, invariants = false): Promise<Context> {
++  const ctx = new Context()
++  await ctx.plugin(LlmRuntime)
++  await ctx.plugin(SessionStore)
++  await ctx.plugin(SystemPrompt, { persona: 'stable layout system' })
++  await ctx.plugin(ToolRuntime)
++  await ctx.plugin(AgentRegistry)
++  await ctx.plugin(AgentLoop, { agents: [] })
++  if (invariants) {
++    await ctx.plugin(InvariantRegistry)
++    await ctx.plugin(AgentLoopInvariant)
++  }
++  ctx.llm.registerAdapter(['mock'], adapter)
++  return ctx
++}
++
++function message(text: string) {
++  return createUserMessage({
++    content: [{ type: 'text', text }],
++    source: { kind: 'user' },
++  })
++}
++
++function send(agent: Agent, text: string): void {
++  agent.followup(message(text))
++}
++
++function registerEcho(ctx: Context): void {
++  ctx.tools.register(defineContentToolFixture({
++    name: 'echo',
++    description: 'echo back',
++    parameters: { text: { type: 'string' } },
++    async execute(args) {
++      return [{ type: 'text', text: `echo: ${String(args.text)}` }]
++    },
++  }))
++}
++
++describe('agent/request-layout', () => {
++  it('preserves the baseline request when no listener is registered', async () => {
++    const adapter = new MockAdapter([textResponse('done')])
++    const ctx = await harness(adapter)
++    const agent = ctx.agentLoop.create(SessionId('layout-identity'), {
++      provider: 'mock',
++      model: 'mock',
++    })
++    const input = message('identity')
++
++    agent.followup(input)
++    await agent.whenIdle()
++
++    expect(adapter.requests).toHaveLength(1)
++    expect(adapter.requests[0]).toMatchObject({
++      provider: 'mock',
++      model: 'mock',
++      messages: [input],
++      sessionId: agent.session.id,
++    })
++    expect(adapter.requests[0]?.system).toContain('stable layout system')
++    expect(adapter.requests[0]?.tools).toBeUndefined()
++  })
++
++  it('reuses the frozen source array for an identity listener', async () => {
++    const adapter = new MockAdapter([textResponse('done')])
++    const ctx = await harness(adapter, true)
++    const agent = ctx.agentLoop.create(SessionId('layout-identity-reference'), {
++      provider: 'mock',
++      model: 'mock',
++    })
++    let source: readonly Message[] | undefined
++    ctx.on('agent/request-layout', async ({ messages }, next) => {
++      source = messages
++      return next()
++    })
++
++    send(agent, 'identity-reference')
++    await agent.whenIdle()
++
++    expect(adapter.requests).toHaveLength(1)
++    expect(adapter.requests[0]?.messages).toBe(source)
++    expect(Object.isFrozen(source)).toBe(true)
++    expect(Object.isFrozen(source?.[0])).toBe(true)
++  })
++
++  it('exposes the complete claimed boundary and accepts a reordered projection', async () => {
++    const adapter = new MockAdapter([textResponse('done')])
++    const ctx = await harness(adapter, true)
++    const agent = ctx.agentLoop.create(SessionId('layout-reorder'), {
++      provider: 'mock',
++      model: 'mock',
++    })
++    const injected = message('injected context')
++    const current = message('current trigger')
++    let seen: {
++      agent: Agent
++      sessionId: SessionId
++      turn: number
++      step: number
++      attempt: number
++      system?: string
++      tools: readonly unknown[]
++      messages: readonly Message[]
++      config: { provider: string; model: string }
++      signal: AbortSignal
++    } | undefined
++
++    ctx.on('agent/request-layout', async (payload, next) => {
++      seen = payload
++      const baseline = await next()
++      return { messages: [...baseline.messages].reverse() }
++    })
++    agent.inject(injected)
++    agent.followup(current)
++    await agent.whenIdle()
++
++    expect(seen).toBeDefined()
++    if (seen === undefined) return
++    expect(seen.agent).toBe(agent)
++    expect(seen.sessionId).toBe(agent.session.id)
++    expect({
++      turn: seen.turn,
++      step: seen.step,
++      attempt: seen.attempt,
++      config: seen.config,
++      system: seen.system,
++      tools: seen.tools,
++    }).toMatchObject({
++      turn: 1,
++      step: 1,
++      attempt: 1,
++      config: { provider: 'mock', model: 'mock' },
++      tools: [],
++    })
++    expect(seen.system).toContain('stable layout system')
++    expect(seen.signal).toBeInstanceOf(AbortSignal)
++    expect(seen.messages.map(item => item.id)).toEqual([
++      injected.id,
++      current.id,
++    ])
++    expect(adapter.requests[0]?.messages.map(item => item.id)).toEqual([
++      current.id,
++      injected.id,
++    ])
++  })
++
++  it.each([
++    {
++      name: 'an assistant role with a user source',
++      replacement: (boundary: readonly Message[]): readonly Message[] => [{
++        ...boundary[0]!,
++        role: 'assistant',
++      }],
++      error: /model source/,
++    },
++    {
++      name: 'an orphaned tool result',
++      replacement: (): readonly Message[] => [createToolResultMessage({
++        callId: CallId('orphan'),
++        content: [{ type: 'text', text: 'orphaned' }],
++        isError: false,
++      })],
++      error: /no matching tool-call/,
++    },
++    {
++      name: 'a user-role tool call with a matching result',
++      replacement: (boundary: readonly Message[]): readonly Message[] => {
++        const callId = CallId('user-role-call')
++        return [
++          {
++            ...boundary[0]!,
++            content: [{ type: 'tool-call', id: callId, name: 'echo', arguments: '{}' }],
++          },
++          createToolResultMessage({ callId, content: [], isError: false }),
++        ]
++      },
++      error: /tool-call.*assistant model message/,
++    },
++    {
++      name: 'a message interleaved between a tool call and its result',
++      replacement: (): readonly Message[] => {
++        const callId = CallId('interleaved-call')
++        return [
++          createAssistantMessage({
++            content: [{ type: 'tool-call', id: callId, name: 'echo', arguments: '{}' }],
++            source: { provider: 'mock', model: 'mock' },
++          }),
++          message('interleaved'),
++          createToolResultMessage({ callId, content: [], isError: false }),
++        ]
++      },
++      error: /must be followed immediately by tool-result messages/,
++    },
++    {
++      name: 'a duplicate tool call in one open span',
++      replacement: (): readonly Message[] => {
++        const callId = CallId('duplicate-open-call')
++        return [
++          createAssistantMessage({
++            content: [
++              { type: 'tool-call', id: callId, name: 'echo', arguments: '{}' },
++              { type: 'tool-call', id: callId, name: 'echo', arguments: '{}' },
++            ],
++            source: { provider: 'mock', model: 'mock' },
++          }),
++          createToolResultMessage({ callId, content: [], isError: false }),
++        ]
++      },
++      error: /tool-call.*occurs more than once/,
++    },
++    {
++      name: 'a duplicate result after its call is settled',
++      replacement: (): readonly Message[] => {
++        const callId = CallId('duplicate-result')
++        return [
++          createAssistantMessage({
++            content: [{ type: 'tool-call', id: callId, name: 'echo', arguments: '{}' }],
++            source: { provider: 'mock', model: 'mock' },
++          }),
++          createToolResultMessage({ callId, content: [], isError: false }),
++          createToolResultMessage({ callId, content: [], isError: false }),
++        ]
++      },
++      error: /tool-result.*has no matching tool-call/,
++    },
++    {
++      name: 'a text block without text',
++      replacement: (boundary: readonly Message[]): readonly Message[] => [{
++        ...boundary[0]!,
++        content: [{ type: 'text' }],
++      } as unknown as Message],
++      error: /text block.*text/,
++    },
++    {
++      name: 'a tool result with a non-boolean isError',
++      replacement: (): readonly Message[] => {
++        const callId = CallId('bad-is-error')
++        const result = structuredClone(createToolResultMessage({
++          callId,
++          content: [],
++          isError: false,
++        })) as unknown as { content: [{ isError: unknown }] }
++        result.content[0].isError = 'false'
++        return [
++          createAssistantMessage({
++            content: [{ type: 'tool-call', id: callId, name: 'echo', arguments: '{}' }],
++            source: { provider: 'mock', model: 'mock' },
++          }),
++          result as unknown as Message,
++        ]
++      },
++      error: /tool-result block.*isError/,
++    },
++    {
++      name: 'a malformed nested tool-result block',
++      replacement: (): readonly Message[] => {
++        const callId = CallId('bad-nested-block')
++        return [
++          createAssistantMessage({
++            content: [{ type: 'tool-call', id: callId, name: 'echo', arguments: '{}' }],
++            source: { provider: 'mock', model: 'mock' },
++          }),
++          createToolResultMessage({
++            callId,
++            content: [{ type: 'reasoning', text: 7 } as unknown as Message['content'][number]],
++            isError: false,
++          }),
++        ]
++      },
++      error: /reasoning block.*text/,
++    },
++    {
++      name: 'an image block with an incomplete attachment reference',
++      replacement: (boundary: readonly Message[]): readonly Message[] => [{
++        ...boundary[0]!,
++        content: [{ type: 'image', attachment: { attachmentId: 'missing-fields' } }],
++      } as unknown as Message],
++      error: /image block.*attachment/,
++    },
++  ])('rejects $name before request-header logging or Provider dispatch', async ({ replacement, error }) => {
++    const adapter = new MockAdapter([textResponse('unused')])
++    const ctx = await harness(adapter)
++    const agent = ctx.agentLoop.create(SessionId(`layout-invalid-${String(error)}`), {
++      provider: 'mock',
++      model: 'mock',
++    })
++    const failures: unknown[] = []
++    ctx.on('agent/error', ({ agent: subject, error: failure }) => {
++      if (subject === agent) failures.push(failure)
++    })
++    ctx.on('agent/request-layout', async ({ messages }) => ({
++      messages: replacement(messages),
++    }))
++
++    send(agent, 'go')
++    await agent.whenIdle()
++
++    expect(adapter.requests).toHaveLength(0)
++    expect(agent.session.events.filter(event => event.type === 'request/header')).toHaveLength(0)
++    expect(failures).toHaveLength(1)
++    expect(failures[0]).toBeInstanceOf(Error)
++    if (!(failures[0] instanceof Error)) return
++    expect(failures[0].message).toMatch(error)
++  })
++
++  it('snapshots a transformed message before reading its stateful properties for validation', async () => {
++    const adapter = new MockAdapter([textResponse('done')])
++    const ctx = await harness(adapter, true)
++    const agent = ctx.agentLoop.create(SessionId('layout-stateful-getter'), {
++      provider: 'mock',
++      model: 'mock',
++    })
++    let messagesReads = 0
++    let roleReads = 0
++    ctx.on('agent/request-layout', async ({ messages }) => {
++      const projected = structuredClone(messages[0]!)
++      Object.defineProperty(projected, 'role', {
++        configurable: true,
++        enumerable: true,
++        get() {
++          roleReads += 1
++          return roleReads === 1 ? 'user' : 'assistant'
++        },
++      })
++      return Object.defineProperty({}, 'messages', {
++        enumerable: true,
++        get() {
++          messagesReads += 1
++          return [projected]
++        },
++      }) as { messages: Message[] }
++    })
++
++    send(agent, 'getter')
++    await agent.whenIdle()
++
++    expect(adapter.requests).toHaveLength(1)
++    expect(adapter.requests[0]?.messages[0]?.role).toBe('user')
++    expect(messagesReads).toBe(1)
++    expect(roleReads).toBe(1)
++  })
++
++  it('clones no identity boundary and exactly one transformed boundary', () => {
++    const source = Object.freeze([message('source')]) as unknown as Message[]
++    const transformed = [{
++      ...source[0]!,
++      content: [{ type: 'text', text: 'transformed' }],
++    }] as Message[]
++    const clone = vi.spyOn(globalThis, 'structuredClone')
++    try {
++      expect(finalizeRequestLayout({ messages: source }, source)).toEqual({
++        messages: source,
++        layoutApplied: false,
++      })
++      expect(clone).not.toHaveBeenCalled()
++
++      const result = finalizeRequestLayout({ messages: transformed }, source)
++      expect(clone).toHaveBeenCalledTimes(1)
++      expect(result.messages).not.toBe(transformed)
++      expect(result).toMatchObject({ layoutApplied: true })
++    } finally {
++      clone.mockRestore()
++    }
++  })
++
++  it('allows an unknown plain extension block with a non-empty type', async () => {
++    const adapter = new MockAdapter([textResponse('done')])
++    const ctx = await harness(adapter, true)
++    const agent = ctx.agentLoop.create(SessionId('layout-extension-block'), {
++      provider: 'mock',
++      model: 'mock',
++    })
++    ctx.on('agent/request-layout', async ({ messages }) => ({
++      messages: [{
++        ...messages[0]!,
++        content: [{ type: 'plugin-chart', payload: { series: [1, 2, 3] } }],
++      } as unknown as Message],
++    }))
++
++    send(agent, 'extension')
++    await agent.whenIdle()
++
++    expect(adapter.requests).toHaveLength(1)
++    expect(adapter.requests[0]?.messages[0]?.content).toEqual([
++      { type: 'plugin-chart', payload: { series: [1, 2, 3] } },
++    ])
++  })
++
++  it('deep-freezes a detached listener projection before dispatch', async () => {
++    const adapter = new MockAdapter([textResponse('done')])
++    const ctx = await harness(adapter)
++    const agent = ctx.agentLoop.create(SessionId('layout-freeze'), {
++      provider: 'mock',
++      model: 'mock',
++    })
++    let projected: Message[] | undefined
++    ctx.on('agent/request-layout', async ({ messages }) => {
++      projected = messages.map(item => structuredClone(item))
++      return { messages: projected }
++    })
++
++    send(agent, 'freeze')
++    await agent.whenIdle()
++
++    const request = adapter.requests[0]!
++    expect(request.messages).not.toBe(projected)
++    expect(Object.isFrozen(request)).toBe(true)
++    expect(Object.isFrozen(request.messages)).toBe(true)
++    expect(Object.isFrozen(request.messages[0])).toBe(true)
++    expect(Object.isFrozen(request.messages[0]?.content)).toBe(true)
++    expect(Object.isFrozen(request.messages[0]?.content[0])).toBe(true)
++  })
++
++  it('detaches and freezes projected messages before publishing synchronous session events', async () => {
++    const adapter = new MockAdapter([textResponse('done')])
++    const ctx = await harness(adapter)
++    const agent = ctx.agentLoop.create(SessionId('layout-observer-freeze'), {
++      provider: 'mock',
++      model: 'mock',
++    })
++    let projected: Message[] | undefined
++    let mutationThrew = false
++    ctx.on('agent/request-layout', async ({ messages }) => {
++      projected = messages.map(item => structuredClone(item))
++      return { messages: projected }
++    })
++    ctx.on('session/event', (session, event) => {
++      if (session !== agent.session || event.type !== 'request/header' || projected === undefined) return
++      try {
++        Object.assign(projected[0]!.content[0]!, { text: 'mutated by observer' })
++      } catch {
++        mutationThrew = true
++      }
++    })
++
++    send(agent, 'observer-safe')
++    await agent.whenIdle()
++
++    const request = adapter.requests[0]!
++    expect(request.messages).not.toBe(projected)
++    expect(request.messages[0]?.content).toEqual([{ type: 'text', text: 'observer-safe' }])
++    expect(Object.isFrozen(request.messages)).toBe(true)
++    expect(Object.isFrozen(request.messages[0])).toBe(true)
++    expect(Object.isFrozen(request.messages[0]?.content[0])).toBe(true)
++    const projectedBlock = projected?.[0]?.content[0]
++    expect(mutationThrew || (projectedBlock?.type === 'text'
++      && projectedBlock.text === 'mutated by observer')).toBe(true)
++  })
++
++  it('accepts the same opaque tool-call id in two consecutive settled steps without a listener', async () => {
++    const adapter = new MockAdapter([
++      toolCallResponse('reused-call', 'echo', { text: 'one' }),
++      toolCallResponse('reused-call', 'echo', { text: 'two' }),
++      textResponse('done'),
++    ])
++    const ctx = await harness(adapter, true)
++    registerEcho(ctx)
++    const agent = ctx.agentLoop.create(SessionId('layout-reused-call-id'), {
++      provider: 'mock',
++      model: 'mock',
++    })
++
++    send(agent, 'reuse')
++    await agent.whenIdle()
++
++    expect(adapter.requests).toHaveLength(3)
++    expect(adapter.requests[2]?.messages.filter(item =>
++      item.content.some(block => block.type === 'tool-call' && block.id === CallId('reused-call')),
++    )).toHaveLength(2)
++    expect(adapter.requests[2]?.messages.filter(item =>
++      item.content.some(block => block.type === 'tool-result' && block.toolCallId === CallId('reused-call')),
++    )).toHaveLength(2)
++  })
++
++  it('numbers retries from one and resets the attempt on the next tool step', async () => {
++    const adapter = new MockAdapter([
++      () => { throw new LlmError('busy', 'RATE_LIMIT') },
++      toolCallResponse('layout-call', 'echo', { text: 'one' }),
++      textResponse('done'),
++    ])
++    const ctx = await harness(adapter, true)
++    registerEcho(ctx)
++    const agent = ctx.agentLoop.create(SessionId('layout-attempt'), {
++      provider: 'mock',
++      model: 'mock',
++    })
++    const seen: {
++      turn: number
++      step: number
++      attempt: number
++      hasToolResult: boolean
++    }[] = []
++    const context = message('retry context')
++    const current = message('go')
++    ctx.on('agent/request-layout', async ({ turn, step, attempt, messages }, next) => {
++      seen.push({
++        turn,
++        step,
++        attempt,
++        hasToolResult: messages.some(item =>
++          item.content.some(block => block.type === 'tool-result')),
++      })
++      const baseline = await next()
++      if (step !== 2) return baseline
++      return {
++        messages: [
++          ...baseline.messages.filter(item => item.id !== context.id),
++          context,
++        ],
++      }
++    })
++    ctx.on('agent/request-error', async () => ({ kind: 'retry' }))
++
++    agent.inject(context)
++    agent.followup(current)
++    await agent.whenIdle()
++
++    expect(seen).toEqual([
++      { turn: 1, step: 1, attempt: 1, hasToolResult: false },
++      { turn: 1, step: 1, attempt: 2, hasToolResult: false },
++      { turn: 1, step: 2, attempt: 1, hasToolResult: true },
++    ])
++    expect(adapter.requests).toHaveLength(3)
++    expect(adapter.requests[2]?.messages.at(-1)?.id).toBe(context.id)
++    expect(adapter.requests[2]?.messages.some(item => item.id === current.id)).toBe(true)
++    expect(adapter.requests[2]?.messages.some(item =>
++      item.content.some(block => block.type === 'tool-result'))).toBe(true)
++  })
++
++  it('rejects a source boundary that no longer matches the session at dispatch', async () => {
++    const adapter = new MockAdapter([textResponse('unused')])
++    const ctx = await harness(adapter, true)
++    const agent = ctx.agentLoop.create(SessionId('layout-source-mismatch'), {
++      provider: 'mock',
++      model: 'mock',
++    })
++    const failures: unknown[] = []
++    ctx.on('agent/error', ({ agent: subject, error }) => {
++      if (subject === agent) failures.push(error)
++    })
++    ctx.on('agent/request-layout', async ({ messages }) => {
++      agent.session.append('user/message', message('late mutation'), { surfaceOp: 'append' })
++      return { messages }
++    })
++
++    send(agent, 'go')
++    await agent.whenIdle()
++
++    expect(adapter.requests).toHaveLength(0)
++    expect(failures).toHaveLength(1)
++    expect(failures[0]).toBeInstanceOf(Error)
++    if (!(failures[0] instanceof Error)) return
++    expect(failures[0].message).toMatch(/source boundary.*durable derivation/)
++  })
++})
+diff --git a/packages/core/agent/README.i18n.yaml b/packages/core/agent/README.i18n.yaml
+index 4dd5627b2e60fbc4043edb326da1471d339bb699..020b57ad189ed2d476abb17226b4af9cfa5f7dd3 100644
+--- a/packages/core/agent/README.i18n.yaml
++++ b/packages/core/agent/README.i18n.yaml
+@@ -2,5 +2,5 @@
+ # side as of the last confirmed-consistent state. Both languages carry equal authority;
+ # after editing either side, bring the other along and re-record with:
+ #   pnpm run verify-translation-pairing --write packages/core/agent/README.md
+-README.md: f6b698e93b254c97786155e7d2c7e81f07c0d981
+-README.zh.md: 5e3da8a5d09d06fa4fc9726406aae9c6d5e69c3e
++README.md: 8cdaf500a6eac3ca8d1ce4392cd16ad02a60b0d9
++README.zh.md: eb9628e8080eb05b8e70840a5fdd7355885f5fe6
+diff --git a/packages/core/agent/README.md b/packages/core/agent/README.md
+index f6b698e93b254c97786155e7d2c7e81f07c0d981..8cdaf500a6eac3ca8d1ce4392cd16ad02a60b0d9 100644
+--- a/packages/core/agent/README.md
++++ b/packages/core/agent/README.md
+@@ -50,7 +50,7 @@ Agent *creation* is provided by the plugin implementing `AgentFactory` (`dsh-age
+ 
+ The lifecycle edges have two important local caveats. `agent/created` runs after scoped setup and after both session and agent registry entries exist. Setup is trusted composition-only code; the immediately following non-vetoing `agent/session-start` notification is the first supported startup injection point. `agent/disposed` always means the exact agent has left the registry. AgentLoop emits it after its driver is quiescent, while ordered teardown may still be detaching the session and unwinding the scope; custom agents registered directly own any stronger driver-ordering contract themselves.
+ 
+-Most interception points are cooperative waterfalls. `agent/pre-step` receives a payload carrying the subject `agent`, the exclusive claimed `UserMessage[]`, and the proposed `turn`, `step`, and cancellation `signal`; its batch may be empty when tools already require another request. Agent-scoped turn extension points carry their explicit `AbortSignal` in the payload; the remaining turn-scoped extension points receive it through their request value. Listeners may cooperate with a signal but must not retain it as authority over another turn. `agent/request-error` is the failed-model-request recovery waterfall: it receives request coordinates, normalized failure facts, the serving registration's retry policy when available, and the signal. A listener returns `{ kind: 'retry' }` without calling `next()` when it owns recovery. `agent/turn-stopping` runs before an otherwise completed turn closes. The [explicit-cancellation decision](../../../.agents/notes/implemented/architecture/2026-07-16-explicit-turn-cancellation.md) owns signal lifetime; the [agent-scope runtime-design Agent Note](../../../.agents/notes/implemented/architecture/2026-07-12-agent-scope-runtime-design.md#three-execution-boundaries-are-deliberately-one-way) owns scoped dispatch and terminal settlement.
++Most interception points are cooperative waterfalls. `agent/pre-step` receives a payload carrying the subject `agent`, the exclusive claimed `UserMessage[]`, and the proposed `turn`, `step`, and cancellation `signal`; its batch may be empty when tools already require another request. `agent/request-layout` receives the complete Session-derived boundary, effective config, system text, tools, and a one-based attempt; it may replace only the ordered messages, and a new step resets the attempt to one. Agent-scoped turn extension points carry their explicit `AbortSignal` in the payload; the remaining turn-scoped extension points receive it through their request value. Listeners may cooperate with a signal but must not retain it as authority over another turn. `agent/request-error` is the failed-model-request recovery waterfall: it receives request coordinates, normalized failure facts, the serving registration's retry policy when available, and the signal. A listener returns `{ kind: 'retry' }` without calling `next()` when it owns recovery. `agent/turn-stopping` runs before an otherwise completed turn closes. The [explicit-cancellation decision](../../../.agents/notes/implemented/architecture/2026-07-16-explicit-turn-cancellation.md) owns signal lifetime; the [agent-scope runtime-design Agent Note](../../../.agents/notes/implemented/architecture/2026-07-12-agent-scope-runtime-design.md#three-execution-boundaries-are-deliberately-one-way) owns scoped dispatch and terminal settlement.
+ 
+ `PreStepDecision` is either `{ kind: 'reject' }` or `{ kind: 'enter', messages }`. The enter branch is the complete identified, frozen batch for the proposed step. A listener that wraps downstream entry preserves that batch unless it intentionally replaces it; additions follow the waterfall's natural return order. Claiming already removed the offered messages from the inbox, so rejection does not retain them. Messages inserted after the claim remain pending for a later boundary.
+ 
+diff --git a/packages/core/agent/README.zh.md b/packages/core/agent/README.zh.md
+index 5e3da8a5d09d06fa4fc9726406aae9c6d5e69c3e..eb9628e8080eb05b8e70840a5fdd7355885f5fe6 100644
+--- a/packages/core/agent/README.zh.md
++++ b/packages/core/agent/README.zh.md
+@@ -52,7 +52,7 @@ Agent *创建* 由实现 `AgentFactory` 的插件（`dsh-agent-loop`）提供，
+ 
+ 生命周期边有两个重要的本地注意事项。`agent/created` 在作用域 setup 之后、会话与 agent 注册表条目都存在之后运行。Setup 是受信任、仅用于组合的代码；紧随其后且不可 veto 的 `agent/session-start` 通知是第一个受支持的启动注入点。`agent/disposed` 始终表示确切 agent 已离开注册表。AgentLoop 在其驱动器完全停稳后发出该事件，而有序 teardown 此时可能仍在分离会话并撤销作用域；直接注册的自定义 agent 自行拥有任何更强的驱动器顺序约定。
+ 
+-大多数拦截点都是协作式 waterfall（瀑布式事件）。`agent/pre-step` 接收一个 payload，携带主体 `agent`、独占的已领取 `UserMessage[]` 以及拟进入的 `turn`、`step` 与取消 `signal`；当工具已经要求继续请求时，该批次可以为空。agent 作用域轮次扩展点在 payload 中携带显式 `AbortSignal`；其余轮次作用域扩展点通过其请求值接收它。监听器可以配合信号，但不得将它保留为控制另一轮次的权限。`agent/request-error` 是失败模型请求的恢复 waterfall：它接收请求坐标、规范化失败事实、可用时提供服务的注册项重试策略以及信号。拥有恢复权的监听器返回 `{ kind: 'retry' }` 且不调用 `next()`。`agent/turn-stopping` 在本可完成的轮次关闭前运行。信号生命周期由[显式取消决策](../../../.agents/notes/implemented/architecture/2026-07-16-explicit-turn-cancellation.zh.md)拥有；作用域分发与终止结算由 [agent 作用域 runtime 设计 Agent Note](../../../.agents/notes/implemented/architecture/2026-07-12-agent-scope-runtime-design.zh.md#three-execution-boundaries-are-deliberately-one-way)拥有。
++大多数拦截点都是协作式 waterfall（瀑布式事件）。`agent/pre-step` 接收一个 payload，携带主体 `agent`、独占的已领取 `UserMessage[]` 以及拟进入的 `turn`、`step` 与取消 `signal`；当工具已经要求继续请求时，该批次可以为空。`agent/request-layout` 接收由 Session 派生的完整边界、生效配置、系统文本、工具以及从一开始计数的 attempt；它只能替换消息顺序与内容，新 step 会把 attempt 重置为一。agent 作用域轮次扩展点在 payload 中携带显式 `AbortSignal`；其余轮次作用域扩展点通过其请求值接收它。监听器可以配合信号，但不得将它保留为控制另一轮次的权限。`agent/request-error` 是失败模型请求的恢复 waterfall：它接收请求坐标、规范化失败事实、可用时提供服务的注册项重试策略以及信号。拥有恢复权的监听器返回 `{ kind: 'retry' }` 且不调用 `next()`。`agent/turn-stopping` 在本可完成的轮次关闭前运行。信号生命周期由[显式取消决策](../../../.agents/notes/implemented/architecture/2026-07-16-explicit-turn-cancellation.zh.md)拥有；作用域分发与终止结算由 [agent 作用域 runtime 设计 Agent Note](../../../.agents/notes/implemented/architecture/2026-07-12-agent-scope-runtime-design.zh.md#three-execution-boundaries-are-deliberately-one-way)拥有。
+ 
+ `PreStepDecision` 要么是 `{ kind: 'reject' }`，要么是 `{ kind: 'enter', messages }`。enter 分支是拟进入步骤的完整、带标识且冻结的批次。包装下游 enter 的监听器会保留该批次，除非有意替换它；新增消息遵循 waterfall 的自然返回顺序。领取操作已经把候选消息从 inbox 删除，因此 reject 不会保留它们；领取后插入的消息仍等待后续边界。
+ 
+diff --git a/packages/core/agent/src/runtime-types.ts b/packages/core/agent/src/runtime-types.ts
+index 7d713f8c77112f8e74150bc060ec677bb5107f90..9cfed37f7e62ff773027858ad32356ebbccb2858 100644
+--- a/packages/core/agent/src/runtime-types.ts
++++ b/packages/core/agent/src/runtime-types.ts
+@@ -7,7 +7,13 @@
+ 
+ import type { Context } from '@deepseek-ai/cordis'
+ import type { Scoped } from '@deepseek-ai/dsh-scope'
+-import type { LlmCallConfig, LlmFailure, ResolvedRetryPolicy } from '@deepseek-ai/dsh-llm'
++import type {
++  LlmCallConfig,
++  LlmFailure,
++  Message,
++  ResolvedRetryPolicy,
++  ToolSchema,
++} from '@deepseek-ai/dsh-llm'
+ import type { AgentCancelCause, Session, SessionId, UserMessage } from '@deepseek-ai/dsh-session'
+ export type { AgentCancelCause } from '@deepseek-ai/dsh-session'
+ import type { Inbox } from './inbox.ts'
+@@ -57,6 +63,36 @@ export type PreStepDecision =
+ /** Action returned by a listener that owns model-request recovery. */
+ export type RequestErrorAction = { kind: 'retry' } | undefined
+ 
++/** Complete immutable inputs available to one provider-request message projection. */
++export interface RequestLayoutInput {
++  /** Agent whose request is being projected. */
++  readonly agent: Agent
++  /** Durable Session identity stamped on the request. */
++  readonly sessionId: SessionId
++  /** Open turn containing this request. */
++  readonly turn: number
++  /** Open step containing this request. */
++  readonly step: number
++  /** One-based provider attempt within this step; a new step starts again at one. */
++  readonly attempt: number
++  /** Effective provider/model call configuration recorded by the request header. */
++  readonly config: Readonly<LlmCallConfig>
++  /** Rendered system prompt, absent when the request has none. */
++  readonly system?: string
++  /** Complete tool schemas for the request. */
++  readonly tools: readonly ToolSchema[]
++  /** Session-derived messages at the dispatch boundary, before projection. */
++  readonly messages: readonly Message[]
++  /** Current turn's cancellation signal. */
++  readonly signal: AbortSignal
++}
++
++/** Message projection returned by `agent/request-layout`. */
++export interface RequestLayoutResult {
++  /** Complete ordered messages to send to the Provider. */
++  readonly messages: readonly Message[]
++}
++
+ /** Why a session lifecycle began; seeded creates are `startup`, while persisted loads are `resume`. */
+ export type SessionStartSource = 'startup' | 'resume' | 'clear' | 'compact'
+ 
+@@ -242,6 +278,27 @@ declare module '@deepseek-ai/cordis' {
+      * @mode waterfall
+     */
+     'agent/request'(this: Scoped<Agent>, payload: { agent: Agent; turn: number; step: number; signal: AbortSignal }, next: () => Promise<LlmCallConfig>): Promise<LlmCallConfig>
++    /**
++     * Replace only the ordered messages of one complete model request. The
++     * default result is `payload.messages`; listeners call `next()` to obtain
++     * and wrap the downstream projection. The loop validates message roles and
++     * tool-call/result ordering, then deep-freezes the final request before
++     * Provider dispatch. Configuration, system text, tools, Session history,
++     * and Provider invocation remain loop-owned.
++     * @param payload.agent - the agent making the model call.
++     * @param payload.sessionId - the durable Session identity stamped on the request.
++     * @param payload.turn - the open turn number.
++     * @param payload.step - the open step number.
++     * @param payload.attempt - one-based Provider attempt within this step; a new step resets it to one.
++     * @param payload.config - the effective request configuration recorded by the request header.
++     * @param payload.system - the rendered system prompt, when non-empty.
++     * @param payload.tools - the complete immutable tool-schema list.
++     * @param payload.messages - the complete immutable Session-derived messages before projection.
++     * @param payload.signal - the current turn's explicit abort signal.
++     * Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent.
++     * @mode waterfall
++     */
++    'agent/request-layout'(this: Scoped<Agent>, payload: RequestLayoutInput, next: () => Promise<RequestLayoutResult>): Promise<RequestLayoutResult>
+     /**
+      * Handle one failed model-request attempt before the loop retries or closes
+      * its step. A listener returns `{ kind: 'retry' }` without calling `next()`
+diff --git a/packages/core/scope/src/scoped-events.generated.ts b/packages/core/scope/src/scoped-events.generated.ts
+index 672914c5c30f1ef683994e5ed213888505aff332..fa181c75452c116040f8339b5301b2856a2fcd49 100644
+--- a/packages/core/scope/src/scoped-events.generated.ts
++++ b/packages/core/scope/src/scoped-events.generated.ts
+@@ -17,6 +17,7 @@ const scopedSubjectResolvers: Readonly<Record<string, ScopedSubjectResolver | nu
+   'agent/pre-step': args => (args[0] as Record<string, unknown>)['agent'],
+   'agent/request': args => (args[0] as Record<string, unknown>)['agent'],
+   'agent/request-error': args => (args[0] as Record<string, unknown>)['agent'],
++  'agent/request-layout': args => (args[0] as Record<string, unknown>)['agent'],
+   'agent/session-start': args => (args[0] as Record<string, unknown>)['agent'],
+   'agent/status': args => (args[0] as Record<string, unknown>)['agent'],
+   'agent/turn-stopping': args => (args[0] as Record<string, unknown>)['agent'],
+diff --git a/packages/core/scope/tests/invariant.spec.ts b/packages/core/scope/tests/invariant.spec.ts
+index 345766b04231d36c96c431543a8607cdba9acd48..7436cf9107b302004b4eaf1d67cbd359e6f1e9b9 100644
+--- a/packages/core/scope/tests/invariant.spec.ts
++++ b/packages/core/scope/tests/invariant.spec.ts
+@@ -54,6 +54,17 @@ describe('scoped-dispatch invariants', () => {
+       'agent/session-start': [{ agent, source: 'startup' }],
+       'agent/pre-step': [{ agent, messages: [message], turn: 1, step: 1, signal }, () => Promise.resolve({ kind: 'enter', messages: [message] })],
+       'agent/request': [{ agent, turn: 1, step: 1, signal }, () => Promise.resolve(config)],
++      'agent/request-layout': [{
++        agent,
++        sessionId: agent.id,
++        turn: 1,
++        step: 1,
++        attempt: 1,
++        config,
++        tools: [],
++        messages: [message],
++        signal,
++      }, () => Promise.resolve({ messages: [message] })],
+       'agent/request-error': [
+         {
+           agent,
+diff --git a/packages/core/session/src/index.ts b/packages/core/session/src/index.ts
+index 2d82a88623cf8b8d381f9ba905ba2e7088cbfe12..3c42f7fc6d65f82b205637dbe7dc6d807c986b84 100644
+--- a/packages/core/session/src/index.ts
++++ b/packages/core/session/src/index.ts
+@@ -8,7 +8,7 @@
+ 
+ import { Context, Service } from '@deepseek-ai/cordis'
+ import { isAbsolute } from 'node:path'
+-import { deepFreeze } from '@deepseek-ai/dsh-llm'
++import { assertContentBlocks, deepFreeze } from '@deepseek-ai/dsh-llm'
+ import { scopeOf, scopeTarget } from '@deepseek-ai/dsh-scope'
+ import type { Scoped } from '@deepseek-ai/dsh-scope'
+ import type { Message } from '@deepseek-ai/dsh-llm'
+@@ -326,6 +326,7 @@ function assertMessageEventShape(event: Record<string, unknown>, subject: string
+   if (!Array.isArray(messageRecord['content'])) {
+     throw new Error(`${subject} message has invalid content`)
+   }
++  assertContentBlocks(messageRecord['content'], `${subject} message content`)
+   const sourceRecord = source as Record<string, unknown>
+   if (type === 'assistant/message') {
+     if (sourceRecord['kind'] !== 'model' || !hasProviderModel(sourceRecord)) {
+diff --git a/packages/extensions/tool-cordis/src/api-catalog.ts b/packages/extensions/tool-cordis/src/api-catalog.ts
+index 32e9ccbda60c10cfe108cb155c2f27e58e7565ea..de6075859a31c1b0a04659a2c162b3d5e01fed5e 100644
+--- a/packages/extensions/tool-cordis/src/api-catalog.ts
++++ b/packages/extensions/tool-cordis/src/api-catalog.ts
+@@ -2453,6 +2453,14 @@ export const EVENT_API: readonly EventApiEntry[] = [
+     description: 'Handle one failed model-request attempt before the loop retries or closes its step. A listener returns `{ kind: \'retry\' }` without calling `next()` when it owns recovery, or calls `next()` to delegate. The default `undefined` leaves the failure terminal.',
+     parameters: [{ name: 'payload', description: '.signal - the turn abort signal. Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent.' }],
+   },
++  {
++    name: 'agent/request-layout',
++    mode: 'waterfall',
++    signature: '\'agent/request-layout\'(this: Scoped<Agent>, payload: RequestLayoutInput, next: () => Promise<RequestLayoutResult>): Promise<RequestLayoutResult>',
++    summary: 'Replace only the ordered messages of one complete model request.',
++    description: 'Replace only the ordered messages of one complete model request. The default result is `payload.messages`; listeners call `next()` to obtain and wrap the downstream projection. The loop validates message roles and tool-call/result ordering, then deep-freezes the final request before Provider dispatch. Configuration, system text, tools, Session history, and Provider invocation remain loop-owned.',
++    parameters: [{ name: 'payload', description: '.signal - the current turn\'s explicit abort signal. Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent.' }],
++  },
+   {
+     name: 'agent/session-start',
+     mode: 'emit',
+@@ -3933,6 +3941,14 @@ export const TYPE_API: readonly TypeApiEntry[] = [
+     name: 'RequestImageAttachment',
+     declaration: 'export interface RequestImageAttachment {\n    variantId: ImageVariantId;\n    attachment: ImageAttachmentRef;\n    data: Uint8Array;\n    mediaType: ImageMediaType;\n    bytes: number;\n    width: number;\n    height: number;\n    depth: \'uchar\';\n    space: \'srgb\';\n    hasAlpha: boolean;\n}',
+   },
++  {
++    name: 'RequestLayoutInput',
++    declaration: 'export interface RequestLayoutInput {\n    readonly agent: Agent;\n    readonly sessionId: SessionId;\n    readonly turn: number;\n    readonly step: number;\n    readonly attempt: number;\n    readonly config: Readonly<LlmCallConfig>;\n    readonly system?: string;\n    readonly tools: readonly ToolSchema[];\n    readonly messages: readonly Message[];\n    readonly signal: AbortSignal;\n}',
++  },
++  {
++    name: 'RequestLayoutResult',
++    declaration: 'export interface RequestLayoutResult {\n    readonly messages: readonly Message[];\n}',
++  },
+   {
+     name: 'RequestRunOutcome',
+     declaration: 'export type RequestRunOutcome = \'approved\' | \'completed\' | \'rejected\' | \'cancelled\' | \'failed\';',
+diff --git a/packages/llm/llm/README.i18n.yaml b/packages/llm/llm/README.i18n.yaml
+index 08820bbfd90bc766af5d1eba0acb18cd29539cfb..21cbf48526512480a7b775cb997933a7895ae833 100644
+--- a/packages/llm/llm/README.i18n.yaml
++++ b/packages/llm/llm/README.i18n.yaml
+@@ -2,5 +2,5 @@
+ # side as of the last confirmed-consistent state. Both languages carry equal authority;
+ # after editing either side, bring the other along and re-record with:
+ #   pnpm run verify-translation-pairing --write packages/llm/llm/README.md
+-README.md: 59c5303bdae8d6391f3bb1595a527d677e2378bc
+-README.zh.md: 313fc23590de2119bf07dd5c4c4fafe9daa94c56
++README.md: 0147a6393c0f03afc1b6d0e8ceae50e4a591be60
++README.zh.md: 1cb379007b7ea374edde67cc6dac1375ec96c8f3
+diff --git a/packages/llm/llm/README.md b/packages/llm/llm/README.md
+index 59c5303bdae8d6391f3bb1595a527d677e2378bc..0147a6393c0f03afc1b6d0e8ceae50e4a591be60 100644
+--- a/packages/llm/llm/README.md
++++ b/packages/llm/llm/README.md
+@@ -55,7 +55,7 @@ Exact-model metadata is a separate correctness query, not a catalog decoration o
+ 
+ `Message` is the shared immutable value used by delivery, durable history, and model requests. Every message has a required `MessageId`, role, content, and typed source from creation onward. `createMessage(input)` mints the identity and returns a detached deep-frozen value; `createUserMessage({ content, source })` fixes the user role; `createAssistantMessage({ content, source })` fixes the assistant role and model source kind; `createToolResultMessage({ callId, content, isError })` fixes the user role and couples the tool source to its result block; `freezeMessage(message)` imports an identity that already exists and never replaces it. Message rewrites preserve the identity and produce another frozen value. Browser code imports these value constructors from the dependency-minimal `@deepseek-ai/dsh-llm/message` entry instead of the service-bearing package root.
+ 
+-Message content is an array of typed blocks: `text`, `reasoning`, `image`, `tool-call`, `tool-result`. An `ImageBlock` carries only a durable `ImageAttachmentRef`; provider bytes and request dimensions are resolved later. The union remains merge-extensible through `ContentBlockMap`, so plugins can add further block types via declaration merging. Assistant messages use a model source carrying the provider and model that produced them plus optional adapter-private replay state. Before dispatch, `LlmRuntime` retains that state only when the historical provider route and target provider route are currently owned by the exact same adapter instance; the adapter then decides whether it can restore or convert the state across models/providers.
++Message content is an array of typed blocks: `text`, `reasoning`, `image`, `tool-call`, `tool-result`. An `ImageBlock` carries only a durable `ImageAttachmentRef`; provider bytes and request dimensions are resolved later. `assertContentBlocks(value, subject)` validates every built-in block, including nested tool-result content, while permitting a plain extension block with a non-empty type. The union remains merge-extensible through `ContentBlockMap`, so plugins can add further block types via declaration merging. Assistant messages use a model source carrying the provider and model that produced them plus optional adapter-private replay state. Before dispatch, `LlmRuntime` retains that state only when the historical provider route and target provider route are currently owned by the exact same adapter instance; the adapter then decides whether it can restore or convert the state across models/providers.
+ 
+ Every dispatch uses the exact model modalities captured with its adapter generation. An image-capable adapter projects durable image references into route-specific request versions. A text-only route instead receives deterministic attachment placeholders, including nested tool-result images, without changing append-only session history. `offloadRequestImagesWithPolicy()` provides deterministic oldest-first image removal with raw or base64 accounting and count or byte quanta; adapters supply the exact derived-version byte length.
+ 
+diff --git a/packages/llm/llm/README.zh.md b/packages/llm/llm/README.zh.md
+index 313fc23590de2119bf07dd5c4c4fafe9daa94c56..1cb379007b7ea374edde67cc6dac1375ec96c8f3 100644
+--- a/packages/llm/llm/README.zh.md
++++ b/packages/llm/llm/README.zh.md
+@@ -55,7 +55,7 @@
+ 
+ `Message` 是投递、持久历史和模型请求共享的不可变值。每条消息从创建起都必须具有 `MessageId`、角色、内容和带类型的来源。`createMessage(input)` 生成标识，并返回与输入分离且深度冻结的值；`createUserMessage({ content, source })` 固定 user 角色；`createAssistantMessage({ content, source })` 固定 assistant 角色与模型来源类别；`createToolResultMessage({ callId, content, isError })` 固定 user 角色，并将工具来源与其结果块耦合；`freezeMessage(message)` 导入已有标识，绝不将其替换。改写消息时会保留标识，并产生另一个冻结值。浏览器端代码会从依赖最少的 `@deepseek-ai/dsh-llm/message` 入口导入这些值构造函数，而不是从包含服务的包根入口导入。
+ 
+-消息内容是类型化内容块数组：`text`、`reasoning`、`image`、`tool-call`、`tool-result`。`ImageBlock` 只携带持久 `ImageAttachmentRef`；提供方字节和请求尺寸之后再解析。联合仍从可合并扩展的 `ContentBlockMap` 派生，因此插件可以通过 declaration merging 添加其他块类型。assistant 消息使用模型来源，其中携带生成该消息的提供方和模型，以及可选的适配器私有回放状态。dispatch 前，`LlmRuntime` 只在历史提供方路由与目标提供方路由当前由完全相同的适配器实例拥有时才保留该状态；随后由适配器判定能否在模型或提供方间恢复或转换该状态。
++消息内容是类型化内容块数组：`text`、`reasoning`、`image`、`tool-call`、`tool-result`。`ImageBlock` 只携带持久 `ImageAttachmentRef`；提供方字节和请求尺寸之后再解析。`assertContentBlocks(value, subject)` 会校验每一种内建块，包括嵌套的工具结果内容，同时允许带非空 type 的普通扩展块。联合仍从可合并扩展的 `ContentBlockMap` 派生，因此插件可以通过 declaration merging 添加其他块类型。assistant 消息使用模型来源，其中携带生成该消息的提供方和模型，以及可选的适配器私有回放状态。dispatch 前，`LlmRuntime` 只在历史提供方路由与目标提供方路由当前由完全相同的适配器实例拥有时才保留该状态；随后由适配器判定能否在模型或提供方间恢复或转换该状态。
+ 
+ 每次分发都使用随适配器世代捕获的确切模型模态。支持图片的适配器把持久图片引用投影为路由专用请求版本。纯文本路由则收到确定性的附件占位文本，其中也包括嵌套工具结果图片，追加式会话历史不会改变。`offloadRequestImagesWithPolicy()` 提供确定性的从旧到新图片移除，支持按原始字节或 base64 计数，也支持图片数量或字节量步长；适配器提供确切派生版本的字节长度。
+ 
+diff --git a/packages/llm/llm/src/message.ts b/packages/llm/llm/src/message.ts
+index 608b56475df8dfdef72e104f180cf4dd024eb0be..78eb8ccf8f5cb26ab19e6645a25ac832660a69cd 100644
+--- a/packages/llm/llm/src/message.ts
++++ b/packages/llm/llm/src/message.ts
+@@ -4,6 +4,116 @@ import { MessageId, type CallId } from './brand.ts'
+ import { deepFreeze } from './call-config.ts'
+ import type { ContentBlock, StreamChunk, ToolResultBlock } from './types.ts'
+ 
++/** Return a plain object record, excluding arrays and exotic prototypes. */
++function plainRecord(value: unknown): Record<string, unknown> | undefined {
++  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
++  const prototype = Reflect.getPrototypeOf(value)
++  return prototype === Object.prototype || prototype === null
++    ? value as Record<string, unknown>
++    : undefined
++}
++
++const imageMediaTypes = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
++
++/** Return whether a byte count or pixel dimension is representable exactly and positive. */
++function positiveSafeInteger(value: unknown): value is number {
++  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
++}
++
++/** Validate the attachment fields carried by one built-in image block. */
++function assertImageAttachment(value: unknown, subject: string): void {
++  const attachment = plainRecord(value)
++  if (attachment === undefined
++    || typeof attachment['attachmentId'] !== 'string' || attachment['attachmentId'].length === 0
++    || typeof attachment['mediaType'] !== 'string' || !imageMediaTypes.has(attachment['mediaType'])
++    || !positiveSafeInteger(attachment['bytes'])
++    || !positiveSafeInteger(attachment['width'])
++    || !positiveSafeInteger(attachment['height'])
++    || attachment['name'] !== undefined && typeof attachment['name'] !== 'string') {
++    throw new Error(`${subject} has an invalid attachment`)
++  }
++  const originalDimensions = attachment['originalDimensions']
++  if (originalDimensions === undefined) return
++  const dimensions = plainRecord(originalDimensions)
++  if (dimensions === undefined
++    || !positiveSafeInteger(dimensions['width'])
++    || !positiveSafeInteger(dimensions['height'])) {
++    throw new Error(`${subject} has invalid originalDimensions`)
++  }
++}
++
++/**
++ * Validate every built-in content block while permitting plain extension blocks.
++ * @param value - Candidate content array from a message snapshot.
++ * @param subject - Diagnostic prefix naming the owning message or nested result.
++ * @returns Nothing; successful validation narrows `value` to content blocks.
++ * @throws When the array, a built-in block, or an extension block is malformed.
++ */
++export function assertContentBlocks(
++  value: unknown,
++  subject: string,
++): asserts value is ContentBlock[] {
++  if (!Array.isArray(value)) throw new Error(`${subject} must be a content array`)
++  const pending: { content: unknown[]; subject: string; index: number }[] = [{ content: value, subject, index: 0 }]
++  const active = new WeakSet<unknown[]>([value])
++  const completed = new WeakSet<unknown[]>()
++  while (pending.length > 0) {
++    // oxlint-disable-next-line typescript/no-non-null-assertion -- the loop condition proves an entry remains
++    const current = pending.at(-1)!
++    if (current.index >= current.content.length) {
++      active.delete(current.content)
++      completed.add(current.content)
++      pending.pop()
++      continue
++    }
++    const index = current.index
++    current.index += 1
++    const candidate = current.content[index]
++    const block = plainRecord(candidate)
++    const type = block?.['type']
++    if (block === undefined || typeof type !== 'string' || type.length === 0) {
++      throw new Error(`${current.subject} block at index ${index} must be a plain object with a non-empty type`)
++    }
++    const blockSubject = `${current.subject} ${type} block at index ${index}`
++    switch (type) {
++      case 'text':
++      case 'reasoning':
++        if (typeof block['text'] !== 'string') {
++          throw new Error(`${blockSubject} must have string text`)
++        }
++        break
++      case 'image':
++        assertImageAttachment(block['attachment'], blockSubject)
++        break
++      case 'tool-call':
++        if (typeof block['id'] !== 'string' || block['id'].length === 0
++          || typeof block['name'] !== 'string' || block['name'].length === 0
++          || typeof block['arguments'] !== 'string') {
++          throw new Error(`${blockSubject} has invalid id, name, or arguments`)
++        }
++        break
++      case 'tool-result': {
++        if (typeof block['toolCallId'] !== 'string' || block['toolCallId'].length === 0
++          || !Array.isArray(block['content'])
++          || block['isError'] !== undefined && typeof block['isError'] !== 'boolean') {
++          throw new Error(`${blockSubject} has invalid toolCallId, content, or isError`)
++        }
++        if (active.has(block['content'])) {
++          throw new Error(`${blockSubject} content contains cyclic content`)
++        }
++        if (!completed.has(block['content'])) {
++          active.add(block['content'])
++          pending.push({ content: block['content'], subject: `${blockSubject} content`, index: 0 })
++        }
++        break
++      }
++      default:
++        // ContentBlockMap is merge-extensible; core can validate only its own tags.
++        break
++    }
++  }
++}
++
+ /** Provider/model identity and adapter-private replay data for an assistant message. */
+ export interface AssistantProvenance {
+   /** Provider route that produced the message. */
+diff --git a/packages/llm/llm/tests/message.spec.ts b/packages/llm/llm/tests/message.spec.ts
+index 846d37c9df1f48c8b2e836df6cc6659d73fe46b3..5c13c1d7890ad4414086982fd60851c9ac020adf 100644
+--- a/packages/llm/llm/tests/message.spec.ts
++++ b/packages/llm/llm/tests/message.spec.ts
+@@ -1,5 +1,6 @@
+ import { describe, expect, it } from 'vitest'
+ import {
++  assertContentBlocks,
+   CallId,
+   createAssistantMessage,
+   createToolResultMessage,
+@@ -8,6 +9,142 @@ import {
+   MessageId,
+ } from '@deepseek-ai/dsh-llm'
+ 
++describe('content block validation', () => {
++  it('rejects a tool-result content array that contains itself', () => {
++    const content: unknown[] = []
++    content.push({ type: 'tool-result', toolCallId: 'self', content })
++
++    expect(() => {
++      assertContentBlocks(content, 'message content')
++    }).toThrow(/cyclic content/)
++  })
++
++  it('rejects an indirect cycle between tool-result content arrays', () => {
++    const outer: unknown[] = []
++    const inner: unknown[] = []
++    outer.push({ type: 'tool-result', toolCallId: 'outer', content: inner })
++    inner.push({ type: 'tool-result', toolCallId: 'inner', content: outer })
++
++    expect(() => {
++      assertContentBlocks(outer, 'message content')
++    }).toThrow(/cyclic content/)
++  })
++
++  it('allows a non-cyclic nested content array shared by multiple tool results', () => {
++    const shared = [{ type: 'text', text: 'shared' }]
++    const content = [
++      { type: 'tool-result', toolCallId: 'first', content: shared },
++      { type: 'tool-result', toolCallId: 'second', content: shared },
++    ]
++
++    expect(() => {
++      assertContentBlocks(content, 'message content')
++    }).not.toThrow()
++  })
++
++  it.each([
++    ['bytes', 0],
++    ['bytes', -1],
++    ['bytes', 0.5],
++    ['bytes', Number.POSITIVE_INFINITY],
++    ['bytes', Number.MAX_SAFE_INTEGER + 1],
++    ['width', 0],
++    ['width', -1],
++    ['width', 1.5],
++    ['width', Number.POSITIVE_INFINITY],
++    ['width', Number.MAX_SAFE_INTEGER + 1],
++    ['height', 0],
++    ['height', -1],
++    ['height', 1.5],
++    ['height', Number.POSITIVE_INFINITY],
++    ['height', Number.MAX_SAFE_INTEGER + 1],
++  ] as const)('rejects an image attachment with %s=%s', (field, value) => {
++    const attachment = {
++      attachmentId: 'image',
++      mediaType: 'image/png',
++      bytes: 1,
++      width: 1,
++      height: 1,
++      [field]: value,
++    }
++
++    expect(() => {
++      assertContentBlocks(
++        [{ type: 'image', attachment }],
++        'message content',
++      )
++    }).toThrow(/invalid attachment/)
++  })
++
++  it.each([
++    ['width', 0],
++    ['width', -1],
++    ['width', 1.5],
++    ['width', Number.POSITIVE_INFINITY],
++    ['width', Number.MAX_SAFE_INTEGER + 1],
++    ['height', 0],
++    ['height', -1],
++    ['height', 1.5],
++    ['height', Number.POSITIVE_INFINITY],
++    ['height', Number.MAX_SAFE_INTEGER + 1],
++  ] as const)('rejects image originalDimensions with %s=%s', (field, value) => {
++    const attachment = {
++      attachmentId: 'image',
++      mediaType: 'image/png',
++      bytes: 1,
++      width: 1,
++      height: 1,
++      originalDimensions: { width: 1, height: 1, [field]: value },
++    }
++
++    expect(() => {
++      assertContentBlocks(
++        [{ type: 'image', attachment }],
++        'message content',
++      )
++    }).toThrow(/invalid originalDimensions/)
++  })
++
++  it('accepts the smallest positive safe integer for image byte and dimension fields', () => {
++    const content = [{
++      type: 'image',
++      attachment: {
++        attachmentId: 'smallest-image',
++        mediaType: 'image/png',
++        bytes: 1,
++        width: 1,
++        height: 1,
++        originalDimensions: { width: 1, height: 1 },
++      },
++    }]
++
++    expect(() => {
++      assertContentBlocks(content, 'message content')
++    }).not.toThrow()
++  })
++
++  it('accepts the maximum safe integer for image byte and dimension fields', () => {
++    const content = [{
++      type: 'image',
++      attachment: {
++        attachmentId: 'largest-safe-image',
++        mediaType: 'image/png',
++        bytes: Number.MAX_SAFE_INTEGER,
++        width: Number.MAX_SAFE_INTEGER,
++        height: Number.MAX_SAFE_INTEGER,
++        originalDimensions: {
++          width: Number.MAX_SAFE_INTEGER,
++          height: Number.MAX_SAFE_INTEGER,
++        },
++      },
++    }]
++
++    expect(() => {
++      assertContentBlocks(content, 'message content')
++    }).not.toThrow()
++  })
++})
++
+ describe('message construction', () => {
+   it('assigns identity immediately and returns a detached deep-frozen message', () => {
+     const input = {
+diff --git a/scripts/gen-cordis-catalog.ts b/scripts/gen-cordis-catalog.ts
+index 522e98df962fd0db1dfa9a8cc389f58b5154975b..b553e06279b50b63f098e5de2ba1bd381213a202 100644
+--- a/scripts/gen-cordis-catalog.ts
++++ b/scripts/gen-cordis-catalog.ts
+@@ -276,6 +276,8 @@ export const LINK_MAP: Readonly<Record<string, string>> = {
+   PreStepDecision: 'core.md',
+   PreStepContext: 'core.md',
+   RequestErrorAction: 'core.md',
++  RequestLayoutInput: 'core.md',
++  RequestLayoutResult: 'core.md',
+   RequestFailureContext: 'core.md',
+   PreparedReferencedMessage: 'session-reference.md',
+   FileReferenceCandidate: 'session-reference.md',
+diff --git a/scripts/type-equiv.manifest.json b/scripts/type-equiv.manifest.json
+index a83e2fc8e705eaca64a4fa2ac59c987454cf6a27..c34b8553dd6ccb2d450b558931c22b8e80755571 100644
+--- a/scripts/type-equiv.manifest.json
++++ b/scripts/type-equiv.manifest.json
+@@ -141,6 +141,16 @@
+       "symbol": "RequestErrorAction",
+       "source": "packages/core/agent/src/runtime-types.ts"
+     },
++    {
++      "doc": "docs/subsystems/core.md",
++      "symbol": "RequestLayoutInput",
++      "source": "packages/core/agent/src/runtime-types.ts"
++    },
++    {
++      "doc": "docs/subsystems/core.md",
++      "symbol": "RequestLayoutResult",
++      "source": "packages/core/agent/src/runtime-types.ts"
++    },
+     {
+       "doc": "docs/subsystems/core.md",
+       "symbol": "SessionStartSource",
+-- 
+2.50.1 (Apple Git-155)
+
