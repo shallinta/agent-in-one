@@ -29,6 +29,22 @@ export interface SessionEventPairSpanLink {
   pairEventId: string;
 }
 
+export type RequestLocalSessionLinkProof =
+  | {
+      kind: 'pair-delivery';
+      pairEventId: string;
+      deliveryId: string;
+    }
+  | {
+      kind: 'native-composer';
+      sourceEventId: string;
+    };
+
+export interface RequestLocalSessionLink extends SessionEventPairSpanLink {
+  persistence: 'request-local';
+  proof: RequestLocalSessionLinkProof;
+}
+
 export type LocalHistoryDecision = 'retained' | 'excluded' | 'degraded';
 
 export type LocalHistoryReason =
@@ -84,6 +100,7 @@ export type LocalHistoryProjection =
 
 export interface ProjectLocalHistoryOptions {
   expectedSessionId: string;
+  requestLocalLinks?: readonly RequestLocalSessionLink[];
 }
 
 export class LocalHistoryInvariantError extends Error {
@@ -223,6 +240,44 @@ function runtimeLink(input: unknown): RuntimeLink | undefined {
     return undefined;
   }
   return value as unknown as RuntimeLink;
+}
+
+function validateRequestLocalLink(link: RequestLocalSessionLink): void {
+  const value = runtimeLink(link);
+  if (
+    value === undefined ||
+    link.persistence !== 'request-local' ||
+    link.representation !== 'full'
+  ) {
+    throw new LocalHistoryInvariantError('request-local link is invalid');
+  }
+  const proof = (link as unknown as Record<string, unknown>).proof;
+  if (typeof proof !== 'object' || proof === null || Array.isArray(proof)) {
+    throw new LocalHistoryInvariantError('request-local proof kind is invalid');
+  }
+  const valueProof = proof as Record<string, unknown>;
+  switch (valueProof.kind) {
+    case 'pair-delivery':
+      if (
+        !nonEmptyString(valueProof.pairEventId) ||
+        !nonEmptyString(valueProof.deliveryId) ||
+        valueProof.pairEventId !== link.pairEventId
+      ) {
+        throw new LocalHistoryInvariantError(
+          'request-local Pair delivery proof is invalid',
+        );
+      }
+      return;
+    case 'native-composer':
+      if (!nonEmptyString(valueProof.sourceEventId)) {
+        throw new LocalHistoryInvariantError(
+          'request-local native composer proof is invalid',
+        );
+      }
+      return;
+    default:
+      throw new LocalHistoryInvariantError('request-local proof kind is invalid');
+  }
 }
 
 function buildSpans(
@@ -420,8 +475,44 @@ export function projectLocalHistory(
   options: ProjectLocalHistoryOptions,
 ): LocalHistoryProjection {
   canonicalJsonStringify(persistedLinks);
+  canonicalJsonStringify(options.requestLocalLinks ?? []);
   if (!nonEmptyString(options.expectedSessionId)) {
     throw new LocalHistoryInvariantError('expectedSessionId is required');
+  }
+  if (
+    persistedLinks.some(
+      (link) =>
+        typeof link === 'object' &&
+        link !== null &&
+        (link as unknown as Record<string, unknown>).persistence ===
+          'request-local',
+    )
+  ) {
+    throw new LocalHistoryInvariantError(
+      'request-local links must be supplied for the current request',
+    );
+  }
+  const requestLocalLinks = options.requestLocalLinks ?? [];
+  requestLocalLinks.forEach(validateRequestLocalLink);
+  if (
+    requestLocalLinks.some((current) =>
+      persistedLinks.some(
+        (persisted) =>
+          persisted.representation === 'full' &&
+          persisted.sessionId === current.sessionId &&
+          persisted.fromSessionSeq === current.fromSessionSeq &&
+          persisted.throughSessionSeq === current.throughSessionSeq &&
+          persisted.pairEventId === current.pairEventId &&
+          persisted.messageIds.length === current.messageIds.length &&
+          persisted.messageIds.every(
+            (messageId, index) => messageId === current.messageIds[index],
+          ),
+      ),
+    )
+  ) {
+    throw new LocalHistoryInvariantError(
+      'request-local proof is redundant with persisted full proof',
+    );
   }
   const boundaries = boundaryMessages.map(normalizeBoundary);
   const duplicateMessageId = boundaries.some(
@@ -437,7 +528,7 @@ export function projectLocalHistory(
   const hasUnexpectedBoundarySession = boundaries.some(
     ({ sessionId }) => sessionId !== options.expectedSessionId,
   );
-  const hasUnexpectedLinkSession = persistedLinks.some(
+  const hasUnexpectedLinkSession = [...persistedLinks, ...requestLocalLinks].some(
     (link) =>
       typeof link !== 'object' ||
       link === null ||
@@ -476,7 +567,7 @@ export function projectLocalHistory(
     };
   }
 
-  const runtimeLinks = persistedLinks
+  const runtimeLinks = [...persistedLinks, ...requestLocalLinks]
     .map(runtimeLink)
     .filter((link): link is RuntimeLink => link !== undefined);
   const validLinks = runtimeLinks.filter((link) =>

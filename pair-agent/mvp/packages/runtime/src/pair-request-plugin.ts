@@ -12,7 +12,9 @@ import {
   buildPairRequestLayout,
   type LocalBoundaryMessage,
   type NormalizedMessage,
+  type PairCurrentTrigger,
   type PairRequestLayout,
+  type RequestLocalSessionLink,
   type SessionEventPairSpanLink,
 } from '@pair-agent/context';
 import {
@@ -140,26 +142,6 @@ function eventMessage(event: DshSessionEvent): DshMessage | undefined {
   return undefined;
 }
 
-function deliveryFromMessage(message: DshMessage): JsonObject | undefined {
-  if (
-    message.source.kind !== 'plugin' ||
-    message.source.plugin !== DELIVERY_PLUGIN
-  ) {
-    return undefined;
-  }
-  const deliveryId = message.source.deliveryId;
-  const pairEventId = message.source.pairEventId;
-  const trigger = message.source.trigger;
-  if (
-    typeof deliveryId !== 'string' ||
-    typeof pairEventId !== 'string' ||
-    plainRecord(trigger) === undefined
-  ) {
-    throw new PairRequestBindingError('Pair delivery message has invalid provenance');
-  }
-  return trigger as JsonObject;
-}
-
 function dshToNormalized(message: DshMessage): NormalizedMessage {
   if (
     message.role === 'user' &&
@@ -207,6 +189,282 @@ function dshToNormalized(message: DshMessage): NormalizedMessage {
   return { role: message.role, content: message.content as JsonValue };
 }
 
+function pairEventId(event: Pick<PairEvent, 'pairId' | 'seq'>): string {
+  return `${event.pairId}:${event.seq}`;
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function activeSessionLinkPayload(
+  event: PairEvent,
+  activeSessionId: string,
+): Record<string, unknown> | undefined {
+  if (event.type !== 'session_event.linked') return undefined;
+  const payload = plainRecord(event.payload);
+  return payload?.sessionId === activeSessionId ? payload : undefined;
+}
+
+function isCanonicalTaskAssignment(event: PairEvent): boolean {
+  if (
+    event.type !== 'task.assigned' ||
+    event.actor.kind !== 'agent' ||
+    event.actor.role !== 'navigator' ||
+    event.source !== 'navigator-session' ||
+    event.channel !== 'shared-control' ||
+    event.authority !== 'navigator'
+  ) {
+    return false;
+  }
+  const task = plainRecord(plainRecord(event.payload)?.task);
+  return (
+    task !== undefined &&
+    nonEmptyString(task.id) &&
+    Number.isSafeInteger(task.revision) &&
+    (task.revision as number) > 0 &&
+    nonEmptyString(task.summary) &&
+    task.state === 'queued' &&
+    event.refs.task?.id === task.id &&
+    event.refs.task.revision === task.revision
+  );
+}
+
+function isRepresentableSharedEvent(event: PairEvent): boolean {
+  if (event.visibility !== 'shared') return false;
+  if (isCanonicalTaskAssignment(event)) return true;
+  if (event.channel !== 'navigator' && event.channel !== 'pilot') return false;
+  if (event.type === 'user.message') {
+    return (
+      event.source === 'pair' ||
+      event.source === `${event.channel}-session`
+    );
+  }
+  if (event.type === 'agent.message' && event.actor.kind === 'agent') {
+    return (
+      event.source === `${event.actor.role}-session` &&
+      event.channel === event.actor.role
+    );
+  }
+  return false;
+}
+
+export function persistentSessionLinks(
+  pairEvents: readonly PairEvent[],
+  activeSessionId: string,
+): readonly SessionEventPairSpanLink[] {
+  const eventsById = new Map(
+    pairEvents.map((event) => [pairEventId(event), event] as const),
+  );
+  return pairEvents.flatMap((event): readonly SessionEventPairSpanLink[] => {
+    const payload = activeSessionLinkPayload(event, activeSessionId);
+    if (payload === undefined) return [];
+    const fromSessionSeq = payload.fromSessionSeq;
+    const throughSessionSeq = payload.throughSessionSeq;
+    const messageIds = payload.messageIds;
+    const representedId = payload.pairEventId;
+    const representation = payload.representation;
+    if (
+      (representation !== 'full' &&
+        representation !== 'summary' &&
+        representation !== 'artifact-ref') ||
+      !Number.isSafeInteger(fromSessionSeq) ||
+      (fromSessionSeq as number) <= 0 ||
+      !Number.isSafeInteger(throughSessionSeq) ||
+      (throughSessionSeq as number) < (fromSessionSeq as number) ||
+      !Array.isArray(messageIds) ||
+      messageIds.length === 0 ||
+      !messageIds.every(nonEmptyString) ||
+      new Set(messageIds).size !== messageIds.length ||
+      !nonEmptyString(representedId)
+    ) {
+      throw new PairRequestBindingError(
+        `Persisted Session link ${pairEventId(event)} is malformed`,
+      );
+    }
+    const represented = eventsById.get(representedId);
+    if (
+      represented === undefined ||
+      pairEventId(represented) !== representedId ||
+      represented.seq >= event.seq ||
+      !isRepresentableSharedEvent(represented)
+    ) {
+      throw new PairRequestBindingError(
+        `Persisted Session link ${pairEventId(event)} has no earlier canonical represented Pair message`,
+      );
+    }
+    return [
+      {
+        sessionId: activeSessionId,
+        fromSessionSeq: fromSessionSeq as number,
+        throughSessionSeq: throughSessionSeq as number,
+        messageIds: messageIds as string[],
+        representation,
+        pairEventId: representedId,
+      },
+    ];
+  });
+}
+
+function hasExactPersistentFullLink(
+  links: readonly SessionEventPairSpanLink[],
+  boundary: LocalBoundaryMessage,
+  representedPairEventId: string,
+): boolean {
+  return links.some(
+    (link) =>
+      link.representation === 'full' &&
+      link.sessionId === boundary.sessionId &&
+      link.fromSessionSeq === boundary.sessionSeq &&
+      link.throughSessionSeq === boundary.sessionSeq &&
+      link.messageIds.length === 1 &&
+      link.messageIds[0] === boundary.messageId &&
+      link.pairEventId === representedPairEventId,
+  );
+}
+
+function expectedDeliveryTrigger(event: PairEvent): JsonObject | undefined {
+  const payload = plainRecord(event.payload);
+  if (payload === undefined) return undefined;
+  if (
+    event.type === 'user.message' &&
+    (event.channel === 'navigator' || event.channel === 'pilot') &&
+    nonEmptyString(payload.text)
+  ) {
+    return {
+      kind: event.type,
+      role: event.channel,
+      text: payload.text,
+      pairEventId: pairEventId(event),
+    };
+  }
+  if (isCanonicalTaskAssignment(event)) {
+    return {
+      kind: event.type,
+      pairEventId: pairEventId(event),
+      task: payload.task as JsonObject,
+    };
+  }
+  return undefined;
+}
+
+function deliveryTargetRole(event: PairEvent): PairRole | undefined {
+  if (
+    event.type === 'user.message' &&
+    (event.channel === 'navigator' || event.channel === 'pilot')
+  ) {
+    return event.channel;
+  }
+  if (isCanonicalTaskAssignment(event)) return 'pilot';
+  return undefined;
+}
+
+function compactCurrentTrigger(
+  event: PairEvent,
+  deliveryId: string,
+): PairCurrentTrigger {
+  const payload = plainRecord(event.payload);
+  return {
+    kind: event.type,
+    pairEventId: pairEventId(event),
+    deliveryId,
+    ...(nonEmptyString(payload?.causalRootId)
+      ? { causalRootId: payload.causalRootId }
+      : {}),
+    ...(Number.isSafeInteger(payload?.hop) ? { hop: payload?.hop as number } : {}),
+  };
+}
+
+function validateDeliveryProof(
+  message: DshMessage,
+  eventsById: ReadonlyMap<string, PairEvent>,
+  activeRole: PairRole,
+): {
+  readonly pairEvent: PairEvent;
+  readonly proof: RequestLocalSessionLink['proof'];
+  readonly currentTrigger: PairCurrentTrigger;
+} {
+  const deliveryId = message.source.deliveryId;
+  const representedId = message.source.pairEventId;
+  const trigger = message.source.trigger;
+  if (
+    message.role !== 'user' ||
+    !nonEmptyString(deliveryId) ||
+    !nonEmptyString(representedId) ||
+    deliveryId !== representedId ||
+    plainRecord(trigger) === undefined
+  ) {
+    throw new PairRequestBindingError('Pair delivery message has invalid provenance');
+  }
+  const represented = eventsById.get(representedId);
+  const expectedTrigger = represented === undefined
+    ? undefined
+    : expectedDeliveryTrigger(represented);
+  if (
+    represented === undefined ||
+    represented.visibility !== 'shared' ||
+    deliveryTargetRole(represented) !== activeRole ||
+    pairEventId(represented) !== representedId ||
+    expectedTrigger === undefined ||
+    canonicalJsonStringify(trigger) !== canonicalJsonStringify(expectedTrigger)
+  ) {
+    throw new PairRequestBindingError(
+      'Pair delivery provenance does not match its durable Pair Event',
+    );
+  }
+  const expectedInput = createPairDeliveryMessageInput(
+    deliveryId,
+    trigger as JsonObject,
+  );
+  if (
+    canonicalJsonStringify(message.content) !==
+    canonicalJsonStringify(expectedInput.content)
+  ) {
+    throw new PairRequestBindingError(
+      'Pair delivery normalized payload does not match its durable provenance',
+    );
+  }
+  return {
+    pairEvent: represented,
+    proof: { kind: 'pair-delivery', pairEventId: representedId, deliveryId },
+    currentTrigger: compactCurrentTrigger(represented, deliveryId),
+  };
+}
+
+function validateNativeComposerProof(
+  boundary: LocalBoundaryMessage,
+  pairEvent: PairEvent,
+  sourceEventId: string,
+  role: PairRole,
+): void {
+  const payload = plainRecord(pairEvent.payload);
+  const origin = plainRecord(payload?.origin);
+  const expectedSource = role === 'navigator'
+    ? 'navigator-session'
+    : 'pilot-session';
+  const normalizedPairMessage = payload === undefined
+    ? undefined
+    : { role: 'user', content: payload.content };
+  if (
+    pairEvent.type !== 'user.message' ||
+    pairEvent.visibility !== 'shared' ||
+    pairEvent.source !== expectedSource ||
+    pairEvent.channel !== role ||
+    pairEvent.authority !== 'user-derived' ||
+    !pairEvent.refs.sourceEventIds?.includes(sourceEventId) ||
+    origin?.schemaVersion !== 1 ||
+    origin.sessionId !== boundary.sessionId ||
+    origin.sessionEventSeq !== boundary.sessionSeq ||
+    origin.messageId !== boundary.messageId ||
+    canonicalJsonStringify(normalizedPairMessage) !==
+      canonicalJsonStringify(boundary.message)
+  ) {
+    throw new PairRequestBindingError(
+      'Native composer provenance does not match its durable Pair Event',
+    );
+  }
+}
+
 function textContent(content: JsonValue): readonly JsonObject[] {
   if (
     Array.isArray(content) &&
@@ -239,10 +497,13 @@ function syntheticMessage(message: NormalizedMessage): DshMessage {
 
 function boundaryProjection(
   payload: DshRequestLayoutPayload,
+  pairEvents: readonly PairEvent[],
+  role: PairRole,
 ): {
   boundary: readonly LocalBoundaryMessage[];
   links: readonly SessionEventPairSpanLink[];
-  currentTrigger?: JsonObject;
+  requestLocalLinks: readonly RequestLocalSessionLink[];
+  currentTrigger?: PairCurrentTrigger;
   localSurfaceThroughSeq: number;
   originals: ReadonlyMap<string, DshMessage>;
 } {
@@ -268,26 +529,82 @@ function boundaryProjection(
       message: dshToNormalized(message),
     };
   });
-  const links: SessionEventPairSpanLink[] = [];
-  let currentTrigger: JsonObject | undefined;
-  for (const item of boundary) {
-    const original = originals.get(item.messageId)!;
-    const trigger = deliveryFromMessage(original);
-    if (trigger === undefined) continue;
-    const pairEventId = original.source.pairEventId as string;
-    links.push({
-      sessionId: payload.sessionId,
-      fromSessionSeq: item.sessionSeq,
-      throughSessionSeq: item.sessionSeq,
-      messageIds: [item.messageId],
-      representation: 'full',
-      pairEventId,
-    });
-    currentTrigger = trigger;
+  const links = persistentSessionLinks(pairEvents, payload.sessionId);
+  const requestLocalLinks: RequestLocalSessionLink[] = [];
+  let currentTrigger: PairCurrentTrigger | undefined;
+  const current = payload.step === 1 ? boundary.at(-1) : undefined;
+  const currentOriginal = current === undefined
+    ? undefined
+    : originals.get(current.messageId);
+  if (current !== undefined && currentOriginal !== undefined) {
+    if (
+      currentOriginal.source.kind === 'plugin' &&
+      currentOriginal.source.plugin === DELIVERY_PLUGIN
+    ) {
+      const eventsById = new Map(
+        pairEvents.map((event) => [pairEventId(event), event] as const),
+      );
+      const verified = validateDeliveryProof(
+        currentOriginal,
+        eventsById,
+        role,
+      );
+      currentTrigger = verified.currentTrigger;
+      const hasPersistentProof = hasExactPersistentFullLink(
+        links,
+        current,
+        pairEventId(verified.pairEvent),
+      );
+      if (!hasPersistentProof) {
+        requestLocalLinks.push({
+          sessionId: payload.sessionId,
+          fromSessionSeq: current.sessionSeq,
+          throughSessionSeq: current.sessionSeq,
+          messageIds: [current.messageId],
+          representation: 'full',
+          pairEventId: pairEventId(verified.pairEvent),
+          persistence: 'request-local',
+          proof: verified.proof,
+        });
+      }
+    } else if (currentOriginal.source.kind === 'user') {
+      const sourceEventId =
+        `dsh:${payload.sessionId}:${current.sessionSeq}:user.message`;
+      const candidates = pairEvents.filter((event) =>
+        event.refs.sourceEventIds?.includes(sourceEventId),
+      );
+      if (candidates.length > 1) {
+        throw new PairRequestBindingError(
+          `Native composer source ${sourceEventId} has multiple durable claims`,
+        );
+      }
+      const represented = candidates[0];
+      if (represented !== undefined) {
+        validateNativeComposerProof(current, represented, sourceEventId, role);
+        const hasPersistentProof = hasExactPersistentFullLink(
+          links,
+          current,
+          pairEventId(represented),
+        );
+        if (!hasPersistentProof) {
+          requestLocalLinks.push({
+            sessionId: payload.sessionId,
+            fromSessionSeq: current.sessionSeq,
+            throughSessionSeq: current.sessionSeq,
+            messageIds: [current.messageId],
+            representation: 'full',
+            pairEventId: pairEventId(represented),
+            persistence: 'request-local',
+            proof: { kind: 'native-composer', sourceEventId },
+          });
+        }
+      }
+    }
   }
   return {
     boundary,
     links,
+    requestLocalLinks,
     ...(currentTrigger === undefined ? {} : { currentTrigger }),
     localSurfaceThroughSeq: Math.max(0, ...boundary.map((item) => item.sessionSeq)),
     originals,
@@ -476,7 +793,11 @@ export class PairRequestPlugin {
     const sharedEvents = events.filter(
       (event) => event.visibility === 'shared',
     );
-    const local = boundaryProjection(payload);
+    const local = boundaryProjection(
+      payload,
+      events,
+      this.options.binding.role,
+    );
     const materials = selectedMaterials;
     if (
       payload.system !== materials.commonSystem.content ||
@@ -505,6 +826,7 @@ export class PairRequestPlugin {
       projection,
       boundaryMessages: local.boundary,
       links: local.links,
+      requestLocalLinks: local.requestLocalLinks,
       roleToolGuidance: materials.roleToolGuidance[this.options.binding.role],
         ...(payload.step === 1 && local.currentTrigger !== undefined
           ? { currentTrigger: local.currentTrigger }

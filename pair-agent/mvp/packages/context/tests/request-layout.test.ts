@@ -115,9 +115,9 @@ function input(
         ? 'Use navigator control tools only.'
         : 'Use pilot execution tools only.',
     currentTrigger: {
+      kind: 'user.message',
       deliveryId: `delivery-${role}`,
       pairEventId: 'event-2',
-      mode: 'followup',
     },
     tools: [
       {
@@ -241,7 +241,11 @@ describe('buildPairRequestLayout', () => {
       },
     ];
     mutable.links = [];
-    mutable.currentTrigger = { nested: { value: 'before' } };
+    mutable.currentTrigger = {
+      kind: 'user.message',
+      pairEventId: 'event-before',
+      deliveryId: 'delivery-before',
+    };
     mutable.tools = [{ function: { name: 'before' } }];
     mutable.config = { provider: { model: 'before' } };
     const layout = buildPairRequestLayout(mutable);
@@ -249,8 +253,7 @@ describe('buildPairRequestLayout', () => {
 
     ((mutable.boundaryMessages[0]?.message.content as { nested: { value: string } })
       .nested.value) = 'after';
-    ((mutable.currentTrigger as { nested: { value: string } }).nested.value) =
-      'after';
+    mutable.currentTrigger.deliveryId = 'delivery-after';
     ((mutable.tools as { function: { name: string } }[])[0] as {
       function: { name: string };
     }).function.name = 'after';
@@ -376,8 +379,52 @@ describe('buildPairRequestLayout', () => {
     expect(layout.messages.at(-1)).toEqual({
       role: 'user',
       content:
-        '<pair-trigger schema="pair-trigger/v1">\n{"deliveryId":"delivery-navigator","mode":"followup","pairEventId":"event-2"}\n</pair-trigger>',
+        '<pair-trigger schema="pair-trigger/v1">\n{"deliveryId":"delivery-navigator","kind":"user.message","pairEventId":"event-2"}\n</pair-trigger>',
     });
+  });
+
+  it('allows request-local proof for this layout without making it a persisted link', () => {
+    const current = input();
+    current.links = [];
+    current.boundaryMessages = [current.boundaryMessages[1]!];
+    current.requestLocalLinks = [
+      {
+        sessionId: current.sessionId,
+        fromSessionSeq: 11,
+        throughSessionSeq: 11,
+        messageIds: ['navigator-11'],
+        representation: 'full',
+        pairEventId: 'event-2',
+        persistence: 'request-local',
+        proof: {
+          kind: 'pair-delivery',
+          pairEventId: 'event-2',
+          deliveryId: 'delivery-navigator',
+        },
+      },
+    ];
+
+    const layout = buildPairRequestLayout(current);
+
+    expect(layout.messages.some((message) => message.content === 'already shared'))
+      .toBe(false);
+    expect(layout.manifest.spans[0]).toMatchObject({
+      decision: 'excluded',
+      linkedPairEventIds: ['event-2'],
+    });
+  });
+
+  it.each([
+    { text: 'duplicated text' },
+    { task: { id: 'task-1' } },
+    { role: 'navigator' },
+  ])('rejects duplicated model-visible trigger payload %#', (duplicate) => {
+    const invalid = input();
+    invalid.currentTrigger = { ...invalid.currentTrigger!, ...duplicate } as never;
+
+    expect(() => buildPairRequestLayout(invalid)).toThrow(
+      /currentTrigger contains unsupported payload fields/,
+    );
   });
 
   it('records deterministic source references and every local span in the manifest', () => {
@@ -456,7 +503,11 @@ describe('buildPairRequestLayout', () => {
       name: 'messagesDigest',
       changedDigest: 'messagesDigest' as const,
       mutate: (value: PairRequestLayoutInput) => {
-        value.currentTrigger = { changed: true };
+        value.currentTrigger = {
+          kind: 'user.message',
+          pairEventId: 'event-2',
+          deliveryId: 'delivery-changed',
+        };
       },
       fullRequestChanges: true,
     },
@@ -531,15 +582,6 @@ describe('buildPairRequestLayout', () => {
         value.config = { model: undefined } as never;
       },
       message: /cannot be undefined/,
-    },
-    {
-      name: 'circular trigger',
-      mutate: (value: PairRequestLayoutInput) => {
-        const circular: Record<string, unknown> = {};
-        circular.self = circular;
-        value.currentTrigger = circular as never;
-      },
-      message: /circular reference/,
     },
   ])('rejects $name', ({ mutate, message }) => {
     const invalid = input();

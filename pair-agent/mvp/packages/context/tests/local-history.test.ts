@@ -4,6 +4,7 @@ import {
   LocalHistoryInvariantError,
   projectLocalHistory,
   type LocalBoundaryMessage,
+  type RequestLocalSessionLink,
   type SessionEventPairSpanLink,
 } from '../src/index.js';
 
@@ -37,6 +38,19 @@ function link(
     ),
     representation,
     pairEventId,
+  };
+}
+
+function requestLocalLink(
+  sessionSeq: number,
+  proof: RequestLocalSessionLink['proof'],
+): RequestLocalSessionLink {
+  return {
+    ...link(sessionSeq, sessionSeq, 'full', proof.kind === 'pair-delivery'
+      ? proof.pairEventId
+      : 'pair-event-current'),
+    persistence: 'request-local',
+    proof,
   };
 }
 
@@ -290,6 +304,86 @@ describe('projectLocalHistory', () => {
         { decision: 'retained', reason: 'unlinked' },
         { decision: 'retained', reason: 'unknown-representation' },
       ]);
+  });
+
+  it('accepts a proven request-local full link only through the current request option', () => {
+    const input = [boundary(1, { role: 'user', content: 'already shared now' })];
+    const current = requestLocalLink(1, {
+      kind: 'pair-delivery',
+      pairEventId: 'pair-01:2',
+      deliveryId: 'pair-01:2',
+    });
+
+    const projected = projectLocalHistory(input, [], {
+      expectedSessionId: sessionId,
+      requestLocalLinks: [current],
+    });
+
+    expect(projected.messages).toEqual([]);
+    expect(projected.spans).toEqual([
+      expect.objectContaining({
+        messageIds: ['message-1'],
+        decision: 'excluded',
+        reason: 'fully-represented-in-pair',
+        linkedPairEventIds: ['pair-01:2'],
+      }),
+    ]);
+  });
+
+  it('rejects request-local proof links passed as reusable persisted links', () => {
+    const current = requestLocalLink(1, {
+      kind: 'native-composer',
+      sourceEventId: `dsh:${sessionId}:1:user.message`,
+    });
+
+    expect(() =>
+      projectLocalHistory(
+        [boundary(1, { role: 'user', content: 'current native input' })],
+        [current],
+        { expectedSessionId: sessionId },
+      ),
+    ).toThrow(/request-local links must be supplied for the current request/);
+  });
+
+  it('rejects an unknown request-local proof discriminant', () => {
+    const forged = {
+      ...requestLocalLink(1, {
+        kind: 'native-composer',
+        sourceEventId: `dsh:${sessionId}:1:user.message`,
+      }),
+      proof: { kind: 'forged-proof', sourceEventId: 'forged' },
+    };
+
+    expect(() =>
+      projectLocalHistory(
+        [boundary(1, { role: 'user', content: 'must not deduplicate' })],
+        [],
+        {
+          expectedSessionId: sessionId,
+          requestLocalLinks: [forged as never],
+        },
+      ),
+    ).toThrow(/request-local proof kind is invalid/);
+  });
+
+  it('rejects redundant request-local proof when an exact persisted full link exists', () => {
+    const persisted = link(1, 1, 'full', 'pair-01:2');
+    const current = requestLocalLink(1, {
+      kind: 'pair-delivery',
+      pairEventId: 'pair-01:2',
+      deliveryId: 'pair-01:2',
+    });
+
+    expect(() =>
+      projectLocalHistory(
+        [boundary(1, { role: 'user', content: 'persistently represented' })],
+        [persisted],
+        {
+          expectedSessionId: sessionId,
+          requestLocalLinks: [current],
+        },
+      ),
+    ).toThrow(/request-local proof is redundant/);
   });
 
   it('excludes a complete multi-call tool protocol only as one linked span', () => {

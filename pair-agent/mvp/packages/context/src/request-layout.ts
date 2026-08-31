@@ -13,6 +13,7 @@ import {
   type DegradedLocalHistoryProjection,
   type LocalBoundaryMessage,
   type LocalHistorySpanManifest,
+  type RequestLocalSessionLink,
   type SessionEventPairSpanLink,
 } from './local-history.js';
 import {
@@ -47,10 +48,19 @@ export interface PairRequestLayoutInput {
   projection: PairProjection;
   boundaryMessages: readonly LocalBoundaryMessage[];
   links: readonly SessionEventPairSpanLink[];
+  requestLocalLinks?: readonly RequestLocalSessionLink[];
   roleToolGuidance: string;
-  currentTrigger?: JsonValue;
+  currentTrigger?: PairCurrentTrigger;
   tools: JsonValue;
   config: JsonValue;
+}
+
+export interface PairCurrentTrigger {
+  kind: string;
+  pairEventId: string;
+  deliveryId?: string;
+  causalRootId?: string;
+  hop?: number;
 }
 
 export interface LayoutManifest {
@@ -156,7 +166,7 @@ function buildActiveRoleReminder(
   });
 }
 
-function buildCurrentTrigger(trigger: JsonValue): NormalizedMessage {
+function buildCurrentTrigger(trigger: PairCurrentTrigger): NormalizedMessage {
   return normalizeMessage({
     role: 'user',
     content: [
@@ -225,6 +235,37 @@ function validateInput(input: PairRequestLayoutInput): void {
   );
 
   if (input.currentTrigger !== undefined) {
+    const allowed = new Set([
+      'kind',
+      'pairEventId',
+      'deliveryId',
+      'causalRootId',
+      'hop',
+    ]);
+    invariant(
+      Object.keys(input.currentTrigger).every((key) => allowed.has(key)),
+      'currentTrigger contains unsupported payload fields',
+    );
+    nonEmptyString(input.currentTrigger.kind, 'currentTrigger.kind');
+    nonEmptyString(
+      input.currentTrigger.pairEventId,
+      'currentTrigger.pairEventId',
+    );
+    if (input.currentTrigger.deliveryId !== undefined) {
+      nonEmptyString(
+        input.currentTrigger.deliveryId,
+        'currentTrigger.deliveryId',
+      );
+    }
+    if (input.currentTrigger.causalRootId !== undefined) {
+      nonEmptyString(
+        input.currentTrigger.causalRootId,
+        'currentTrigger.causalRootId',
+      );
+    }
+    if (input.currentTrigger.hop !== undefined) {
+      nonNegativeSafeInteger(input.currentTrigger.hop, 'currentTrigger.hop');
+    }
     canonicalJsonStringify(input.currentTrigger);
   }
   canonicalJsonStringify(input.tools);
@@ -244,6 +285,9 @@ export function buildPairRequestLayout(
   );
   const local = projectLocalHistory(input.boundaryMessages, input.links, {
     expectedSessionId: input.sessionId,
+    ...(input.requestLocalLinks === undefined
+      ? {}
+      : { requestLocalLinks: input.requestLocalLinks }),
   });
   if (local.status === 'degraded') {
     throw new UnsafeLocalHistoryError(local);
