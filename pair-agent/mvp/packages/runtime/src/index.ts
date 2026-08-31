@@ -4,3 +4,4 @@ export * from './pair-derived-event-writer.js';
 export * from './pair-registry.js';
 export * from './pair-request-plugin.js';
 export * from './request-material-registry.js';
+export * from './session-event-derive.js';

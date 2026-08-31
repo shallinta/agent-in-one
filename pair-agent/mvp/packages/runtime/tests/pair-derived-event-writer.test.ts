@@ -206,6 +206,71 @@ describe('PairDerivedEventWriter', () => {
     ]);
   });
 
+  test('links a Pair delivery directly to an existing Pair message ID', async () => {
+    const { pairId, store, writer } = await createHarness();
+    const represented = await store.append(
+      pairId,
+      {
+        type: 'user.message',
+        actor: { kind: 'user' },
+        source: 'pair',
+        channel: 'navigator',
+        visibility: 'shared',
+        authority: 'user',
+        refs: {},
+        payload: {
+          schemaVersion: 1,
+          kind: 'user-input',
+          text: 'delivered input',
+          content: [{ type: 'text', text: 'delivered input' }],
+          deliveryId: `${pairId}:3`,
+        },
+      },
+      2,
+    );
+    const deliveryLink: DerivedEventSpec = {
+      sourceId: 'dsh:pair:pair-derived:navigator:8:session_event.linked',
+      representedPairEventId: `${pairId}:${represented.seq}`,
+      draft: {
+        type: 'session_event.linked',
+        actor: { kind: 'host' },
+        source: 'navigator-session',
+        channel: 'navigator',
+        visibility: 'infrastructure',
+        authority: 'host',
+        refs: {},
+        payload: {
+          schemaVersion: 1,
+          sessionId: 'pair:pair-derived:navigator',
+          fromSessionSeq: 8,
+          throughSessionSeq: 8,
+          messageIds: ['delivery-message'],
+          pairEventId: 'resolved-by-writer',
+          representation: 'full',
+        },
+      },
+    };
+
+    const [link] = await writer.appendGroup(pairId, [deliveryLink]);
+
+    expect(link?.payload).toMatchObject({ pairEventId: `${pairId}:3` });
+    expect(await store.read(pairId)).toHaveLength(4);
+  });
+
+  test('rejects a direct Pair event link when its target is absent', async () => {
+    const { pairId, writer } = await createHarness();
+
+    await expect(
+      writer.appendGroup(pairId, [
+        {
+          ...linkSpec(),
+          representedSourceId: undefined,
+          representedPairEventId: `${pairId}:999`,
+        },
+      ]),
+    ).rejects.toBeInstanceOf(DerivedEventConflictError);
+  });
+
   test('repairs a message-only half write by appending only the link', async () => {
     const { pairId, store, writer } = await createHarness();
     const [message] = await writer.appendGroup(pairId, [messageSpec()]);

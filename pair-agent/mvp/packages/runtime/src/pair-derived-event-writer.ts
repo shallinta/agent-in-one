@@ -12,6 +12,7 @@ import { PairRegistry } from './pair-registry.js';
 export interface DerivedEventSpec {
   readonly sourceId: string;
   readonly representedSourceId?: string;
+  readonly representedPairEventId?: string;
   readonly draft: PairEventDraft;
 }
 
@@ -43,6 +44,10 @@ function indexCanonicalSources(events: readonly PairEvent[]): Map<string, PairEv
     }
   }
   return bySource;
+}
+
+function indexPairEventIds(events: readonly PairEvent[]): Map<string, PairEvent> {
+  return new Map(events.map((event) => [pairEventId(event), event]));
 }
 
 function withSourceId(
@@ -100,31 +105,41 @@ function assertCanonicalDerivation(
 function materializeDraft(
   spec: DerivedEventSpec,
   bySource: ReadonlyMap<string, PairEvent>,
+  byPairEventId: ReadonlyMap<string, PairEvent>,
 ): PairEventDraft {
   if (spec.draft.type !== 'session_event.linked') {
-    if (spec.representedSourceId !== undefined) {
+    if (
+      spec.representedSourceId !== undefined ||
+      spec.representedPairEventId !== undefined
+    ) {
       throw new DerivedEventConflictError(
         spec.sourceId,
-        'representedSourceId is valid only for session_event.linked',
+        'represented message selectors are valid only for session_event.linked',
       );
     }
     return withSourceId(spec.draft, spec.sourceId);
   }
 
-  if (spec.representedSourceId === undefined) {
+  if (
+    (spec.representedSourceId === undefined) ===
+    (spec.representedPairEventId === undefined)
+  ) {
     throw new DerivedEventConflictError(
       spec.sourceId,
-      'session_event.linked requires representedSourceId',
+      'session_event.linked requires exactly one represented message selector',
     );
   }
-  const represented = bySource.get(spec.representedSourceId);
+  const represented =
+    spec.representedSourceId === undefined
+      ? byPairEventId.get(spec.representedPairEventId!)
+      : bySource.get(spec.representedSourceId);
   if (
     represented === undefined ||
     (represented.type !== 'user.message' && represented.type !== 'agent.message')
   ) {
     throw new DerivedEventConflictError(
       spec.sourceId,
-      `represented message ${spec.representedSourceId} is missing`,
+      `represented message ${spec.representedSourceId ?? spec.representedPairEventId} is missing`,
     );
   }
   return withSourceId(
@@ -150,13 +165,18 @@ export class PairDerivedEventWriter {
       pairId,
       async ({ events, appendDerived }) => {
         const bySource = indexCanonicalSources(events);
+        const byPairEventId = indexPairEventIds(events);
 
         for (const spec of specs) {
           if (
             spec.draft.type === 'session_event.linked' &&
             bySource.has(spec.sourceId) &&
-            (spec.representedSourceId === undefined ||
-              !bySource.has(spec.representedSourceId))
+            ((spec.representedSourceId !== undefined &&
+              !bySource.has(spec.representedSourceId)) ||
+              (spec.representedPairEventId !== undefined &&
+                !byPairEventId.has(spec.representedPairEventId)) ||
+              (spec.representedSourceId === undefined &&
+                spec.representedPairEventId === undefined))
           ) {
             throw new DerivedEventConflictError(
               spec.sourceId,
@@ -167,7 +187,7 @@ export class PairDerivedEventWriter {
 
         const output: PairEvent[] = [];
         for (const spec of specs) {
-          const draft = materializeDraft(spec, bySource);
+          const draft = materializeDraft(spec, bySource, byPairEventId);
           if (
             draft.type !== 'user.message' &&
             draft.type !== 'agent.message' &&
@@ -187,6 +207,7 @@ export class PairDerivedEventWriter {
           }
           const event = await appendDerived(draft);
           bySource.set(spec.sourceId, event);
+          byPairEventId.set(pairEventId(event), event);
           output.push(event);
         }
         return output;
