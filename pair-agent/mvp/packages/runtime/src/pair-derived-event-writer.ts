@@ -135,7 +135,11 @@ function materializeDraft(
       : bySource.get(spec.representedSourceId);
   if (
     represented === undefined ||
-    (represented.type !== 'user.message' && represented.type !== 'agent.message')
+    (spec.representedSourceId !== undefined &&
+      represented.type !== 'user.message' &&
+      represented.type !== 'agent.message') ||
+    (spec.representedPairEventId !== undefined &&
+      represented.visibility !== 'shared')
   ) {
     throw new DerivedEventConflictError(
       spec.sourceId,
@@ -156,6 +160,10 @@ function materializeDraft(
 
 export class PairDerivedEventWriter {
   constructor(private readonly registry: PairRegistry) {}
+
+  readPairEvents(pairId: PairId): Promise<readonly PairEvent[]> {
+    return this.registry.readDerivedEvents(pairId);
+  }
 
   async appendGroup(
     pairId: PairId,

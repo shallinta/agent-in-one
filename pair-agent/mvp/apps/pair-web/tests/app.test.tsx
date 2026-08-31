@@ -11,6 +11,7 @@ const baseProjection: PairProjection = {
   header: {
     pairId: parsePairId('pair-web'),
     schemaVersion: 1,
+    pairProtocol: 'pair-agent/p0.5',
     navigatorSessionId: 'pair:pair-web:navigator',
     pilotSessionId: 'pair:pair-web:pilot',
     ledgerHead: 2,

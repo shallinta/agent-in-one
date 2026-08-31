@@ -38,6 +38,7 @@ function event(
       seq === 1
         ? {
             schemaVersion: 1,
+            pairProtocol: 'pair-agent/p0.5',
             navigatorSessionId: 'pair:pair-01:navigator',
             pilotSessionId: 'pair:pair-01:pilot',
           }
@@ -52,6 +53,7 @@ function projection(sharedHead: number): PairProjection {
     header: {
       pairId: parsePairId('pair-01'),
       schemaVersion: 1,
+      pairProtocol: 'pair-agent/p0.5',
       navigatorSessionId: 'pair:pair-01:navigator',
       pilotSessionId: 'pair:pair-01:pilot',
       ledgerHead: sharedHead,

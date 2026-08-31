@@ -33,7 +33,9 @@ export interface DerivedSessionGroup {
   readonly sourceSessionSeq: number;
   readonly time: number;
   readonly role: PairRole;
-  readonly records: readonly [DerivedEventSpec, DerivedEventSpec?];
+  readonly records:
+    | readonly [DerivedEventSpec]
+    | readonly [DerivedEventSpec, DerivedEventSpec];
 }
 
 export class SessionEventDerivationError extends Error {
@@ -168,7 +170,7 @@ function findExistingMessage(
   );
   if (
     represented === undefined ||
-    (represented.type !== 'user.message' && represented.type !== 'agent.message')
+    represented.visibility !== 'shared'
   ) {
     throw new SessionEventDerivationError(
       `Pair delivery references missing message ${pairEventId}`,

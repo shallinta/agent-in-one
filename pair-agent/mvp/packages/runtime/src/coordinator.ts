@@ -214,7 +214,12 @@ export class PairCoordinator {
           visibility: 'shared',
           authority: 'user',
           refs: {},
-          payload: { text },
+          payload: {
+            schemaVersion: 1,
+            kind: 'user-input',
+            text,
+            content: [{ type: 'text', text }],
+          },
         });
         const pane = ready.panes.find((candidate) => candidate.role === role)!;
         return this.#deliver(pairId, pane.sessionId, event, {

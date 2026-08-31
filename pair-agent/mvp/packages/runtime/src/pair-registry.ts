@@ -6,6 +6,7 @@ import {
   canonicalJsonStringify,
   createPairSessionIds,
   parsePairId,
+  PAIR_PROTOCOL_VERSION,
   type DshBuildRef,
   type DshRuntimeArtifactRef,
   type JsonObject,
@@ -53,6 +54,10 @@ export interface DshRuntimeAttestation {
 }
 
 export interface AgentAdapter {
+  /** DSH-style adapters use this second construction stage to attach Host services. */
+  attachPairRegistry?(registry: PairRegistry): void;
+  /** True when adapter.close() is the sole owner of all Agent handle disposal. */
+  readonly closeOwnsHandles?: true;
   /** Immutable build facts verified by the adapter before it becomes usable. */
   getDshRuntimeAttestation(): DshRuntimeAttestation;
   preparePairAgent(input: PreparePairAgentInput): Promise<PreparedPairAgent>;
@@ -61,6 +66,16 @@ export interface AgentAdapter {
     pairId: PairId;
     sessions: Readonly<Record<PairRole, AgentHandle>>;
   }): Promise<void>;
+  catchUpPair?(input: {
+    pairId: PairId;
+    sessions: Readonly<Record<PairRole, AgentHandle>>;
+    recovery: boolean;
+  }): Promise<void>;
+  cleanupFailedPair?(input: {
+    pairId: PairId;
+    sessions: readonly AgentHandle[];
+  }): Promise<void>;
+  assertPairHealthy?(pairId: PairId): void;
   release(handle: AgentHandle): Promise<void>;
   // Phase 0 uses followup as the uniform wake primitive for both Pair roles.
   followup(input: FollowupInput): Promise<void>;
@@ -372,6 +387,7 @@ export class PairRegistry {
     options: PairRegistryOptions = {},
   ) {
     this.#options = options;
+    adapter.attachPairRegistry?.(this);
   }
 
   createPair(input: CreatePairInput): Promise<PairCreationResult> {
@@ -404,6 +420,7 @@ export class PairRegistry {
         refs: {},
         payload: {
           schemaVersion: 1,
+          pairProtocol: PAIR_PROTOCOL_VERSION,
           ...sessionIds,
           dshBuild: attestation.dshBuild as unknown as JsonObject,
           dshRuntimeArtifacts: attestation.runtimeArtifacts as unknown as JsonObject,
@@ -463,7 +480,7 @@ export class PairRegistry {
     }
 
     if (failure !== undefined) {
-      const released = await this.#releasePairHandles(
+      const released = await this.#cleanupFailedPair(
         pairId,
         prepared.map(({ handle }) => handle),
       );
@@ -488,6 +505,44 @@ export class PairRegistry {
         },
       );
       if (this.#closed) throw new RegistryClosedError();
+      const failed: FailedPair = { status: 'failed', projection, ...failure };
+      this.#states.set(pairId, failed);
+      return failed;
+    }
+
+    try {
+      await this.adapter.catchUpPair?.({
+        pairId,
+        sessions: {
+          navigator: prepared[0]!.handle,
+          pilot: prepared[1]!.handle,
+        },
+        recovery: false,
+      });
+    } catch (error) {
+      failure = { reason: errorMessage(error) };
+    }
+
+    if (failure !== undefined) {
+      const released = await this.#cleanupFailedPair(
+        pairId,
+        prepared.map(({ handle }) => handle),
+      );
+      if (!released) retainOwnership = true;
+      if (this.#closed) throw new RegistryClosedError();
+      const { projection } = await this.#appendLifecycleEvent(
+        pairId,
+        {
+          type: 'pair.agent_failed',
+          actor: { kind: 'host' },
+          source: 'pair',
+          channel: 'shared-control',
+          visibility: 'infrastructure',
+          authority: 'host',
+          refs: {},
+          payload: { reason: failure.reason },
+        },
+      );
       const failed: FailedPair = { status: 'failed', projection, ...failure };
       this.#states.set(pairId, failed);
       return failed;
@@ -569,7 +624,14 @@ export class PairRegistry {
     const resumeError = this.#resumeErrors.get(pairId);
     if (resumeError !== undefined) return Promise.reject(resumeError);
     const cached = this.#states.get(pairId);
-    if (cached?.status === 'ready') return Promise.resolve(cached);
+    if (cached?.status === 'ready') {
+      try {
+        this.adapter.assertPairHealthy?.(pairId);
+        return Promise.resolve(cached);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    }
     if (cached?.status === 'failed') {
       return Promise.reject(new PairNotReadyError(pairId, cached.reason));
     }
@@ -593,7 +655,7 @@ export class PairRegistry {
   async #recoverColdPair(pairId: PairId): Promise<ReadyPair> {
     const events = await this.store.replay(pairId);
     if (events.length === 0) throw new PairNotFoundError(pairId);
-    const projection = replayPairProjection(events);
+    let projection = replayPairProjection(events);
     const persistedBuild = projection.header.dshBuild;
     const persistedArtifacts = projection.header.dshRuntimeArtifacts;
     if (persistedBuild === undefined) {
@@ -695,8 +757,16 @@ export class PairRegistry {
           pilot: resumed[1]!.handle,
         },
       });
+      await this.adapter.catchUpPair?.({
+        pairId,
+        sessions: {
+          navigator: resumed[0]!.handle,
+          pilot: resumed[1]!.handle,
+        },
+        recovery: true,
+      });
     } catch (error) {
-      const released = await this.#releasePairHandles(
+      const released = await this.#cleanupFailedPair(
         pairId,
         resumed.map(({ handle }) => handle),
       );
@@ -709,6 +779,7 @@ export class PairRegistry {
       this.#resumeErrors.set(pairId, resumeError);
       throw resumeError;
     }
+    projection = replayPairProjection(await this.store.replay(pairId));
     const ready: ReadyPair = {
       status: 'ready',
       projection,
@@ -746,6 +817,7 @@ export class PairRegistry {
       if (ready?.status !== 'ready') {
         throw new PairNotReadyError(pairId);
       }
+      this.adapter.assertPairHealthy?.(pairId);
       const events = await this.store.replay(pairId);
       if (events.length === 0) throw new PairNotFoundError(pairId);
       let projection = replayPairProjection(events);
@@ -781,16 +853,18 @@ export class PairRegistry {
     pairIdInput: string,
     operation: (context: PairDerivedMutationContext) => Promise<TResult>,
   ): Promise<TResult> {
-    this.#assertOpen();
     const pairId = parsePairId(pairIdInput);
     const storageIdentity = await this.#getStorageIdentity();
     return serializePairMutation(`${storageIdentity}\0${pairId}`, async () => {
-      this.#assertOpen();
+      if (this.#closed && !this.#ownedLeaseKeys.has(pairId)) {
+        throw new RegistryClosedError();
+      }
       const state = this.#states.get(pairId);
-      if (state?.status === 'failed') {
+      const ownsPair = this.#ownedLeaseKeys.has(pairId);
+      if (state?.status === 'failed' && !ownsPair) {
         throw new PairNotReadyError(pairId, state.reason);
       }
-      if (state?.status !== 'ready' && !this.#ownedLeaseKeys.has(pairId)) {
+      if (state?.status !== 'ready' && !ownsPair) {
         throw new PairNotReadyError(pairId, 'Registry does not own this Pair');
       }
 
@@ -833,6 +907,19 @@ export class PairRegistry {
           throw error;
         }
       }
+    });
+  }
+
+  async readDerivedEvents(pairIdInput: string): Promise<readonly PairEvent[]> {
+    const pairId = parsePairId(pairIdInput);
+    const storageIdentity = await this.#getStorageIdentity();
+    return serializePairMutation(`${storageIdentity}\0${pairId}`, async () => {
+      if (this.#closed && !this.#ownedLeaseKeys.has(pairId)) {
+        throw new RegistryClosedError();
+      }
+      const events = await this.store.replay(pairId);
+      if (events.length === 0) throw new PairNotFoundError(pairId);
+      return structuredClone(events);
     });
   }
 
@@ -975,15 +1062,27 @@ export class PairRegistry {
         for (const handle of degraded) handles.add(handle);
         handlesByPair.set(pairId, handles);
       }
-      const releaseResults = await Promise.all(
-        [...handlesByPair].map(([pairId, handles]) =>
-          this.#releasePairHandles(pairId, [...handles]),
-        ),
-      );
-      const allHandlesReleased = releaseResults.every(Boolean);
+      const adapterOwnsHandles = this.adapter.closeOwnsHandles === true;
+      let allHandlesReleased = false;
       let adapterClosed = false;
       let adapterCloseError: unknown;
-      if (this.adapter.close !== undefined) {
+      if (adapterOwnsHandles && this.adapter.close !== undefined) {
+        try {
+          await this.adapter.close();
+          adapterClosed = true;
+        } catch (error) {
+          adapterCloseError = error;
+        }
+      }
+      if (!adapterOwnsHandles) {
+        const releaseResults = await Promise.all(
+          [...handlesByPair].map(([pairId, handles]) =>
+            this.#releasePairHandles(pairId, [...handles]),
+          ),
+        );
+        allHandlesReleased = releaseResults.every(Boolean);
+      }
+      if (!adapterOwnsHandles && this.adapter.close !== undefined) {
         try {
           await this.adapter.close();
           adapterClosed = true;
@@ -994,6 +1093,9 @@ export class PairRegistry {
       if (allHandlesReleased || adapterClosed) {
         this.#degradedHandles.clear();
         this.#releaseAllOwnership();
+      }
+      if (adapterOwnsHandles && adapterCloseError !== undefined) {
+        throw adapterCloseError;
       }
       if (!allHandlesReleased && !adapterClosed) {
         throw new AggregateError(
@@ -1041,6 +1143,28 @@ export class PairRegistry {
     }
     this.#degradedHandles.delete(pairId);
     return true;
+  }
+
+  async #cleanupFailedPair(
+    pairId: PairId,
+    handles: readonly AgentHandle[],
+  ): Promise<boolean> {
+    if (this.adapter.cleanupFailedPair === undefined) {
+      return this.#releasePairHandles(pairId, handles);
+    }
+    const owned = [
+      ...(this.#degradedHandles.get(pairId) ?? []),
+      ...handles,
+    ].filter((handle) => !this.#releasedHandles.has(handle));
+    try {
+      await this.adapter.cleanupFailedPair({ pairId, sessions: owned });
+      for (const handle of owned) this.#releasedHandles.add(handle);
+      this.#degradedHandles.delete(pairId);
+      return true;
+    } catch {
+      this.#degradedHandles.set(pairId, new Set(owned));
+      return false;
+    }
   }
 
   #assertOpen(): void {

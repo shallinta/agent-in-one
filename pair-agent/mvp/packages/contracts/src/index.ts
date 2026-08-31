@@ -48,6 +48,7 @@ export function createPairSessionIds(pairId: string): PairSessionIds {
 }
 
 export type PairRole = 'navigator' | 'pilot';
+export const PAIR_PROTOCOL_VERSION = 'pair-agent/p0.5' as const;
 export type PairChannel = PairRole | 'shared-control';
 export type PairEventSource =
   | 'pair'
@@ -169,6 +170,7 @@ export interface DshRuntimeArtifactRef {
 
 export interface PairCreatedPayload extends PairSessionIds {
   schemaVersion: 1;
+  pairProtocol: typeof PAIR_PROTOCOL_VERSION;
   dshBuild?: DshBuildRef;
   dshRuntimeArtifacts?: DshRuntimeArtifactRef;
 }

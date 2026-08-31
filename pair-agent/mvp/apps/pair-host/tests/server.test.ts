@@ -316,7 +316,10 @@ describe('Pair Host HTTP API', () => {
       delivery: 'pending',
     });
     expect((await store.read('pending-pair')).at(-1)?.payload).toEqual({
+      schemaVersion: 1,
+      kind: 'user-input',
       text: 'persist me',
+      content: [{ type: 'text', text: 'persist me' }],
     });
   });
 

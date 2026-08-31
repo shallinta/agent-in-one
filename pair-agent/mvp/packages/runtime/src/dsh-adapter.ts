@@ -29,6 +29,12 @@ import {
   ImmutablePairRequestMaterialRegistry,
   type PairRequestMaterialEntry,
 } from './request-material-registry.js';
+import { PairDerivedEventWriter } from './pair-derived-event-writer.js';
+import type { DshSessionEvent } from './session-event-derive.js';
+import {
+  SessionToPairBridge,
+  type PairSessionBridgePort,
+} from './session-to-pair-bridge.js';
 import type {
   AgentAdapter,
   AgentHandle as PairAgentHandle,
@@ -36,6 +42,7 @@ import type {
   PreparePairAgentInput,
   PreparedPairAgent,
   DshRuntimeAttestation,
+  PairRegistry,
 } from './pair-registry.js';
 
 const execFile = promisify(execFileCallback);
@@ -66,6 +73,16 @@ interface DshOwnedAgentHandle {
   dispose(): Promise<void>;
 }
 
+interface DshObservedPairSession {
+  readonly pairId: PairId;
+  readonly role: PairRole;
+  readonly sessionId: string;
+  live?: DshSession;
+  pending: boolean;
+  pendingSession?: DshSession;
+  fault?: Error;
+}
+
 interface DshRegisteredToolDefinition {
   readonly name: string;
   readonly description: string;
@@ -77,6 +94,10 @@ interface DshContext {
   get(name: string): unknown;
   plugin(plugin: unknown, config?: unknown): Promise<unknown>;
   readonly fiber: { dispose(): Promise<void> };
+  on(
+    name: 'session/event',
+    listener: (session: DshSession, event: JsonObject) => void,
+  ): () => void;
   readonly agents: {
     create(input: {
       sessionId: string;
@@ -111,6 +132,10 @@ interface DshContext {
   };
   readonly sessionPersistence: {
     locate(header: JsonObject): { kind: string; path: string } | undefined;
+    readFrom(
+      sessionId: string,
+      fromSeq: number,
+    ): Promise<{ meta: JsonObject; events: JsonObject[] }>;
   };
   readonly tools: {
     register(tool: object): () => void;
@@ -261,6 +286,7 @@ export interface DshPairAgentAdapterOptions {
   /** Capture-mode fault injection for lifecycle rollback contract tests only. */
   readonly lifecycleFaults?: {
     afterAgentOpened?(): void;
+    beforeBridgeRead?(sessionId: string, fromSeq: number): Promise<void> | void;
     beforeDispose?(reason: 'rollback' | 'release' | 'close'): Promise<void> | void;
     /** Hosted capture-runtime fault injection only. */
     beforeHostedContextDispose?(): void;
@@ -854,6 +880,7 @@ export function validatePairRequestCoordinates(
 }
 
 export class DshPairAgentAdapter implements AgentAdapter {
+  readonly closeOwnsHandles = true as const;
   readonly #handles = new Map<string, DshOwnedAgentHandle>();
   readonly #pairHandles = new WeakMap<PairAgentHandle, DshOwnedAgentHandle>();
   readonly #bindings = new Map<
@@ -867,7 +894,17 @@ export class DshPairAgentAdapter implements AgentAdapter {
   readonly #captures: CapturedProviderRequest[] = [];
   readonly #requestHandoffs = new PendingRequestHandoffs();
   readonly #orphans = new Set<DshOwnedAgentHandle>();
+  readonly #disposedHandles = new WeakSet<DshOwnedAgentHandle>();
+  readonly #failedCleanupPairs = new Set<PairId>();
+  readonly #observedSessions = new Map<string, DshObservedPairSession>();
+  readonly #sessionEventListeners = new Set<
+    (sessionId: string, event: DshSessionEvent) => void
+  >();
+  #observationOff?: () => void;
+  #bridge?: SessionToPairBridge;
   #closed = false;
+  #closeDrainSuspended = false;
+  #closeAgentsDisposed = false;
   #closePromise?: Promise<void>;
 
   private constructor(
@@ -996,6 +1033,7 @@ export class DshPairAgentAdapter implements AgentAdapter {
         adapter.#createCaptureProvider(),
       );
     }
+    adapter.#installObservationHook();
     return adapter;
   }
 
@@ -1017,6 +1055,60 @@ export class DshPairAgentAdapter implements AgentAdapter {
     }
     canonicalJsonStringify(options.commonSystem);
     return DshPairAgentAdapter.createOnContext(options, modules, context, false);
+  }
+
+  attachPairRegistry(registry: PairRegistry): void {
+    if (this.#bridge !== undefined) {
+      throw new PairRequestBindingError('Pair Bridge is already attached');
+    }
+    if (this.#observationOff === undefined) {
+      throw new PairRequestBindingError('DSH Session observation hook is not installed');
+    }
+    this.#bridge = new SessionToPairBridge(
+      this.observationPort(),
+      new PairDerivedEventWriter(registry),
+    );
+  }
+
+  observationPort(): PairSessionBridgePort {
+    return {
+      onSessionEvent: (listener) => {
+        this.#sessionEventListeners.add(listener);
+        return () => this.#sessionEventListeners.delete(listener);
+      },
+      flushSession: async (sessionId) => {
+        const observed = this.#requireObservedSession(sessionId);
+        if (observed.fault !== undefined) throw observed.fault;
+        if (observed.live === undefined) {
+          throw new PairRequestBindingError(
+            `DSH Pair Session ${sessionId} has no verified live identity`,
+          );
+        }
+        const accepted = await this.context.sessions.flush(observed.live);
+        if (!accepted) {
+          throw new PairRequestBindingError(
+            `DSH persistence refused to flush Pair Session ${sessionId}`,
+          );
+        }
+      },
+      readDurableFrom: async (sessionId, fromSeq) => {
+        const observed = this.#requireObservedSession(sessionId);
+        if (observed.fault !== undefined) throw observed.fault;
+        await this.options.lifecycleFaults?.beforeBridgeRead?.(sessionId, fromSeq);
+        const snapshot = await this.context.sessionPersistence.readFrom(
+          sessionId,
+          fromSeq,
+        );
+        return structuredClone(snapshot.events) as unknown as DshSessionEvent[];
+      },
+      whenAgentIdle: async (sessionId) => {
+        const handle = this.#handles.get(sessionId);
+        if (handle === undefined) {
+          throw new PairRequestBindingError(`Unknown DSH Pair session ${sessionId}`);
+        }
+        await handle.agent.whenIdle();
+      },
+    };
   }
 
   preparePairAgent(input: PreparePairAgentInput): Promise<PreparedPairAgent> {
@@ -1119,6 +1211,7 @@ export class DshPairAgentAdapter implements AgentAdapter {
         }).on('agent/request-error', async () => ({ kind: 'retry' }));
       };
     }
+    this.#bindProvisional(input, pairId);
     let handle: DshOwnedAgentHandle | undefined;
     try {
       handle = resume
@@ -1142,6 +1235,7 @@ export class DshPairAgentAdapter implements AgentAdapter {
       if (location === undefined || location.kind !== 'jsonl') {
         throw new PairRequestBindingError('DSH JSONL persistence did not locate the Session');
       }
+      this.#confirmLiveSession(input.sessionId, handle.agent.session);
       if (!resume) {
         handle.agent.inject(
           this.modules.createUserMessage({
@@ -1175,6 +1269,7 @@ export class DshPairAgentAdapter implements AgentAdapter {
           this.#orphans.add(handle);
         }
       }
+      this.#removeObservedSession(input.sessionId);
       throw error;
     }
   }
@@ -1199,13 +1294,7 @@ export class DshPairAgentAdapter implements AgentAdapter {
     if (owned === undefined) return;
     if (this.#handles.get(handle.sessionId) !== owned) return;
     await this.#disposeOwned(owned, 'release');
-    this.#pairHandles.delete(handle);
-    this.#handles.delete(handle.sessionId);
-    this.#prepared.delete(handle.sessionId);
-    this.#bindings.delete(handle.sessionId);
-    this.#deliveries.delete(handle.sessionId);
-    this.#artifacts.delete(handle.sessionId);
-    this.#orphans.delete(owned);
+    this.#forgetOwnedPairHandle(handle, owned);
   }
 
   async auditPairRequests(input: {
@@ -1265,6 +1354,75 @@ export class DshPairAgentAdapter implements AgentAdapter {
     }
   }
 
+  async catchUpPair(input: {
+    pairId: PairId;
+    sessions: Readonly<Record<PairRole, PairAgentHandle>>;
+    recovery: boolean;
+  }): Promise<void> {
+    const bridge = this.#requireBridge();
+    for (const role of ['navigator', 'pilot'] as const) {
+      const handle = input.sessions[role];
+      const owned = this.#pairHandles.get(handle);
+      const observed = this.#observedSessions.get(handle.sessionId);
+      if (
+        owned === undefined ||
+        observed === undefined ||
+        observed.pairId !== input.pairId ||
+        observed.role !== role ||
+        observed.live !== owned.agent.session
+      ) {
+        throw new PairRequestBindingError(
+          `Pair Bridge lacks the authoritative ${role} Session identity`,
+        );
+      }
+    }
+    if (input.recovery) await bridge.recoverPair(input.pairId);
+    else await bridge.catchUpPair(input.pairId);
+  }
+
+  async cleanupFailedPair(input: {
+    pairId: PairId;
+    sessions: readonly PairAgentHandle[];
+  }): Promise<void> {
+    const bridge = this.#requireBridge();
+    this.#failedCleanupPairs.add(input.pairId);
+    await bridge.suspendPair(input.pairId);
+    const owned = input.sessions.flatMap((handle) => {
+      const dshHandle = this.#pairHandles.get(handle);
+      return dshHandle === undefined ? [] : [{ pairHandle: handle, dshHandle }];
+    });
+    const settled = await Promise.allSettled(
+      owned.map(({ dshHandle }) => this.#disposeOwned(dshHandle, 'release')),
+    );
+    const failures = settled.flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : [],
+    );
+    try {
+      await bridge.drainDisposedPair(input.pairId);
+    } catch (error) {
+      failures.push(error);
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `DSH adapter could not dispose and drain failed Pair ${input.pairId}`,
+      );
+    }
+    for (const { pairHandle, dshHandle } of owned) {
+      this.#forgetOwnedPairHandle(pairHandle, dshHandle);
+    }
+    this.#failedCleanupPairs.delete(input.pairId);
+  }
+
+  assertPairHealthy(pairId: PairId): void {
+    for (const observed of this.#observedSessions.values()) {
+      if (observed.pairId === pairId && observed.fault !== undefined) {
+        throw observed.fault;
+      }
+    }
+    this.#requireBridge().assertHealthy(pairId);
+  }
+
   async followup(input: FollowupInput): Promise<void> {
     this.#assertOpen();
     const binding = this.#bindings.get(input.sessionId);
@@ -1298,6 +1456,7 @@ export class DshPairAgentAdapter implements AgentAdapter {
     }
     await handle.agent.whenIdle();
     await this.context.sessions.flush(handle.agent.session);
+    await this.#bridge?.whenCaughtUp([sessionId]);
   }
 
   captureRequests(): readonly CapturedProviderRequest[] {
@@ -1460,33 +1619,65 @@ export class DshPairAgentAdapter implements AgentAdapter {
     this.#closed = true;
     let closing!: Promise<void>;
     closing = (async () => {
-      const handles = [...new Set([...this.#handles.values(), ...this.#orphans])];
       this.#requestHandoffs.clear();
-      const settled = await Promise.allSettled(
-        handles.map((handle) => this.#disposeOwned(handle, 'close')),
+      const bridge = this.#bridge;
+      const pairIds = new Set(
+        [...this.#observedSessions.values()].map((binding) => binding.pairId),
       );
-      const failures = settled.flatMap((result) =>
-        result.status === 'rejected' ? [result.reason] : [],
-      );
-      for (let index = 0; index < handles.length; index += 1) {
-        if (settled[index]?.status !== 'fulfilled') continue;
-        const handle = handles[index]!;
-        this.#orphans.delete(handle);
-        for (const [sessionId, live] of this.#handles) {
-          if (live !== handle) continue;
-          this.#handles.delete(sessionId);
-          this.#prepared.delete(sessionId);
-          this.#bindings.delete(sessionId);
-          this.#deliveries.delete(sessionId);
-          this.#artifacts.delete(sessionId);
-        }
-      }
-      if (failures.length > 0) {
-        throw new AggregateError(
-          failures,
-          'DSH adapter could not dispose every owned Agent during close',
+      if (bridge !== undefined && !this.#closeDrainSuspended) {
+        await Promise.all(
+          [...this.#handles.values()]
+            .filter((handle) => !this.#disposedHandles.has(handle))
+            .map((handle) => handle.agent.whenIdle()),
         );
+        for (const pairId of pairIds) {
+          if (this.#failedCleanupPairs.has(pairId)) continue;
+          await bridge.drainPair(pairId);
+          await bridge.suspendPair(pairId);
+        }
+        this.#closeDrainSuspended = true;
       }
+      if (!this.#closeAgentsDisposed) {
+        const handles = [...new Set([...this.#handles.values(), ...this.#orphans])];
+        const settled = await Promise.allSettled(
+          handles.map((handle) => this.#disposeOwned(handle, 'close')),
+        );
+        const failures = settled.flatMap((result) =>
+          result.status === 'rejected' ? [result.reason] : [],
+        );
+        for (let index = 0; index < handles.length; index += 1) {
+          if (settled[index]?.status !== 'fulfilled') continue;
+          const handle = handles[index]!;
+          this.#orphans.delete(handle);
+          for (const [sessionId, live] of this.#handles) {
+            if (live !== handle) continue;
+            this.#handles.delete(sessionId);
+            this.#prepared.delete(sessionId);
+            this.#bindings.delete(sessionId);
+            this.#deliveries.delete(sessionId);
+            this.#artifacts.delete(sessionId);
+          }
+        }
+        if (failures.length > 0) {
+          throw new AggregateError(
+            failures,
+            'DSH adapter could not dispose every owned Agent during close',
+          );
+        }
+        this.#closeAgentsDisposed = true;
+      }
+      if (bridge !== undefined) {
+        for (const pairId of pairIds) {
+          await bridge.drainDisposedPair(pairId);
+          this.#failedCleanupPairs.delete(pairId);
+        }
+        await bridge.close();
+        this.#bridge = undefined;
+      }
+      this.#observationOff?.();
+      this.#observationOff = undefined;
+      this.#observedSessions.clear();
+      this.#sessionEventListeners.clear();
       if (this.ownsContext) await this.context.fiber.dispose();
     })().catch((error: unknown) => {
       if (this.#closePromise === closing) this.#closePromise = undefined;
@@ -1616,6 +1807,125 @@ export class DshPairAgentAdapter implements AgentAdapter {
     if (this.#closed) throw new DshAdapterClosedError();
   }
 
+  #installObservationHook(): void {
+    if (this.#observationOff !== undefined) {
+      throw new PairRequestBindingError('DSH Session observation hook is already installed');
+    }
+    this.#observationOff = this.context.on('session/event', (session, rawEvent) => {
+      const observed = this.#observedSessions.get(session.id);
+      if (observed === undefined) return;
+      const event = rawEvent as unknown as DshSessionEvent;
+      if (observed.live === undefined) {
+        if (
+          observed.pendingSession !== undefined &&
+          observed.pendingSession !== session
+        ) {
+          observed.fault = new PairRequestBindingError(
+            `DSH Session ${session.id} reused a provisional ID with a different object`,
+          );
+        }
+        observed.pendingSession = session;
+        observed.pending = true;
+        return;
+      }
+      if (observed.live !== session) {
+        observed.fault = new PairRequestBindingError(
+          `DSH Session ${session.id} reused a bound ID with a different live object`,
+        );
+      }
+      for (const listener of this.#sessionEventListeners) {
+        listener(session.id, event);
+      }
+    });
+  }
+
+  #bindProvisional(input: PreparePairAgentInput, pairId: PairId): void {
+    const bridge = this.#requireBridge();
+    if (this.#observedSessions.has(input.sessionId)) {
+      throw new PairRequestBindingError(
+        `DSH Pair Session ${input.sessionId} already has an observation binding`,
+      );
+    }
+    bridge.bindSession(pairId, input.role, input.sessionId);
+    this.#observedSessions.set(input.sessionId, {
+      pairId,
+      role: input.role,
+      sessionId: input.sessionId,
+      pending: false,
+    });
+  }
+
+  #confirmLiveSession(sessionId: string, session: DshSession): void {
+    const observed = this.#requireObservedSession(sessionId);
+    if (session.id !== sessionId) {
+      throw new PairRequestBindingError('DSH Session live identity does not match its binding');
+    }
+    if (observed.live !== undefined && observed.live !== session) {
+      throw new PairRequestBindingError(
+        `DSH Pair Session ${sessionId} changed live object identity`,
+      );
+    }
+    if (
+      observed.pendingSession !== undefined &&
+      observed.pendingSession !== session
+    ) {
+      throw new PairRequestBindingError(
+        `DSH Pair Session ${sessionId} provisional identity did not become live`,
+      );
+    }
+    if (observed.fault !== undefined) throw observed.fault;
+    observed.live = session;
+    observed.pendingSession = undefined;
+    const retained = observed.pending;
+    observed.pending = false;
+    if (retained) this.#requireBridge().markDirty(sessionId);
+  }
+
+  #removeObservedSession(sessionId: string): void {
+    const observed = this.#observedSessions.get(sessionId);
+    if (observed === undefined) return;
+    this.#observedSessions.delete(sessionId);
+    try {
+      this.#bridge?.unbindSession(sessionId);
+    } catch {
+      this.#observedSessions.set(sessionId, observed);
+    }
+  }
+
+  #forgetOwnedPairHandle(
+    pairHandle: PairAgentHandle,
+    owned: DshOwnedAgentHandle,
+  ): void {
+    const { sessionId } = pairHandle;
+    this.#removeObservedSession(sessionId);
+    this.#pairHandles.delete(pairHandle);
+    if (this.#handles.get(sessionId) !== owned) return;
+    this.#handles.delete(sessionId);
+    this.#prepared.delete(sessionId);
+    this.#bindings.delete(sessionId);
+    this.#deliveries.delete(sessionId);
+    this.#artifacts.delete(sessionId);
+    this.#orphans.delete(owned);
+    this.#disposedHandles.delete(owned);
+  }
+
+  #requireObservedSession(sessionId: string): DshObservedPairSession {
+    const observed = this.#observedSessions.get(sessionId);
+    if (observed === undefined) {
+      throw new PairRequestBindingError(`Unknown observed DSH Pair Session ${sessionId}`);
+    }
+    return observed;
+  }
+
+  #requireBridge(): SessionToPairBridge {
+    if (this.#bridge === undefined) {
+      throw new PairRequestBindingError(
+        'Pair Bridge must be attached before preparing Agents',
+      );
+    }
+    return this.#bridge;
+  }
+
   #assertToolCatalog(scope?: unknown): void {
     assertExactToolCatalog(
       this.context.tools.schemas(scope),
@@ -1628,8 +1938,10 @@ export class DshPairAgentAdapter implements AgentAdapter {
     handle: DshOwnedAgentHandle,
     reason: 'rollback' | 'release' | 'close',
   ): Promise<void> {
+    if (this.#disposedHandles.has(handle)) return;
     await this.options.lifecycleFaults?.beforeDispose?.(reason);
     await handle.dispose();
+    this.#disposedHandles.add(handle);
   }
 }
 
@@ -1847,7 +2159,7 @@ export async function launchDshPairWebRuntime(
               failures.push(error);
             }
           }
-          if (!contextClosed) {
+          if (adapterClosed && !contextClosed) {
             try {
               await disposeContext();
               contextClosed = true;

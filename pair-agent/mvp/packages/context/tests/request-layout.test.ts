@@ -27,6 +27,7 @@ function events(text = 'ship the feature'): readonly PairEvent[] {
       refs: {},
       payload: {
         schemaVersion: 1,
+        pairProtocol: 'pair-agent/p0.5',
         navigatorSessionId: 'pair:pair-01:navigator',
         pilotSessionId: 'pair:pair-01:pilot',
       },
@@ -53,6 +54,7 @@ function projection(): PairProjection {
     header: {
       pairId: parsePairId('pair-01'),
       schemaVersion: 1,
+      pairProtocol: 'pair-agent/p0.5',
       navigatorSessionId: 'pair:pair-01:navigator',
       pilotSessionId: 'pair:pair-01:pilot',
       ledgerHead: 3,

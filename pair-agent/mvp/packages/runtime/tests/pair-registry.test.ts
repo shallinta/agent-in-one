@@ -74,7 +74,11 @@ class FakeAdapter implements AgentAdapter {
   onPrepare?: (input: PreparePairAgentInput) => Promise<void>;
   onResume?: (input: PreparePairAgentInput) => Promise<void>;
   auditError?: Error;
+  catchUpError?: Error;
   onAudit?: () => Promise<void>;
+  onCatchUp?: () => Promise<void>;
+  healthError?: Error;
+  cleanupFailedPair?: AgentAdapter['cleanupFailedPair'];
   releaseFailuresRemaining = 0;
   closeFailuresRemaining = 0;
   attestedDshBuild: DshBuildRef = dshBuild;
@@ -131,6 +135,15 @@ class FakeAdapter implements AgentAdapter {
   async auditPairRequests(): Promise<void> {
     if (this.auditError !== undefined) throw this.auditError;
     await this.onAudit?.();
+  }
+
+  async catchUpPair(): Promise<void> {
+    if (this.catchUpError !== undefined) throw this.catchUpError;
+    await this.onCatchUp?.();
+  }
+
+  assertPairHealthy(): void {
+    if (this.healthError !== undefined) throw this.healthError;
   }
 
   async close(): Promise<void> {
@@ -261,6 +274,34 @@ describe('PairRegistry create lifecycle', () => {
     );
   });
 
+  test('does not publish ready when shared-conversation catch-up fails', async () => {
+    const store = new JsonlPairLedgerStore(await createRoot());
+    const adapter = new FakeAdapter();
+    const cleaned: AgentHandle[][] = [];
+    adapter.cleanupFailedPair = async ({ sessions }) => {
+      cleaned.push([...sessions]);
+    };
+    adapter.catchUpError = new Error('bridge catch-up failed');
+    const registry = new PairRegistry(store, adapter);
+
+    const result = await registry.createPair({
+      pairId: 'pair-catch-up-failed',
+      dshBuild,
+      expectedLedgerHead: 0,
+    });
+
+    expect(result).toMatchObject({ status: 'failed', reason: 'bridge catch-up failed' });
+    expect(cleaned).toEqual([[
+      { sessionId: 'pair:pair-catch-up-failed:navigator' },
+      { sessionId: 'pair:pair-catch-up-failed:pilot' },
+    ]]);
+    expect(adapter.released).toEqual([]);
+    expect((await store.read('pair-catch-up-failed')).map((event) => event.type)).toEqual([
+      'pair.created',
+      'pair.agent_failed',
+    ]);
+  });
+
   test('retains a create-cleanup failure for retry by registry close', async () => {
     const store = new JsonlPairLedgerStore(await createRoot());
     const adapter = new FakeAdapter();
@@ -278,6 +319,29 @@ describe('PairRegistry create lifecycle', () => {
     expect(adapter.released).toEqual([
       { sessionId: 'pair:pair-create-degraded:navigator' },
     ]);
+
+    await registry.runDerivedMutation(
+      'pair-create-degraded',
+      async ({ appendDerived }) =>
+        appendDerived({
+          type: 'user.message',
+          actor: { kind: 'user' },
+          source: 'navigator-session',
+          channel: 'navigator',
+          visibility: 'shared',
+          authority: 'user-derived',
+          refs: { sourceEventIds: ['dsh:failed-cleanup:1:user.message'] },
+          payload: {
+            schemaVersion: 1,
+            kind: 'user-input',
+            text: 'cleanup tail',
+            content: [{ type: 'text', text: 'cleanup tail' }],
+          },
+        }),
+    );
+    expect((await store.read('pair-create-degraded')).at(-1)?.type).toBe(
+      'user.message',
+    );
 
     await registry.close();
     expect(adapter.released).toEqual([
@@ -683,6 +747,77 @@ describe('PairRegistry recovery and subscriptions', () => {
     ]);
   });
 
+  test('replays projection after recovery catch-up advances the durable ledger', async () => {
+    const root = await createRoot();
+    const creatorStore = new JsonlPairLedgerStore(root);
+    const creator = new PairRegistry(creatorStore, new FakeAdapter());
+    await creator.createPair({
+      pairId: 'pair-recover-catch-up-head',
+      dshBuild,
+      expectedLedgerHead: 0,
+    });
+    await creator.close();
+
+    const recoveryStore = new JsonlPairLedgerStore(root);
+    const adapter = new FakeAdapter();
+    adapter.onCatchUp = async () => {
+      const head = (await recoveryStore.heads('pair-recover-catch-up-head'))
+        .ledgerHead;
+      await recoveryStore.append(
+        'pair-recover-catch-up-head',
+        {
+          type: 'user.message',
+          actor: { kind: 'user' },
+          source: 'navigator-session',
+          channel: 'navigator',
+          visibility: 'shared',
+          authority: 'user-derived',
+          refs: { sourceEventIds: ['dsh:recover:1:user.message'] },
+          payload: {
+            schemaVersion: 1,
+            kind: 'user-input',
+            text: 'recovered durable input',
+            content: [{ type: 'text', text: 'recovered durable input' }],
+          },
+        },
+        head,
+      );
+    };
+    const registry = new PairRegistry(recoveryStore, adapter);
+
+    const recovered = await registry.recoverPair('pair-recover-catch-up-head');
+    const durableHead = (await recoveryStore.heads('pair-recover-catch-up-head'))
+      .ledgerHead;
+
+    expect(durableHead).toBe(3);
+    expect(recovered.projection.header.ledgerHead).toBe(durableHead);
+    await expect(
+      registry.getReadyPair('pair-recover-catch-up-head'),
+    ).resolves.toMatchObject({
+      projection: { header: { ledgerHead: durableHead } },
+    });
+    await registry.close();
+  });
+
+  test('cached ready lookup fails closed after adapter health becomes faulty', async () => {
+    const adapter = new FakeAdapter();
+    const registry = new PairRegistry(
+      new JsonlPairLedgerStore(await createRoot()),
+      adapter,
+    );
+    await registry.createPair({
+      pairId: 'pair-cached-health',
+      dshBuild,
+      expectedLedgerHead: 0,
+    });
+    adapter.healthError = new Error('bridge async fault');
+
+    await expect(registry.getReadyPair('pair-cached-health')).rejects.toThrow(
+      /bridge async fault/,
+    );
+    await registry.close();
+  });
+
   test('rejects recovery from a different attested DSH fork before resuming either session', async () => {
     const root = await createRoot();
     const store = new JsonlPairLedgerStore(root);
@@ -851,6 +986,7 @@ describe('PairRegistry recovery and subscriptions', () => {
         refs: {},
         payload: {
           schemaVersion: 1,
+          pairProtocol: 'pair-agent/p0.5',
           ...createPairSessionIds('partial'),
           dshBuild: { ...dshBuild },
           dshRuntimeArtifacts: { ...runtimeArtifacts },
@@ -985,6 +1121,27 @@ describe('PairRegistry recovery and subscriptions', () => {
       { sessionId: 'pair:pair-close:pilot' },
     ]);
     expect(adapter.closeCalls).toBe(1);
+  });
+
+  test('delegates handle shutdown exclusively to an owning adapter and preserves retry', async () => {
+    const adapter = new FakeAdapter() as FakeAdapter & { closeOwnsHandles: true };
+    Object.defineProperty(adapter, 'closeOwnsHandles', { value: true });
+    adapter.closeFailuresRemaining = 1;
+    const registry = new PairRegistry(
+      new JsonlPairLedgerStore(await createRoot()),
+      adapter,
+    );
+    await registry.createPair({
+      pairId: 'pair-owning-close',
+      dshBuild,
+      expectedLedgerHead: 0,
+    });
+
+    await expect(registry.close()).rejects.toThrow(/adapter close failed/);
+    expect(adapter.released).toEqual([]);
+    await expect(registry.close()).resolves.toBeUndefined();
+    expect(adapter.released).toEqual([]);
+    expect(adapter.closeCalls).toBe(2);
   });
 
   test('writes actual JSONL records to the configured temp root', async () => {

@@ -1,5 +1,6 @@
 import {
   createPairSessionIds,
+  PAIR_PROTOCOL_VERSION,
   isPairTaskState,
   parsePairId,
   type DshBuildRef,
@@ -210,6 +211,10 @@ function initialize(event: PairEvent): PairProjection {
   const expectedIds = createPairSessionIds(pairId);
   invariant(payload.schemaVersion === 1, 'pair.created schemaVersion must be 1');
   invariant(
+    payload.pairProtocol === PAIR_PROTOCOL_VERSION,
+    `pair.created pairProtocol must be ${PAIR_PROTOCOL_VERSION}; use a fresh Pair ID or PAIR_DATA_ROOT`,
+  );
+  invariant(
     payload.navigatorSessionId === expectedIds.navigatorSessionId,
     'pair.created navigatorSessionId does not match PairId',
   );
@@ -232,6 +237,7 @@ function initialize(event: PairEvent): PairProjection {
     header: {
       pairId,
       schemaVersion: 1,
+      pairProtocol: PAIR_PROTOCOL_VERSION,
       navigatorSessionId: expectedIds.navigatorSessionId,
       pilotSessionId: expectedIds.pilotSessionId,
       ...(dshBuild === undefined ? {} : { dshBuild }),

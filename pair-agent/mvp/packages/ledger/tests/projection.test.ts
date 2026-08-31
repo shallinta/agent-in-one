@@ -46,6 +46,7 @@ function created(seq = 1): PairEvent {
   return event(seq, 'pair.created', {
     ...createPairSessionIds(pairId),
     schemaVersion: 1,
+    pairProtocol: 'pair-agent/p0.5',
   });
 }
 
@@ -58,6 +59,7 @@ describe('pair projection lifecycle', () => {
       navigatorSessionId: 'pair:pair-01:navigator',
       pilotSessionId: 'pair:pair-01:pilot',
       schemaVersion: 1,
+      pairProtocol: 'pair-agent/p0.5',
       ledgerHead: 1,
       sharedHead: 1,
     });
@@ -71,6 +73,17 @@ describe('pair projection lifecycle', () => {
     );
     expect(() => replayPairProjection([created(), created(2)])).toThrow(
       ProjectionInvariantError,
+    );
+  });
+
+  test('rejects a pre-P0.5 Pair with an actionable fresh-data boundary', () => {
+    const obsolete = event(1, 'pair.created', {
+      ...createPairSessionIds(pairId),
+      schemaVersion: 1,
+    });
+
+    expect(() => foldPairEvent(undefined, obsolete)).toThrow(
+      /fresh Pair ID or PAIR_DATA_ROOT/,
     );
   });
 
@@ -97,6 +110,7 @@ describe('pair projection lifecycle', () => {
     const valid = event(1, 'pair.created', {
       ...createPairSessionIds(pairId),
       schemaVersion: 1,
+      pairProtocol: 'pair-agent/p0.5',
       dshBuild: validBuild,
     });
     expect(foldPairEvent(undefined, valid).header.dshBuild).toEqual(validBuild);
@@ -112,6 +126,7 @@ describe('pair projection lifecycle', () => {
       const invalid = event(1, 'pair.created', {
         ...createPairSessionIds(pairId),
         schemaVersion: 1,
+        pairProtocol: 'pair-agent/p0.5',
         dshBuild,
       });
       expect(() => foldPairEvent(undefined, invalid)).toThrow(

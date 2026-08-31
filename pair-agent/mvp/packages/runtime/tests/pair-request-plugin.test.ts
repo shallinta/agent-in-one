@@ -133,7 +133,11 @@ describe('PairRequestPlugin request-layout ownership', () => {
           visibility: 'shared',
           authority: 'host',
           refs: {},
-          payload: { schemaVersion: 1, ...ids },
+          payload: {
+            schemaVersion: 1,
+            pairProtocol: 'pair-agent/p0.5',
+            ...ids,
+          },
         },
         0,
       );

@@ -84,6 +84,7 @@ async function createRuntime(
     commonSystem?: { readonly version: string; readonly content: string };
     lifecycleFaults?: {
       afterAgentOpened?(): void;
+      beforeBridgeRead?(sessionId: string, fromSeq: number): void;
       beforeDispose?(reason: 'rollback' | 'release' | 'close'): void;
     };
   } = {},
@@ -433,6 +434,77 @@ describe('DshPairAgentAdapter real-runtime contract', () => {
     expect(runtime.adapter.ownedHandleCount()).toBe(0);
   }, 30_000);
 
+  test('keeps failed-Pair cleanup bindings until adapter close retries disposal and drain', async () => {
+    const pairId = 'pair-dsh-failed-cleanup-retry';
+    const pairRoot = await temporaryRoot('failed-cleanup-ledger');
+    const sessionRoot = await temporaryRoot('failed-cleanup-sessions');
+    let failOneRelease = true;
+    const runtime = await createRuntime(pairId, pairRoot, sessionRoot, {
+      lifecycleFaults: {
+        beforeDispose(reason) {
+          if (reason === 'release' && failOneRelease) {
+            failOneRelease = false;
+            throw new Error('fault during failed-Pair cleanup');
+          }
+        },
+      },
+    });
+    const ready = await runtime.coordinator.createPair({
+      pairId,
+      dshBuild,
+      expectedLedgerHead: 0,
+    });
+    if (ready.status !== 'ready') throw new Error(ready.reason);
+
+    await expect(
+      runtime.adapter.cleanupFailedPair({
+        pairId: pairId as never,
+        sessions: [ready.handles.navigator, ready.handles.pilot],
+      }),
+    ).rejects.toThrow(/dispose and drain failed Pair/i);
+    expect(runtime.adapter.ownedHandleCount()).toBe(2);
+
+    await runtime.adapter.close();
+    expect(runtime.adapter.ownedHandleCount()).toBe(0);
+    await runtime.coordinator.close();
+  }, 30_000);
+
+  test('retries a failed post-dispose scan while the Registry Pair is failed but still owned', async () => {
+    const pairId = 'pair-dsh-failed-scan-retry';
+    const pairRoot = await temporaryRoot('failed-scan-ledger');
+    const sessionRoot = await temporaryRoot('failed-scan-sessions');
+    let failInitialCatchUp = true;
+    let failPostDisposeRead = false;
+    const runtime = await createRuntime(pairId, pairRoot, sessionRoot, {
+      lifecycleFaults: {
+        beforeBridgeRead() {
+          if (failInitialCatchUp) {
+            failInitialCatchUp = false;
+            throw new Error('fault during initial catch-up read');
+          }
+          if (failPostDisposeRead) {
+            failPostDisposeRead = false;
+            throw new Error('fault during post-dispose read');
+          }
+        },
+        beforeDispose(reason) {
+          if (reason === 'release') failPostDisposeRead = true;
+        },
+      },
+    });
+
+    await expect(
+      runtime.coordinator.createPair({ pairId, dshBuild, expectedLedgerHead: 0 }),
+    ).resolves.toMatchObject({
+      status: 'failed',
+      reason: expect.stringContaining('fault during initial catch-up read'),
+    });
+    expect(runtime.adapter.ownedHandleCount()).toBe(2);
+
+    await expect(runtime.coordinator.close()).resolves.toBeUndefined();
+    expect(runtime.adapter.ownedHandleCount()).toBe(0);
+  }, 30_000);
+
   test('keeps adapter ownership when close disposal fails and allows a successful close retry', async () => {
     const pairId = 'pair-dsh-close-retry';
     const pairRoot = await temporaryRoot('close-ledger');
@@ -668,6 +740,7 @@ describe('DshPairAgentAdapter real-runtime contract', () => {
         expect.objectContaining({ type: 'text', text: expect.stringContaining('<pair-session-events') }),
       ]),
     );
+    expect(JSON.stringify(pilotRequest?.messages[0])).toContain('Navigator accepted.');
     expect(JSON.stringify(navigatorRequest?.messages[2])).toContain(
       '<active-role>navigator</active-role>',
     );
@@ -690,6 +763,14 @@ describe('DshPairAgentAdapter real-runtime contract', () => {
     expect(JSON.stringify(pilotRequest)).not.toContain('previous_response_id');
 
     const pairEvents = await runtime.store.read(pairId);
+    expect(
+      pairEvents
+        .filter((event) => event.type === 'agent.message')
+        .map((event) => (event.payload as { text: string }).text),
+    ).toEqual(['Navigator accepted.', 'Pilot accepted.']);
+    expect(
+      pairEvents.filter((event) => event.type === 'session_event.linked'),
+    ).toHaveLength(4);
     const snapshots = pairEvents.filter((event) => event.type === 'pair.request_built');
     expect(snapshots).toHaveLength(2);
     expect(snapshots.every((event) => event.visibility === 'infrastructure')).toBe(true);
