@@ -10,7 +10,7 @@
 >
 > **实现语言：**TypeScript，运行于 Node.js；首个模型协议使用 OpenAI Chat Completions 兼容接口。
 >
-> **版本：**Exploration Draft 0.3，2026-08-25
+> **版本：**Exploration Draft 0.5，2026-08-31
 
 ---
 
@@ -551,7 +551,7 @@ Pair Ledger 对 `dsh-source-id` 建立唯一约束。进程在“DSH 已提交�
 
 Bridge 通过 `session_event.linked(visibility=infrastructure)` 持久化 `SessionEventPairLink`，标记 Pair Event 是完整表达、摘要还是 ArtifactRef。它不是进程内 side table。`agent.message` 进入 Pair Ledger 后，另一 Agent 在下一次 Pair Context Builder 构造时自然可见；本 Agent 的 Local History Projector 也据此判断是否能安全排除重复消息。只有消息同时产生 `attention.requested` 或影响当前 Task 时才主动唤醒另一方，避免两个 Agent 对同一普通输出重复响应。
 
-Request Builder 在投影前执行 link barrier：扫描目标 Session 到本次 `localSurfaceThroughSeq` 的尚未映射事件，幂等补写能够确定的 `session_event.linked` 并 flush Pair Ledger。当前 delivery 的 `user/message` 不等待异步 Bridge 猜测，而是用已经持久化的 `delivery.pairEventId + dshMessageId` 直接生成 full link。无法在调用前证明已经完整映射的其他消息保留在 Local Request Tail，宁可暂时重复，也不能错误删除。
+Request Builder 在投影前执行 link barrier：只扫描当前正在构造请求的 Agent Session 到本次 `localSurfaceThroughSeq` 的尚未映射事件，不读取 peer Session；它幂等补写能够确定的 `session_event.linked` 并 flush Pair Ledger。当前 Pair delivery 的 `user/message` 不等待异步 Bridge 猜测：Host-bound `delivery.pairEventId + deliveryId + dshMessageId` 与 durable Pair Event 完全匹配时，可以生成只用于本次请求的 full provenance link；原生 composer 当前输入如果已有由 Bridge 生成且 source/origin/payload 完全等价的 durable Pair Event，也可使用同样严格的 request-local link。Current Trigger 只携带引用，不复制 Shared Event 正文。Bridge 后续仍补写持久 link；无法证明已经完整映射的其他消息保留在 Local Request Tail，宁可暂时重复，也不能错误删除。
 
 ## 6. 最小数据结构
 
@@ -1099,9 +1099,11 @@ async function prepareNewRequest(input: PairRequestBuildInput): Promise<{
   request: PairModelRequest;
   snapshot: PairRequestSnapshot;
 }> {
-  // The current claimed input must have a durable, full Session-to-Pair link
-  // before the projector is allowed to remove its local duplicate.
-  await ensureDeliveryLinkBarrier(input.deliveryId, input.dshSessionId);
+  // Historical exclusions require durable links. The current input may use a
+  // request-local proof only when Host-bound delivery provenance, or an exact
+  // durable Pair Event <-> DSH source/payload match, proves full equivalence.
+  // The Bridge still persists the link after flush for later requests.
+  const currentInputLink = await resolveCurrentInputLink(input);
 
   const pair = await pairLedger.replayLatest(pairIdOf(input.dshSessionId));
   const sourceLedgerHead = pair.heads.ledgerHead;
@@ -1109,7 +1111,10 @@ async function prepareNewRequest(input: PairRequestBuildInput): Promise<{
   const local = localHistoryProjector.project({
     sessionEvents: input.localLog,
     boundaryMessages: input.boundaryMessages,
-    links: pair.sessionEventPairLinks,
+    links: [
+      ...pair.sessionEventPairLinks,
+      ...(currentInputLink === undefined ? [] : [currentInputLink]),
+    ],
   });
 
   const request = pairRequestBuilder.build({
@@ -1195,7 +1200,7 @@ Provider 返回的 response ID 可以作为诊断 metadata 保存，但不得作
 7. append + flush delivery.durable
 8. observe matching user/message 被某个 Turn 领取
 9. 再次 await ctx.sessions.flush(targetAgent.session)，然后 append + flush delivery.claimed
-10. 在 buildRequest seam 内确认当前 delivery 对应的 session_event.linked 已 append + flush
+10. 在 buildRequest seam 内优先确认当前 input 的 `session_event.linked` 已 append + flush；若当前 Pair delivery 或原生 composer 提升正处于 message/link 短暂窗口，只允许使用经过完全等价校验的 request-local provenance link
 11. 读取最新 ledgerHead/sharedHead 和当前 Session surface，构造 PairModelRequest
 12. 生成绑定 dshSessionId/turn/step/attempt 的 PairRequestSnapshot
 13. 以 sourceLedgerHead 为 expectedLedgerHead，CAS append + flush pair.request_built
@@ -1206,7 +1211,7 @@ Provider 返回的 response ID 可以作为诊断 metadata 保存，但不得作
 
 Agent API 的同步接收只表示 live inbox admission；只有第 6 步成功后才能称为 durable。DSH `session/event` 同样是 live append 通知，第 9、10 和第 16 步必须分别完成要求的 flush 后才能推进 Pair 状态。任何 flush 失败都保持原 Pair delivery 状态并进入恢复对账，不能让 Pair Ledger 领先于 DSH durable prefix。第 13 步只记录“准备调用”的确定性 Request Snapshot；没有匹配的 DSH assistant/turn 事件时，不得宣称 Provider 已接收或完成。
 
-第 10 步是 Local History 去重的安全屏障：只有当前输入与 Pair Event 的 `representation: "full"` 映射已经持久化，Projector 才能删除本地副本；无法证明时保留 Local Request Tail 中的消息。第 13 步 CAS 失败意味着并发写入改变了请求事实边界，必须丢弃尚未发送的请求并从第 10 步重新准备。request-error retry 也会递增 `attempt`，生成新的 `requestId` 和 Snapshot；基础设施事件只推进 `ledgerHead`，不推进 `sharedHead`。
+第 10 步是 Local History 去重的安全屏障：历史消息只有 `representation: "full"` 的持久映射才能删除本地副本。当前输入是唯一例外：Pair delivery 的 Host-bound `pairEventId + deliveryId`，或原生 composer 提升后 Pair Event 与 DSH source/origin/payload 的完全等价匹配，可以生成仅供本次请求使用的 request-local link；任何不等价都 fail closed。该 link 只排除 Shared Events 与 Local History 的重复，Current Trigger 继续存在但只携带 `kind`、Pair/delivery identity 和 causal metadata 等引用，不复制 Shared Event 中已有的用户文本、Task 或 Peer Message 内容。Bridge 在 durable drain 后仍必须补写持久 link。无法证明时保留 Local Request Tail 中的消息。第 13 步 CAS 失败意味着并发写入改变了请求事实边界，必须丢弃尚未发送的请求并从第 10 步重新准备。request-error retry 也会递增 `attempt`，生成新的 `requestId` 和 Snapshot；基础设施事件只推进 `ledgerHead`，不推进 `sharedHead`。
 
 `delivery.completed` 必须绑定领取该 delivery 的具体 DSH Turn，而不是笼统地绑定 `agent.whenIdle()`：同一 Agent 可能在一个活动结束前接受替代工作，idle 也不代表某条输入已经完成。
 
@@ -1426,7 +1431,20 @@ MVP 至少通过以下端到端场景：
 - 两个 Channel 的基本输入与事件展示；
 - Navigator 创建 Task 并唤醒 Pilot。
 
-### 14.2 P1：权限和并发
+### 14.2 P0.5：共享对话与 Agent 通信
+
+- Pair-level Navigator/Pilot 输入入口，用户原话先进入 Pair Ledger 再投递目标 Agent；
+- Host-owned Session-to-Pair Bridge 观察两条 DSH Session 的 live committed 事件，只有 flush 后从 persistence 读回的 durable prefix 才能派生 Pair Events；
+- 用户消息与最终公开 `assistant/message` 幂等提升为 `user.message` / `agent.message`；
+- 持久 `session_event.linked` 支持 Local History 安全去重和恢复补写；
+- 普通共享消息不唤醒另一 Agent，另一 Agent 在下一 Turn 自然读取最新 Shared Head；
+- `pair_message_peer` 以 Host 绑定的发送者/接收者产生双向 Peer Delivery，并唤醒接收方；
+- Pair Session Events Semantic/All API 与 UI；
+- 短会话恢复全量扫描、稳定来源 ID 去重和正常关闭 final drain。
+
+P0.5 的详细设计见 [`mvp/p0.5-shared-conversation-design.md`](./mvp/p0.5-shared-conversation-design.md)。持久 unread cursor、Shared Checkpoint、长会话增量恢复和完整 delivery crash-window 对账不阻塞本阶段。
+
+### 14.3 P1：权限和并发
 
 - Goal/Task/Execution Plan 控制工具；
 - Pair Tool Guard 与 Revision fencing；
@@ -1434,11 +1452,12 @@ MVP 至少通过以下端到端场景：
 - Pilot 局部纠偏与 Goal-impact escalation；
 - Pause/Resume/Cancel。
 
-### 14.3 P2：恢复和执行生态
+### 14.4 P2：恢复和执行生态
 
 - Pair Delivery 对账；
 - Pair + 两条 DSH Session 重启恢复；
 - Pair Request Snapshot 与无 Provider 状态的 continuation 重建；
+- 持久 per-Agent unread cursor 与长会话增量恢复优化；
 - Plan Mode、workflow、continuable Sub-agent；
 - ArtifactRef 与重要证据回写；
 - 故障注入和端到端验收场景。
