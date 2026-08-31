@@ -1,15 +1,21 @@
 import { describe, expect, test } from 'vitest';
 
 import {
+  MAX_PAIR_MESSAGE_BYTES,
+  MAX_PEER_HOPS,
   type AssignPairTaskRequest,
   type CreatePairRequest,
   InvalidPairIdError,
   PAIR_EVENT_TYPES,
+  type PairEvent,
   type SendPairMessageRequest,
+  assertP05PairEventPayload,
   canonicalJsonStringify,
   createPairSessionIds,
+  isPeerAgentMessage,
   isPairEventType,
   parsePairId,
+  parseSessionEventsQuery,
 } from '../src/index.js';
 
 describe('Pair Host request DTOs', () => {
@@ -191,5 +197,217 @@ describe('PairEventType runtime contract', () => {
     expect(PAIR_EVENT_TYPES.every(isPairEventType)).toBe(true);
     expect(isPairEventType('unknown.event')).toBe(false);
     expect(isPairEventType('')).toBe(false);
+  });
+});
+
+describe('P0.5 Session Events query contract', () => {
+  test('parses explicit physical cursor pagination values', () => {
+    expect(
+      parseSessionEventsQuery({
+        afterSeq: '4',
+        limit: '2',
+        view: 'semantic',
+      }),
+    ).toEqual({ afterSeq: 4, limit: 2, view: 'semantic' });
+  });
+
+  test('supplies bounded semantic defaults', () => {
+    expect(parseSessionEventsQuery({})).toEqual({
+      afterSeq: 0,
+      limit: 100,
+      view: 'semantic',
+    });
+  });
+
+  test.each([
+    [{ afterSeq: '-1' }, /afterSeq/],
+    [{ afterSeq: '1.5' }, /afterSeq/],
+    [{ afterSeq: String(Number.MAX_SAFE_INTEGER + 1) }, /afterSeq/],
+    [{ limit: '0' }, /limit/],
+    [{ limit: '501' }, /limit/],
+    [{ limit: '2.5' }, /limit/],
+    [{ view: 'private' }, /view/],
+    [{ unexpected: 'value' }, /unexpected/],
+  ])('rejects invalid query %#', (query, expected) => {
+    expect(() => parseSessionEventsQuery(query)).toThrow(expected);
+  });
+});
+
+describe('P0.5 message payload contract', () => {
+  const origin = {
+    schemaVersion: 1,
+    sessionId: 'pair:pair-01:navigator',
+    sessionEventSeq: 42,
+    turn: 3,
+    messageId: 'message-01',
+  } as const;
+
+  test('accepts a versioned user input payload at the UTF-8 byte limit', () => {
+    const payload = {
+      schemaVersion: 1,
+      kind: 'user-input',
+      text: 'a'.repeat(MAX_PAIR_MESSAGE_BYTES),
+      content: [{ type: 'text', text: 'hello' }],
+      origin,
+    };
+
+    expect(assertP05PairEventPayload('user.message', payload)).toBe(payload);
+  });
+
+  test('accepts a complete versioned turn output', () => {
+    const payload = {
+      schemaVersion: 1,
+      kind: 'turn-output',
+      text: 'done',
+      content: [{ type: 'text', text: 'done' }],
+      completion: 'complete',
+      origin,
+    };
+
+    expect(assertP05PairEventPayload('agent.message', payload)).toBe(payload);
+  });
+
+  test('accepts a bounded peer message', () => {
+    const payload = {
+      schemaVersion: 1,
+      kind: 'peer-message',
+      text: 'please inspect the failing test',
+      content: [{ type: 'text', text: 'please inspect the failing test' }],
+      causalRootId: 'pair-event-10',
+      hop: MAX_PEER_HOPS,
+    };
+
+    expect(assertP05PairEventPayload('agent.message', payload)).toBe(payload);
+  });
+
+  test.each([
+    [
+      'empty peer text',
+      {
+        schemaVersion: 1,
+        kind: 'peer-message',
+        text: '   ',
+        content: [],
+        causalRootId: 'root-1',
+        hop: 1,
+      },
+      /text/,
+    ],
+    [
+      'text over 64 KiB',
+      {
+        schemaVersion: 1,
+        kind: 'peer-message',
+        text: 'a'.repeat(MAX_PAIR_MESSAGE_BYTES + 1),
+        content: [],
+        causalRootId: 'root-1',
+        hop: 1,
+      },
+      /64 KiB|text/,
+    ],
+    [
+      'peer hop over the fixed limit',
+      {
+        schemaVersion: 1,
+        kind: 'peer-message',
+        text: 'continue',
+        content: [],
+        causalRootId: 'root-1',
+        hop: MAX_PEER_HOPS + 1,
+      },
+      /hop/,
+    ],
+    [
+      'unknown payload field',
+      {
+        schemaVersion: 1,
+        kind: 'turn-output',
+        text: 'done',
+        content: [],
+        completion: 'complete',
+        unexpected: true,
+      },
+      /unexpected/,
+    ],
+  ])('rejects %s', (_label, payload, expected) => {
+    expect(() => assertP05PairEventPayload('agent.message', payload)).toThrow(
+      expected,
+    );
+  });
+
+  test('rejects a message discriminant that does not match its event type', () => {
+    expect(() =>
+      assertP05PairEventPayload('user.message', {
+        schemaVersion: 1,
+        kind: 'turn-output',
+        text: 'wrong actor',
+        content: [],
+        completion: 'complete',
+      }),
+    ).toThrow(/kind/);
+  });
+
+  test('validates exact versioned Session link payloads', () => {
+    const payload = {
+      schemaVersion: 1,
+      sessionId: origin.sessionId,
+      fromSessionSeq: 40,
+      throughSessionSeq: 42,
+      messageIds: [origin.messageId],
+      pairEventId: 'pair-event-42',
+      representation: 'full',
+    };
+
+    expect(assertP05PairEventPayload('session_event.linked', payload)).toBe(
+      payload,
+    );
+    expect(() =>
+      assertP05PairEventPayload('session_event.linked', {
+        ...payload,
+        throughSessionSeq: 39,
+      }),
+    ).toThrow(/throughSessionSeq/);
+    expect(() =>
+      assertP05PairEventPayload('session_event.linked', {
+        ...payload,
+        extra: true,
+      }),
+    ).toThrow(/extra/);
+  });
+});
+
+describe('peer Agent message classification', () => {
+  const peerEvent: PairEvent = {
+    pairId: parsePairId('pair-01'),
+    seq: 8,
+    type: 'agent.message',
+    actor: { kind: 'agent', role: 'navigator' },
+    source: 'navigator-session',
+    channel: 'pilot',
+    visibility: 'shared',
+    authority: 'navigator',
+    refs: {},
+    payload: {
+      schemaVersion: 1,
+      kind: 'peer-message',
+      text: 'please continue',
+      content: [{ type: 'text', text: 'please continue' }],
+      causalRootId: 'pair-event-7',
+      hop: 1,
+    },
+    occurredAt: '2026-08-31T00:00:00.000Z',
+  };
+
+  test('requires a cross-role channel and peer-message payload', () => {
+    expect(isPeerAgentMessage(peerEvent)).toBe(true);
+    expect(
+      isPeerAgentMessage({ ...peerEvent, channel: 'navigator' }),
+    ).toBe(false);
+    expect(
+      isPeerAgentMessage({
+        ...peerEvent,
+        payload: { ...peerEvent.payload, kind: 'turn-output' },
+      }),
+    ).toBe(false);
   });
 });

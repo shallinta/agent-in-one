@@ -407,3 +407,5 @@ export function assertJsonObject(value: unknown): asserts value is JsonObject {
 export function canonicalJsonStringify(value: unknown): string {
   return JSON.stringify(canonicalize(value, new Set(), '$'));
 }
+
+export * from './pair-events.js';
