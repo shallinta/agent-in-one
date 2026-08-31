@@ -1,6 +1,7 @@
 import { realpath } from 'node:fs/promises';
 
 import {
+  assertP05PairEventPayload,
   assertJsonObject,
   canonicalJsonStringify,
   createPairSessionIds,
@@ -106,6 +107,17 @@ export interface PairMutationContext {
   projection: PairProjection;
   ready: ReadyPair;
   append(draft: PairEventDraft): Promise<PairEvent>;
+}
+
+export interface PairDerivedMutationContext {
+  pairId: PairId;
+  events: readonly PairEvent[];
+  appendDerived(draft: PairEventDraft): Promise<PairEvent>;
+}
+
+export interface PairRegistrySnapshot {
+  projection: PairProjection;
+  events: readonly PairEvent[];
 }
 
 export class DuplicatePairError extends Error {
@@ -380,7 +392,7 @@ export class PairRegistry {
     }
 
     const sessionIds = createPairSessionIds(pairId);
-    const created = await this.store.append(
+    await this.store.append(
       pairId,
       {
         type: 'pair.created',
@@ -457,7 +469,7 @@ export class PairRegistry {
       );
       if (!released) retainOwnership = true;
       if (this.#closed) throw new RegistryClosedError();
-      await this.store.append(
+      const { projection } = await this.#appendLifecycleEvent(
         pairId,
         {
           type: 'pair.agent_failed',
@@ -474,9 +486,7 @@ export class PairRegistry {
             reason: failure.reason,
           },
         },
-        created.seq,
       );
-      const projection = await this.publish(pairId);
       if (this.#closed) throw new RegistryClosedError();
       const failed: FailedPair = { status: 'failed', projection, ...failure };
       this.#states.set(pairId, failed);
@@ -500,8 +510,9 @@ export class PairRegistry {
       if (!released) retainOwnership = true;
       throw new RegistryClosedError();
     }
+    let projection: PairProjection;
     try {
-      await this.store.append(
+      ({ projection } = await this.#appendLifecycleEvent(
         pairId,
         {
           type: 'pair.agent_ready',
@@ -513,8 +524,7 @@ export class PairRegistry {
           refs: {},
           payload: { panes: durablePanes },
         },
-        created.seq,
-      );
+      ));
     } catch (error) {
       const released = await this.#releasePairHandles(
         pairId,
@@ -523,7 +533,6 @@ export class PairRegistry {
       if (!released) retainOwnership = true;
       throw error;
     }
-    const projection = await this.publish(pairId);
     if (this.#closed) {
       const released = await this.#releasePairHandles(
         pairId,
@@ -729,10 +738,14 @@ export class PairRegistry {
   ): Promise<TResult> {
     this.#assertOpen();
     const pairId = parsePairId(pairIdInput);
+    await this.getReadyPair(pairId);
     const storageIdentity = await this.#getStorageIdentity();
     return serializePairMutation(`${storageIdentity}\0${pairId}`, async () => {
       this.#assertOpen();
-      const ready = await this.getReadyPair(pairId);
+      const ready = this.#states.get(pairId);
+      if (ready?.status !== 'ready') {
+        throw new PairNotReadyError(pairId);
+      }
       const events = await this.store.replay(pairId);
       if (events.length === 0) throw new PairNotFoundError(pairId);
       let projection = replayPairProjection(events);
@@ -761,6 +774,128 @@ export class PairRegistry {
           return event;
         },
       });
+    });
+  }
+
+  async runDerivedMutation<TResult>(
+    pairIdInput: string,
+    operation: (context: PairDerivedMutationContext) => Promise<TResult>,
+  ): Promise<TResult> {
+    this.#assertOpen();
+    const pairId = parsePairId(pairIdInput);
+    const storageIdentity = await this.#getStorageIdentity();
+    return serializePairMutation(`${storageIdentity}\0${pairId}`, async () => {
+      this.#assertOpen();
+      const state = this.#states.get(pairId);
+      if (state?.status === 'failed') {
+        throw new PairNotReadyError(pairId, state.reason);
+      }
+      if (state?.status !== 'ready' && !this.#ownedLeaseKeys.has(pairId)) {
+        throw new PairNotReadyError(pairId, 'Registry does not own this Pair');
+      }
+
+      for (;;) {
+        const events = await this.store.replay(pairId);
+        if (events.length === 0) throw new PairNotFoundError(pairId);
+        if (events[0]?.type !== 'pair.created') {
+          throw new PairNotReadyError(pairId, 'canonical pair.created is missing');
+        }
+        let projection = replayPairProjection(events);
+        try {
+          const result = await operation({
+            pairId,
+            events: structuredClone(events),
+            appendDerived: async (draft) => {
+              if (
+                draft.type !== 'user.message' &&
+                draft.type !== 'agent.message' &&
+                draft.type !== 'session_event.linked'
+              ) {
+                throw new TypeError(
+                  `Derived mutation cannot append ${draft.type}`,
+                );
+              }
+              assertP05PairEventPayload(draft.type, draft.payload);
+              const event = await this.store.append(
+                pairId,
+                draft,
+                projection.header.ledgerHead,
+              );
+              projection = foldPairEvent(projection, event);
+              return event;
+            },
+          });
+          this.publishProjection(projection);
+          return result;
+        } catch (error) {
+          this.publishProjection(projection);
+          if (error instanceof LedgerConflictError) continue;
+          throw error;
+        }
+      }
+    });
+  }
+
+  async #appendLifecycleEvent(
+    pairId: PairId,
+    draft: PairEventDraft,
+  ): Promise<{ event: PairEvent; projection: PairProjection }> {
+    const storageIdentity = await this.#getStorageIdentity();
+    return serializePairMutation(`${storageIdentity}\0${pairId}`, async () => {
+      this.#assertOpen();
+      if (!this.#ownedLeaseKeys.has(pairId)) {
+        throw new PairNotReadyError(pairId, 'Registry does not own this Pair');
+      }
+      for (;;) {
+        const events = await this.store.replay(pairId);
+        if (events.length === 0) throw new PairNotFoundError(pairId);
+        let projection = replayPairProjection(events);
+        try {
+          const event = await this.store.append(
+            pairId,
+            draft,
+            projection.header.ledgerHead,
+          );
+          projection = foldPairEvent(projection, event);
+          this.publishProjection(projection);
+          return { event, projection };
+        } catch (error) {
+          if (error instanceof LedgerConflictError) continue;
+          throw error;
+        }
+      }
+    });
+  }
+
+  async readEvents(pairIdInput: string): Promise<readonly PairEvent[]> {
+    return this.readSnapshot(pairIdInput, ({ events }) => events);
+  }
+
+  async readSnapshot<TResult>(
+    pairIdInput: string,
+    select: (snapshot: PairRegistrySnapshot) => TResult,
+  ): Promise<TResult> {
+    this.#assertOpen();
+    const pairId = parsePairId(pairIdInput);
+    const storageIdentity = await this.#getStorageIdentity();
+    return serializePairMutation(`${storageIdentity}\0${pairId}`, async () => {
+      this.#assertOpen();
+      const events = await this.store.replay(pairId);
+      if (events.length === 0) throw new PairNotFoundError(pairId);
+      const snapshot = {
+        projection: replayPairProjection(events),
+        events: structuredClone(events),
+      } satisfies PairRegistrySnapshot;
+      const selected = select(snapshot);
+      if (
+        (typeof selected === 'object' || typeof selected === 'function') &&
+        selected !== null &&
+        'then' in selected &&
+        typeof (selected as { then?: unknown }).then === 'function'
+      ) {
+        throw new TypeError('Pair snapshot selector must be synchronous');
+      }
+      return selected;
     });
   }
 

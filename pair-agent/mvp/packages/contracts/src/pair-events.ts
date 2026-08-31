@@ -374,6 +374,10 @@ export function assertP05PairEventPayload(
   payload: unknown,
 ): SessionEventLinkedPayload & JsonObject;
 export function assertP05PairEventPayload(
+  type: 'user.message' | 'agent.message' | 'session_event.linked',
+  payload: unknown,
+): (PairMessagePayload | SessionEventLinkedPayload) & JsonObject;
+export function assertP05PairEventPayload(
   type: PairEventType,
   payload: unknown,
 ): (PairMessagePayload | SessionEventLinkedPayload) & JsonObject {

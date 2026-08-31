@@ -502,6 +502,72 @@ describe('JsonlPairLedgerStore replay', () => {
     });
   });
 
+  test('lists matching events with a physical Pair sequence cursor', async () => {
+    const store = new JsonlPairLedgerStore(createRoot());
+    await store.append('pair-01', draft('shared'), 0);
+    await store.append(
+      'pair-01',
+      draft('infrastructure', 'session_event.linked'),
+      1,
+    );
+    await store.append('pair-01', draft('shared', 'agent.message'), 2);
+    await store.append(
+      'pair-01',
+      draft('infrastructure', 'pair.request_built'),
+      3,
+    );
+    await store.append('pair-01', draft('shared', 'goal.committed'), 4);
+
+    const page = await store.list('pair-01', {
+      afterSeq: 1,
+      limit: 1,
+      include: (event) => event.visibility === 'shared',
+    });
+
+    expect(page.events.map((event) => event.seq)).toEqual([3]);
+    expect(page.nextAfterSeq).toBe(3);
+    expect(page.hasMore).toBe(true);
+    expect(page.throughLedgerHead).toBe(5);
+  });
+
+  test('advances through a filtered physical suffix without stalling', async () => {
+    const store = new JsonlPairLedgerStore(createRoot());
+    await store.append('pair-01', draft('shared'), 0);
+    await store.append(
+      'pair-01',
+      draft('infrastructure', 'session_event.linked'),
+      1,
+    );
+    await store.append(
+      'pair-01',
+      draft('infrastructure', 'pair.request_built'),
+      2,
+    );
+
+    const page = await store.list('pair-01', {
+      afterSeq: 1,
+      limit: 10,
+      include: (event) => event.visibility === 'shared',
+    });
+
+    expect(page).toMatchObject({
+      events: [],
+      nextAfterSeq: 3,
+      hasMore: false,
+      throughLedgerHead: 3,
+    });
+  });
+
+  test.each([
+    [{ afterSeq: -1, limit: 1 }, /afterSeq/],
+    [{ afterSeq: 0.5, limit: 1 }, /afterSeq/],
+    [{ afterSeq: 0, limit: 0 }, /limit/],
+    [{ afterSeq: 0, limit: 501 }, /limit/],
+  ])('rejects invalid list options %#', async (options, expected) => {
+    const store = new JsonlPairLedgerStore(createRoot());
+    await expect(store.list('pair-01', options)).rejects.toThrow(expected);
+  });
+
   test('ignores an incomplete final line left by a crash', async () => {
     const root = createRoot();
     const store = new JsonlPairLedgerStore(root);

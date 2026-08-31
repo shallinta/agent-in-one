@@ -9,6 +9,7 @@ import {
 import { isAbsolute, join, relative, resolve } from 'node:path';
 
 import {
+  MAX_SESSION_EVENTS_PAGE_SIZE,
   assertJsonObject,
   canonicalJsonStringify,
   isPairEventType,
@@ -18,6 +19,54 @@ import {
   type PairId,
   type JsonObject,
 } from '@pair-agent/contracts';
+
+export interface PairEventListOptions {
+  afterSeq: number;
+  limit: number;
+  include?: (event: PairEvent) => boolean;
+}
+
+export interface PairEventListPage {
+  events: PairEvent[];
+  nextAfterSeq: number;
+  hasMore: boolean;
+  throughLedgerHead: number;
+}
+
+export function paginatePairEvents(
+  all: readonly PairEvent[],
+  options: PairEventListOptions,
+): PairEventListPage {
+  if (!Number.isSafeInteger(options.afterSeq) || options.afterSeq < 0) {
+    throw new RangeError('afterSeq must be a non-negative safe integer');
+  }
+  if (
+    !Number.isSafeInteger(options.limit) ||
+    options.limit < 1 ||
+    options.limit > MAX_SESSION_EVENTS_PAGE_SIZE
+  ) {
+    throw new RangeError(
+      `limit must be between 1 and ${MAX_SESSION_EVENTS_PAGE_SIZE}`,
+    );
+  }
+
+  const events: PairEvent[] = [];
+  let nextAfterSeq = options.afterSeq;
+  const include = options.include ?? (() => true);
+  for (const event of all) {
+    if (event.seq <= options.afterSeq) continue;
+    nextAfterSeq = event.seq;
+    if (include(event)) events.push(structuredClone(event));
+    if (events.length === options.limit) break;
+  }
+  const throughLedgerHead = all.at(-1)?.seq ?? 0;
+  return {
+    events,
+    nextAfterSeq,
+    hasMore: throughLedgerHead > nextAfterSeq,
+    throughLedgerHead,
+  };
+}
 
 export class LedgerConflictError extends Error {
   readonly expectedLedgerHead: number;
@@ -435,6 +484,13 @@ export class JsonlPairLedgerStore {
 
   async replay(pairIdInput: string): Promise<PairEvent[]> {
     return this.read(pairIdInput);
+  }
+
+  async list(
+    pairIdInput: string,
+    options: PairEventListOptions,
+  ): Promise<PairEventListPage> {
+    return paginatePairEvents(await this.read(pairIdInput), options);
   }
 
   async heads(pairIdInput: string): Promise<Heads> {

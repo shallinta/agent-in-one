@@ -74,6 +74,7 @@ class FakeAdapter implements AgentAdapter {
   onPrepare?: (input: PreparePairAgentInput) => Promise<void>;
   onResume?: (input: PreparePairAgentInput) => Promise<void>;
   auditError?: Error;
+  onAudit?: () => Promise<void>;
   releaseFailuresRemaining = 0;
   closeFailuresRemaining = 0;
   attestedDshBuild: DshBuildRef = dshBuild;
@@ -129,6 +130,7 @@ class FakeAdapter implements AgentAdapter {
 
   async auditPairRequests(): Promise<void> {
     if (this.auditError !== undefined) throw this.auditError;
+    await this.onAudit?.();
   }
 
   async close(): Promise<void> {
@@ -186,6 +188,52 @@ describe('PairRegistry create lifecycle', () => {
       ...createPairSessionIds('pair-01'),
       dshBuild,
     });
+  });
+
+  test('serializes pair.agent_ready after a derived event written during preparation', async () => {
+    const store = new JsonlPairLedgerStore(await createRoot());
+    const adapter = new FakeAdapter();
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    adapter.onPrepare = async () => {
+      entered.resolve(undefined);
+      await release.promise;
+    };
+    const registry = new PairRegistry(store, adapter);
+    const creating = registry.createPair({
+      pairId: 'pair-derived-during-create',
+      dshBuild,
+      expectedLedgerHead: 0,
+    });
+    await entered.promise;
+
+    await registry.runDerivedMutation(
+      'pair-derived-during-create',
+      async ({ appendDerived }) =>
+        appendDerived({
+          type: 'user.message',
+          actor: { kind: 'user' },
+          source: 'navigator-session',
+          channel: 'navigator',
+          visibility: 'shared',
+          authority: 'user-derived',
+          refs: { sourceEventIds: ['dsh:create:1:user.message'] },
+          payload: {
+            schemaVersion: 1,
+            kind: 'user-input',
+            text: 'arrived during preparation',
+            content: [{ type: 'text', text: 'arrived during preparation' }],
+          },
+        }),
+    );
+    release.resolve(undefined);
+
+    await expect(creating).resolves.toMatchObject({ status: 'ready' });
+    expect((await store.read('pair-derived-during-create')).map(({ type }) => type)).toEqual([
+      'pair.created',
+      'user.message',
+      'pair.agent_ready',
+    ]);
   });
 
   test('releases every successful handle and records a failed, non-addressable Pair', async () => {
@@ -424,6 +472,43 @@ describe('PairRegistry create lifecycle', () => {
 });
 
 describe('PairRegistry recovery and subscriptions', () => {
+  test(
+    'recovers before entering the Pair mutation queue so catch-up can use that queue',
+    async () => {
+      const root = await createRoot();
+      const creator = new PairRegistry(
+        new JsonlPairLedgerStore(root),
+        new FakeAdapter(),
+      );
+      await creator.createPair({
+        pairId: 'pair-cold-mutation',
+        dshBuild,
+        expectedLedgerHead: 0,
+      });
+      await creator.close();
+
+      const adapter = new FakeAdapter();
+      let registry!: PairRegistry;
+      adapter.onAudit = async () => {
+        await registry.runDerivedMutation(
+          'pair-cold-mutation',
+          async () => undefined,
+        );
+      };
+      registry = new PairRegistry(new JsonlPairLedgerStore(root), adapter);
+
+      await expect(
+        registry.runPairMutation(
+          'pair-cold-mutation',
+          2,
+          async () => 'mutation-entered',
+        ),
+      ).resolves.toBe('mutation-entered');
+      await registry.close();
+    },
+    1_500,
+  );
+
   test('grants one live registry ownership and transfers it only after close', async () => {
     const root = await createRoot();
     const firstAdapter = new FakeAdapter();
