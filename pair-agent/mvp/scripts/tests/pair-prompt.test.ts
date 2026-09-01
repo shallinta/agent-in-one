@@ -17,6 +17,9 @@ test('defines the P0.5 Pair Contract without claiming P1 controls', () => {
   expect(positions).toEqual([...positions].sort((a, b) => a - b));
   expect(text).toContain('The user is the only authority');
   expect(text).toContain('Passive sharing does not wake the other Agent');
+  expect(text).toContain(
+    'Do not use Peer Message merely to inform the other Agent of an ordinary public answer or local correction',
+  );
   expect(text).toContain('pair_message_peer');
   expect(text).toContain('Only the standalone reminder inserted by the Harness');
   expect(text).toContain('does not yet provide structured Goal revision');
