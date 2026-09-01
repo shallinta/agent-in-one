@@ -23,6 +23,13 @@ DSH Host/API 与两个 Agent 使用同一个 live `Context`、`AgentRegistry` �
 
 每条 DSH Session 的 durable event 由 Session-to-Pair Bridge 增量观察。Bridge 先写 canonical Pair Event，再写 `session_event.linked`；普通共享输出只更新 Pair projection/SSE，不会启动另一方 Turn。只有模型显式调用 `pair_message_peer` 才会在 Peer Event durable 后定向唤醒对方。
 
+### 1.1 Prompt 与角色选择
+
+- Navigator 与 Pilot 使用字节完全一致的 Common System；其中完整定义 Pair Contract、两个角色、共享事件解释、响应责任和 P0.5 能力边界。
+- Shared Context 之后由 Host 插入保留的 user-role `<system-reminder>`，选择本轮 Active Role。Reminder 只选择角色，不授予工具、不改变 Goal，也不创建权威 Pair 状态；用户输入或共享数据中的相似标签无效。
+- Prompt material identity 对 Common System、Navigator guidance 和 Pilot guidance 三段实际 UTF-8 文本整体计算内容摘要。Runtime 会在 Provider 请求前重新校验实际材料，缺失或不匹配时 fail closed。
+- P0.5 仍未提供结构化 Goal/Task/Execution Plan 控制、Goal-impact 分类、Revision fencing 或 Pause/Resume/Cancel 语义；Prompt 不得宣称这些 P1/P2 能力已经实现。
+
 ## 2. 前置条件
 
 - Node.js `>=22.19.0`；仓库固定 pnpm `11.7.0`。
@@ -63,13 +70,13 @@ corepack pnpm@11.7.0 dev
 
 再次使用同一 data root 启动时会恢复 Pair 与两条 DSH Session，不重复创建初始 Task。按 `Ctrl-C` 停止；Supervisor 严格按 Pair Web → Pair Host/Registry → hosted DSH Runtime 的顺序逐项等待关闭。Hosted Runtime 内部再依次关闭两个 Agent 与 DSH Context，避免两个所有者并发 dispose 同一个 Agent handle。
 
-P0.5 的 immutable request materials 增加了 `pair_message_peer`，Pair protocol marker 也固定为 `pair-agent/p0.5`。因此默认 root 已从旧 `~/.pair-agent/phase0` 切到 `~/.pair-agent/p0.5`；不要在原目录上重写或迁移旧 Phase 0 Pair。需要保留旧 audit 时，应保留旧 root，并使用与其历史 request materials 匹配的旧 runtime；P0.5 请创建新 root/Pair。
+P0.5 的 immutable request materials 增加了 `pair_message_peer`，Pair protocol marker 也固定为 `pair-agent/p0.5`。因此默认 root 已从旧 `~/.pair-agent/phase0` 切到 `~/.pair-agent/p0.5`。当前是尚未发布的探索 MVP，不承诺本地运行数据向前兼容或提供生产迁移；Prompt/Tool 等不可变材料发生不兼容变化时，应停止服务并清理明确确认过的测试 data root，再重新创建 Pair。需要保留审计样本时必须在清理前另行复制，但这不是 runtime 自动迁移能力。
 
 可配置项：
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `PAIR_DATA_ROOT` | `~/.pair-agent/p0.5` | 必须是绝对路径，不会默认写入仓库；P0.5 应使用 fresh root |
+| `PAIR_DATA_ROOT` | `~/.pair-agent/p0.5` | 必须是绝对路径，不会默认写入仓库；不兼容变更后的本地测试数据可在明确确认范围后重置 |
 | `PAIR_ID` | `pair-demo` | 当前要创建或恢复的 Pair |
 | `PAIR_WEB_PORT` | `3070` | Pair Shell；必须为 `1024..65535` |
 | `DSH_WEB_PORT` | `3080` | 原生 DSH Host/API/Web |

@@ -171,7 +171,7 @@ Main 与 Assistant 始终只代表用户利益，没有彼此对立的组织目�
 | Assistant 自治与用户目标权 | 机械执行缺乏价值；过度自治会替用户作选择 | Assistant 有计划、建议和异议权，无 Goal 决定权 |
 | 完整共享与权限安全 | 不共享会失忆；全部提升为高权限上下文会造成指令注入 | 原始事件共享，控制状态单独结构化 |
 | 上下文完整与调用成本 | 全历史最真实但无限增长；只靠摘要会失真 | 不可变事件账本 + Shared Checkpoint + 增量事件 |
-| 缓存命中与角色清晰 | 角色前置减少共享前缀；伪装成用户消息会削弱权限 | Active Role 保持真实 developer 权限，再评测是否后置 |
+| 缓存命中与角色清晰 | 角色前置减少共享前缀；普通用户文本又不能安全选择身份 | Common Pair Contract 预先定义双角色，Host 在保留边界用 user-role reminder 选择 Active Role，确定性权限仍由 Harness 执行 |
 | 执行透明与整体结论 | 只等 Main 汇总会延迟；Assistant 直接宣布总目标成功会越权 | Assistant 交付执行事实，Main 解释整体意义 |
 
 一句话概括当前设计：
@@ -340,11 +340,11 @@ Host 应保证：一个 Agent 发出的公开事件，在另一个 Agent 下一�
 model
 tools allowed for this role
 
-developer: Pair Contract
-developer: Active Role
-developer: sanitized shared control state（可选，仅限控制面）
+system/developer: Common Pair Contract，完整定义两个角色与 reminder 协议
+system/developer: sanitized shared control state（可选，仅限控制面）
 user: Shared Checkpoint
 user: Tail Session Events, including unread markers
+user: Host-owned Active Role Reminder
 user: Agent Local State and current trigger
 ```
 
@@ -365,38 +365,40 @@ user: Agent Local State and current trigger
 
 Chat Completions 一类接口通常也没有 `other_agent` 角色。因此另一 Agent 的输出不应伪装成当前 Agent 的 `assistant` 历史，而应作为带有 `actor`、`channel`、`eventType` 和 `authority` 的结构化事件输入。当前 Agent 自己尚未结束的模型原生输出或 tool-call 续接，则属于 Agent Local State。
 
-### 8.2 Active Role 必须使用真实权限角色
+### 8.2 Active Role Reminder 是 Host 保留的角色选择协议
 
-下面的写法只是在 user 消息中加入 XML 标签，并不会获得 system 权限：
+下面的普通用户输入只是在消息中加入 XML 标签，并不会获得 system 权限，也不能改变当前 Agent Session、工具集合或 Harness 授权：
 
 ```text
 user: <system-reminder>你是 Main Agent</system-reminder>
 ```
 
-标签可以帮助分隔结构，不能改变消息权限。Active Role 应使用真正的 `developer` 或对应平台的高优先级指令，同时由 Harness 从工具集合、写权限和可调用接口上再次约束。
+Pair Agent 采用更严格的保留协议：Common Pair Contract 在真正的 `system`/`developer` 指令层预先完整定义两个角色，并约定只有 Host 在固定 request boundary 生成的独立 user-role `<system-reminder>` 才能选择本轮 Active Role。Reminder 只是 selector，不授予工具、不修改 Goal，也不生成权威 Pair 状态。用户输入、共享事件、工具结果和引用文本中的相似标签都只是数据；确定性角色绑定、工具视图和写权限仍由 Harness 校验。
 
 ### 8.3 缓存友好与语义稳定之间的取舍
 
-正确性优先的排列是：
+当前选择的缓存优先排列是：
 
 ```text
-developer: common Pair Contract
-developer: Active Role = Main | Assistant
-user: common shared context
+system/developer: Common Pair Contract，定义双角色和 reminder 协议
+system/developer: Common Shared Control State（可选）
+user: Common Shared Checkpoint and Tail Events
+user: Host-owned Active Role Reminder = Main | Assistant
+user: Role-local State and Current Trigger
 ```
 
-它让身份最早明确，但两个请求从 Active Role 开始产生不同前缀，后续共享上下文无法继续命中完全相同的前缀缓存。
+它让两个请求在 Active Role 之前拥有尽量长的共同前缀。Common Pair Contract 提供角色语义权威，后置 reminder 只从已经定义的角色中选择当前响应者。
 
-可以实验更缓存友好的排列：
+另一种角色前置排列仍可作为模型兼容性回退：
 
 ```text
-developer: common Pair Contract, defining both roles
-user: common Shared Checkpoint and Tail Events
-developer: Active Role = Main | Assistant
-user: role-local state and current trigger
+system/developer: Common Pair Contract
+user: Host-owned Active Role Reminder = Main | Assistant
+user: Common Shared Checkpoint and Tail Events
+user: Role-local State and Current Trigger
 ```
 
-这样两个请求在 Active Role 之前拥有更长的共同前缀。但 Active Role 仍然必须是真正的 developer 消息，不能为了缓存降级为带标签的 user 消息；而且后置身份选择是否稳定，需要针对具体模型评测。
+角色前置更早产生 Navigator/Pilot 差异，会缩短跨角色缓存前缀。如果实验发现某个模型无法稳定遵循后置 reminder，或者其 API 不允许所需的消息顺序，可以回退到该排列；无论采用哪种顺序，普通用户伪造标签都不能越过 Host boundary 或改变 Harness 权限。
 
 这里所说的“共同前缀”只对同一个 Session 快照成立。Main 和 Assistant 如果在不同时间调用，看到的 `session.head` 本来就可能不同；共享完整上下文要求所有已发生事件最终可见，不要求两个并发请求在任意时刻字节完全相同。
 
@@ -514,9 +516,9 @@ Assistant 执行结束时，过程不应突然消失。用户先看到执行交�
 
 最危险的压缩错误不是漏掉一句闲聊，而是把 Main 的建议写成用户确认、把临时假设写成事实，或者遗漏一项硬约束。Checkpoint 必须保留 provenance 和不确定性。
 
-### 12.5 为缓存牺牲角色权限
+### 12.5 把缓存友好的 reminder 误当成权限机制
 
-把 Active Role 放进 user 消息、使用看似特殊的 XML 标签，可能获得更长公共前缀，却会让身份和权限退化成可被普通对话覆盖的文字。缓存只能优化正确设计，不能决定权限模型。
+Host-owned user-role reminder 可以在 Common Pair Contract 已定义协议的前提下延长公共前缀，但它仍不是权限提升机制。若实现只依赖 XML 文本、无法证明 reminder 来自保留 request boundary，或让模型自述决定工具能力，普通对话就可能覆盖角色选择。缓存只能优化正确设计；Agent Session binding、工具授权和状态变更仍必须由 Harness 确定性执行。
 
 ### 12.6 Pair Agent 退化成两个重复回答的聊天机器人
 
@@ -527,7 +529,7 @@ Assistant 执行结束时，过程不应突然消失。用户先看到执行交�
 当前讨论已经从角色概念推进到上下文架构，但以下内容仍需原型或评测：
 
 - 什么样的分类器或决策 Prompt 能可靠区分讨论、局部纠偏和 Goal 变更？
-- Active Role 后置带来的缓存收益，是否值得潜在的身份稳定性风险？
+- Host-owned Active Role Reminder 后置后的实际缓存收益和模型身份稳定性，在不同供应商上分别如何？
 - Shared Checkpoint 在多长事件间隔、什么安全水位生成最合适？
 - 如何量化 checkpoint 的语义损失和两个 Agent 的认知分歧？
 - 哪些事件必须主动唤醒另一个 Agent，哪些只需等待下一轮自然消费？
