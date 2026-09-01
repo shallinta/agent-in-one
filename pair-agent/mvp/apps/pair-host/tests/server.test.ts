@@ -274,8 +274,149 @@ describe('Pair Host HTTP API', () => {
       expect(adapter.followups.at(-1)?.sessionId).toBe(
         `pair:message-${role}:${role}`,
       );
+      expect(adapter.followups).toHaveLength(1);
+      expect(adapter.followups.some(({ sessionId }) =>
+        sessionId === `pair:message-${role}:${role === 'navigator' ? 'pilot' : 'navigator'}`,
+      )).toBe(false);
     },
   );
+
+  test('lists Pair Session Events with physical pagination and semantic filtering', async () => {
+    await coordinator.createPair({ pairId: 'pair-demo', dshBuild, expectedLedgerHead: 0 });
+    await coordinator.sendNavigator({
+      pairId: 'pair-demo',
+      text: 'first semantic input',
+      expectedLedgerHead: 2,
+    });
+    await store.append(
+      'pair-demo',
+      {
+        type: 'session_event.linked',
+        actor: { kind: 'host' },
+        source: 'navigator-session',
+        channel: 'navigator',
+        visibility: 'infrastructure',
+        authority: 'host',
+        refs: {},
+        payload: {
+          schemaVersion: 1,
+          sessionId: 'pair:pair-demo:navigator',
+          fromSessionSeq: 1,
+          throughSessionSeq: 1,
+          messageIds: ['message-1'],
+          pairEventId: 'pair-demo:3',
+          representation: 'full',
+        },
+      },
+      3,
+    );
+    await store.append(
+      'pair-demo',
+      {
+        type: 'pair.request_built',
+        actor: { kind: 'host' },
+        source: 'pair',
+        channel: 'shared-control',
+        visibility: 'infrastructure',
+        authority: 'host',
+        refs: {},
+        payload: { requestId: 'request-1' },
+      },
+      4,
+    );
+    await store.append(
+      'pair-demo',
+      {
+        type: 'delivery.completed',
+        actor: { kind: 'host' },
+        source: 'pair',
+        channel: 'shared-control',
+        visibility: 'infrastructure',
+        authority: 'host',
+        refs: {},
+        payload: { deliveryId: 'delivery-1' },
+      },
+      5,
+    );
+    await coordinator.sendPilot({
+      pairId: 'pair-demo',
+      text: 'second semantic input',
+      expectedLedgerHead: 6,
+    });
+    await coordinator.sendNavigator({
+      pairId: 'pair-demo',
+      text: 'third semantic input',
+      expectedLedgerHead: 7,
+    });
+
+    const semantic = await json(
+      origin,
+      '/api/pairs/pair-demo/session-events?afterSeq=0&limit=2&view=semantic',
+    );
+    expect(semantic.response.status).toBe(200);
+    expect(semantic.body).toEqual({
+      pairId: 'pair-demo',
+      throughLedgerHead: 8,
+      sharedHead: 8,
+      events: expect.any(Array),
+      nextAfterSeq: 7,
+      hasMore: true,
+    });
+    expect((semantic.body as { events: Array<{ seq: number; type: string }> }).events)
+      .toMatchObject([
+        { seq: 3, type: 'user.message' },
+        { seq: 7, type: 'user.message' },
+      ]);
+    expect(Object.keys(semantic.body as Record<string, unknown>)).toEqual([
+      'pairId',
+      'throughLedgerHead',
+      'sharedHead',
+      'events',
+      'nextAfterSeq',
+      'hasMore',
+    ]);
+
+    const all = await json(
+      origin,
+      '/api/pairs/pair-demo/session-events?afterSeq=0&limit=20&view=all',
+    );
+    expect(all.response.status).toBe(200);
+    const allTypes = (all.body as { events: Array<{ type: string }> }).events
+      .map(({ type }) => type);
+    expect(allTypes).toContain('session_event.linked');
+    expect(allTypes).toContain('pair.request_built');
+    expect(allTypes).toContain('delivery.completed');
+    expect((semantic.body as { events: Array<{ type: string }> }).events)
+      .not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'session_event.linked' }),
+        expect.objectContaining({ type: 'pair.request_built' }),
+        expect.objectContaining({ type: 'delivery.completed' }),
+      ]));
+  });
+
+  test.each([
+    '/api/pairs/pair-demo/session-events?afterSeq=-1',
+    '/api/pairs/pair-demo/session-events?limit=0',
+    '/api/pairs/pair-demo/session-events?view=private',
+    '/api/pairs/pair-demo/session-events?afterSeq=0&afterSeq=1',
+  ])('rejects invalid Session Events query %s', async (path) => {
+    await coordinator.createPair({ pairId: 'pair-demo', dshBuild, expectedLedgerHead: 0 });
+
+    const result = await json(origin, path);
+
+    expect(result.response.status).toBe(400);
+    expect(result.body).toMatchObject({ error: { code: 'INVALID_QUERY' } });
+  });
+
+  test('returns 404 when listing Session Events for an unknown Pair', async () => {
+    const result = await json(
+      origin,
+      '/api/pairs/unknown-pair/session-events?afterSeq=0&limit=2&view=semantic',
+    );
+
+    expect(result.response.status).toBe(404);
+    expect(result.body).toMatchObject({ error: { code: 'PAIR_NOT_FOUND' } });
+  });
 
   test('accepts a Navigator task command and only wakes Pilot', async () => {
     await coordinator.createPair({ pairId: 'task-pair', dshBuild, expectedLedgerHead: 0 });
@@ -299,29 +440,34 @@ describe('Pair Host HTTP API', () => {
     expect(adapter.followups[0]?.sessionId).toBe('pair:task-pair:pilot');
   });
 
-  test('returns accepted-pending when the durable event cannot wake the adapter', async () => {
-    await coordinator.createPair({ pairId: 'pending-pair', dshBuild, expectedLedgerHead: 0 });
-    adapter.failDelivery = true;
+  test.each(['navigator', 'pilot'] as const)(
+    'returns accepted-pending when durable %s input cannot wake the adapter',
+    async (role) => {
+      await coordinator.createPair({ pairId: 'pending-pair', dshBuild, expectedLedgerHead: 0 });
+      adapter.failDelivery = true;
 
-    const pending = await json(origin, '/api/pairs/pending-pair/messages/navigator', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text: 'persist me', expectedLedgerHead: 2 }),
-    });
+      const pending = await json(origin, `/api/pairs/pending-pair/messages/${role}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text: 'persist me', expectedLedgerHead: 2 }),
+      });
 
-    expect(pending.response.status).toBe(202);
-    expect(pending.body).toEqual({
-      acceptedAtLedgerHead: 3,
-      deliveryId: 'pending-pair:3',
-      delivery: 'pending',
-    });
-    expect((await store.read('pending-pair')).at(-1)?.payload).toEqual({
-      schemaVersion: 1,
-      kind: 'user-input',
-      text: 'persist me',
-      content: [{ type: 'text', text: 'persist me' }],
-    });
-  });
+      expect(pending.response.status).toBe(202);
+      expect(pending.body).toEqual({
+        acceptedAtLedgerHead: 3,
+        deliveryId: 'pending-pair:3',
+        delivery: 'pending',
+      });
+      expect((await store.read('pending-pair')).at(-1)?.payload).toEqual({
+        schemaVersion: 1,
+        kind: 'user-input',
+        text: 'persist me',
+        content: [{ type: 'text', text: 'persist me' }],
+      });
+      expect(adapter.followups).toHaveLength(1);
+      expect(adapter.followups[0]?.sessionId).toBe(`pair:pending-pair:${role}`);
+    },
+  );
 
   test('maps duplicate and stale CAS conflicts to structured 409 errors', async () => {
     await coordinator.createPair({ pairId: 'conflict-pair', dshBuild, expectedLedgerHead: 0 });
@@ -346,6 +492,28 @@ describe('Pair Host HTTP API', () => {
         details: { expectedLedgerHead: 1, actualLedgerHead: 2 },
       },
     });
+
+    const accepted = await json(origin, '/api/pairs/conflict-pair/messages/navigator', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: 'accepted once', expectedLedgerHead: 2 }),
+    });
+    expect(accepted.response.status).toBe(202);
+    const retry = await json(origin, '/api/pairs/conflict-pair/messages/navigator', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: 'must not append', expectedLedgerHead: 2 }),
+    });
+    expect(retry.response.status).toBe(409);
+    expect(retry.body).toMatchObject({
+      error: {
+        code: 'LEDGER_CONFLICT',
+        details: { expectedLedgerHead: 2, actualLedgerHead: 3 },
+      },
+    });
+    expect(await store.heads('conflict-pair')).toMatchObject({ ledgerHead: 3 });
+    expect(adapter.followups).toHaveLength(1);
+    expect(adapter.followups[0]?.sessionId).toBe('pair:conflict-pair:navigator');
   });
 
   test('returns 404 for missing and unknown resources, and 405 for known wrong methods', async () => {

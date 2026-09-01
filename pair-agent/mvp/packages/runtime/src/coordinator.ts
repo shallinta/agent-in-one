@@ -9,12 +9,15 @@ import {
   type DshBuildRef,
   type GetPairResponse,
   type JsonObject,
+  type ListPairSessionEventsQuery,
+  type ListPairSessionEventsResponse,
   type PairEvent,
+  type PairEventType,
   type PairRole,
   type SendPairMessageRequest,
   type SendPairMessageResponse,
 } from '@pair-agent/contracts';
-import { JsonlPairLedgerStore } from '@pair-agent/ledger';
+import { JsonlPairLedgerStore, paginatePairEvents } from '@pair-agent/ledger';
 
 import {
   PairRegistry,
@@ -24,6 +27,26 @@ import {
 } from './pair-registry.js';
 
 const MAX_TEXT_BYTES = 64 * 1024;
+
+const SEMANTIC_PAIR_EVENT_TYPES: ReadonlySet<PairEventType> = new Set([
+  'user.message',
+  'agent.message',
+  'goal.committed',
+  'goal.revised',
+  'task.assigned',
+  'task.revised',
+  'task.state_changed',
+  'execution_plan.updated',
+  'attention.requested',
+  'attention.cleared',
+  'pair.paused',
+  'pair.resumed',
+  'artifact.recorded',
+]);
+
+export function isSemanticPairEvent(event: PairEvent): boolean {
+  return SEMANTIC_PAIR_EVENT_TYPES.has(event.type);
+}
 
 export class InvalidCommandError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -119,6 +142,27 @@ export class PairCoordinator {
   async getPair(pairId: string): Promise<GetPairResponse> {
     const ready = await this.registry.getReadyPair(pairId);
     return { projection: ready.projection, panes: ready.panes };
+  }
+
+  async listSessionEvents(
+    pairIdInput: string,
+    query: ListPairSessionEventsQuery,
+  ): Promise<ListPairSessionEventsResponse> {
+    const pairId = parsePairId(pairIdInput);
+    return this.registry.readSnapshot(pairId, ({ projection, events }) => {
+      const page = paginatePairEvents(events, {
+        ...query,
+        include: query.view === 'all' ? undefined : isSemanticPairEvent,
+      });
+      return {
+        pairId,
+        throughLedgerHead: projection.header.ledgerHead,
+        sharedHead: projection.header.sharedHead,
+        events: page.events,
+        nextAfterSeq: page.nextAfterSeq,
+        hasMore: page.hasMore,
+      };
+    });
   }
 
   async sendNavigator(command: SendMessageCommand): Promise<DeliveryResult> {

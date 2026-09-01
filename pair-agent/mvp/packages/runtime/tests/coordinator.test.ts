@@ -139,6 +139,125 @@ describe('PairCoordinator durable delivery', () => {
     );
   });
 
+  test('lists semantic Pair events from a mutation-queue snapshot with physical cursors', async () => {
+    await coordinator.sendNavigator({
+      pairId: 'pair-commands',
+      text: 'first semantic input',
+      expectedLedgerHead: 2,
+    });
+    await store.append(
+      'pair-commands',
+      {
+        type: 'session_event.linked',
+        actor: { kind: 'host' },
+        source: 'navigator-session',
+        channel: 'navigator',
+        visibility: 'infrastructure',
+        authority: 'host',
+        refs: {},
+        payload: {
+          schemaVersion: 1,
+          sessionId: 'pair:pair-commands:navigator',
+          fromSessionSeq: 1,
+          throughSessionSeq: 1,
+          messageIds: ['message-1'],
+          pairEventId: 'pair-commands:3',
+          representation: 'full',
+        },
+      },
+      3,
+    );
+    await store.append(
+      'pair-commands',
+      {
+        type: 'pair.request_built',
+        actor: { kind: 'host' },
+        source: 'pair',
+        channel: 'shared-control',
+        visibility: 'infrastructure',
+        authority: 'host',
+        refs: {},
+        payload: { requestId: 'request-1' },
+      },
+      4,
+    );
+    await store.append(
+      'pair-commands',
+      {
+        type: 'delivery.completed',
+        actor: { kind: 'host' },
+        source: 'pair',
+        channel: 'shared-control',
+        visibility: 'infrastructure',
+        authority: 'host',
+        refs: {},
+        payload: { deliveryId: 'delivery-1' },
+      },
+      5,
+    );
+    await coordinator.sendPilot({
+      pairId: 'pair-commands',
+      text: 'second semantic input',
+      expectedLedgerHead: 6,
+    });
+
+    await expect(coordinator.listSessionEvents('pair-commands', {
+      afterSeq: 0,
+      limit: 2,
+      view: 'semantic',
+    })).resolves.toMatchObject({
+      pairId: 'pair-commands',
+      throughLedgerHead: 7,
+      sharedHead: 7,
+      events: [
+        { seq: 3, type: 'user.message' },
+        { seq: 7, type: 'user.message' },
+      ],
+      nextAfterSeq: 7,
+      hasMore: false,
+    });
+
+    const all = await coordinator.listSessionEvents('pair-commands', {
+      afterSeq: 0,
+      limit: 20,
+      view: 'all',
+    });
+    expect(all.events.map(({ type }) => type)).toEqual([
+      'pair.created',
+      'pair.agent_ready',
+      'user.message',
+      'session_event.linked',
+      'pair.request_built',
+      'delivery.completed',
+      'user.message',
+    ]);
+  });
+
+  test('advances an empty semantic page through hidden physical events', async () => {
+    const page = await coordinator.listSessionEvents('pair-commands', {
+      afterSeq: 0,
+      limit: 2,
+      view: 'semantic',
+    });
+
+    expect(page).toMatchObject({
+      pairId: 'pair-commands',
+      throughLedgerHead: 2,
+      sharedHead: 1,
+      events: [],
+      nextAfterSeq: 2,
+      hasMore: false,
+    });
+  });
+
+  test('rejects an unknown Pair when listing Session Events', async () => {
+    await expect(coordinator.listSessionEvents('unknown-pair', {
+      afterSeq: 0,
+      limit: 2,
+      view: 'semantic',
+    })).rejects.toMatchObject({ name: 'PairNotFoundError' });
+  });
+
   test('assigns the exported version-1 queued PairTask from Navigator and wakes only Pilot', async () => {
     const expectedLedgerHead = (await store.heads('pair-commands')).ledgerHead;
 

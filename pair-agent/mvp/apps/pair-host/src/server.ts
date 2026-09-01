@@ -8,6 +8,7 @@ import type { AddressInfo } from 'node:net';
 
 import {
   InvalidPairIdError,
+  parseSessionEventsQuery,
   type AssignPairTaskRequest,
   type AssignPairTaskResponse,
   type CreatePairRequest,
@@ -15,6 +16,8 @@ import {
   type DshBuildRef,
   type GetPairResponse,
   type JsonObject,
+  type ListPairSessionEventsQuery,
+  type ListPairSessionEventsResponse,
   type PairProjection,
   type SendPairMessageRequest,
   type SendPairMessageResponse,
@@ -316,6 +319,39 @@ async function routeRequest(
       };
       writeJson(response, 202, taskResponse);
     }
+    return;
+  }
+
+  const sessionEventsMatch = /^\/api\/pairs\/([^/]+)\/session-events$/.exec(path);
+  if (sessionEventsMatch !== null) {
+    if (method !== 'GET') {
+      methodNotAllowed(response, 'GET');
+      return;
+    }
+    const seenQueryKeys = new Set<string>();
+    for (const key of url.searchParams.keys()) {
+      if (seenQueryKeys.has(key)) {
+        throw new HttpRequestError(
+          400,
+          'INVALID_QUERY',
+          `Query parameter ${key} must not be repeated`,
+        );
+      }
+      seenQueryKeys.add(key);
+    }
+    let query: ListPairSessionEventsQuery;
+    try {
+      query = parseSessionEventsQuery(Object.fromEntries(url.searchParams));
+    } catch (error) {
+      if (!(error instanceof TypeError || error instanceof RangeError)) throw error;
+      throw new HttpRequestError(400, 'INVALID_QUERY', error.message);
+    }
+    const sessionEventsResponse: ListPairSessionEventsResponse =
+      await options.coordinator.listSessionEvents(
+        decodePairId(sessionEventsMatch[1]!),
+        query,
+      );
+    writeJson(response, 200, sessionEventsResponse);
     return;
   }
 
