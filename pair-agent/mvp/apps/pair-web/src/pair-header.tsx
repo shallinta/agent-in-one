@@ -1,11 +1,19 @@
+import type { RefObject } from 'react';
 import type { PairProjection } from '@pair-agent/contracts';
 
 export interface PairHeaderViewProps {
   readonly projection: PairProjection;
   readonly connectionState: 'ready' | 'degraded';
+  readonly onOpenSessionEvents: () => void;
+  readonly sessionEventsButtonRef: RefObject<HTMLButtonElement>;
 }
 
-export function PairHeaderView({ projection, connectionState }: PairHeaderViewProps) {
+export function PairHeaderView({
+  projection,
+  connectionState,
+  onOpenSessionEvents,
+  sessionEventsButtonRef,
+}: PairHeaderViewProps) {
   const { header, goal, task, executionPlan, attention, pause } = projection;
   return (
     <header className="pair-header">
@@ -14,14 +22,19 @@ export function PairHeaderView({ projection, connectionState }: PairHeaderViewPr
           <p className="eyebrow">Pair Web Shell</p>
           <h1>{header.pairId}</h1>
         </div>
-        <span
-          className={`status status--${connectionState}`}
-          role="status"
-          aria-live="polite"
-          aria-label="Connection status"
-        >
-          {connectionState}
-        </span>
+        <div className="pair-header__actions">
+          <button ref={sessionEventsButtonRef} type="button" onClick={onOpenSessionEvents}>
+            Session Events
+          </button>
+          <span
+            className={`status status--${connectionState}`}
+            role="status"
+            aria-live="polite"
+            aria-label="Connection status"
+          >
+            {connectionState}
+          </span>
+        </div>
       </div>
 
       <p className="projection-boundary">

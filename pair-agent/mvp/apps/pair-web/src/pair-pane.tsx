@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 
 import {
   normalizeDshWebOrigin,
@@ -26,9 +26,10 @@ export interface PairPaneProps {
   readonly dshWebOrigin: string;
   readonly shellOrigin: string;
   readonly pane: ValidatedPairPane;
+  readonly formSlot?: ReactNode;
 }
 
-export function PairPane({ dshWebOrigin, shellOrigin, pane }: PairPaneProps) {
+export function PairPane({ dshWebOrigin, shellOrigin, pane, formSlot }: PairPaneProps) {
   const [loading, setLoading] = useState(true);
   const label = pane.role === 'navigator' ? 'Navigator' : 'Pilot';
 
@@ -48,14 +49,17 @@ export function PairPane({ dshWebOrigin, shellOrigin, pane }: PairPaneProps) {
   return (
     <section className="pair-pane" aria-labelledby={`${pane.role}-label`}>
       <div className="pair-pane__titlebar">
-        <div>
-          <p className="eyebrow">{pane.source}</p>
-          <h2 id={`${pane.role}-label`}>{label}</h2>
+        <div className="pair-pane__heading">
+          <div>
+            <p className="eyebrow">{pane.source}</p>
+            <h2 id={`${pane.role}-label`}>{label}</h2>
+          </div>
+          <p className="pair-pane__boundary">
+            Isolated native DSH session. Its transcript and composer stay inside this pane.
+            Phase 0 should deploy DSH on a separate origin.
+          </p>
         </div>
-        <p className="pair-pane__boundary">
-          Isolated native DSH session. Its transcript and composer stay inside this pane.
-          Phase 0 should deploy DSH on a separate origin.
-        </p>
+        {formSlot ? <div className="pair-pane__form-slot">{formSlot}</div> : null}
       </div>
       <div className="pair-pane__frame">
         {loading ? (

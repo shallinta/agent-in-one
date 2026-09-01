@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import {
   parsePairId,
   type GetPairResponse,
@@ -6,6 +6,11 @@ import {
 } from '@pair-agent/contracts';
 
 import { App, type PairEventSource } from '../src/app.js';
+import {
+  LedgerConflictError,
+  sendPairMessage,
+  validateListPairSessionEventsResponse,
+} from '../src/pair-client.js';
 
 const baseProjection: PairProjection = {
   header: {
@@ -59,6 +64,10 @@ class FakeEventSource implements PairEventSource {
 
   fail(): void {
     this.onerror?.(new Event('error'));
+  }
+
+  reconnect(): void {
+    this.onopen?.(new Event('open'));
   }
 }
 
@@ -533,6 +542,179 @@ describe('Pair Web App', () => {
     expect(screen.queryByText('Old request replayed')).not.toBeInTheDocument();
   });
 
+  test('integrates the Events trigger and role forms without changing native DSH Session URLs', async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (init?.method === 'POST') {
+        return {
+          ok: true,
+          status: 202,
+          json: async () => ({
+            acceptedAtLedgerHead: 3,
+            deliveryId: 'pair-web:3',
+            delivery: 'delivered',
+          }),
+        } as Response;
+      }
+      if (url.pathname.endsWith('/session-events')) {
+        return okJson({
+          pairId: 'pair-web',
+          throughLedgerHead: 2,
+          sharedHead: 2,
+          events: [],
+          nextAfterSeq: 2,
+          hasMore: false,
+        });
+      }
+      return okJson(responseFor());
+    });
+    renderApp({ fetcher });
+    const iframe = await screen.findByTitle('Navigator DSH session');
+    const sessionUrl = iframe.getAttribute('src');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Session Events' }));
+    expect(screen.getByRole('dialog', { name: 'Session Events' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Close session events' }));
+
+    const input = screen.getByRole('textbox', { name: 'Message navigator' });
+    fireEvent.change(input, { target: { value: 'pair-level input' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send to navigator' }));
+    await waitFor(() =>
+      expect(fetcher).toHaveBeenCalledWith(
+        'https://pair.example/api/pairs/pair-web/messages/navigator',
+        expect.objectContaining({
+          body: JSON.stringify({ text: 'pair-level input', expectedLedgerHead: 2 }),
+        }),
+      ),
+    );
+    expect(iframe).toHaveAttribute('src', sessionUrl);
+  });
+
+  test('keeps a Session Events integrity fault sticky across SSE reconnects', async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith('/session-events')) {
+        return okJson({
+          pairId: 'pair-web',
+          throughLedgerHead: 2,
+          sharedHead: 2,
+          events: [],
+          nextAfterSeq: 0,
+          hasMore: true,
+        });
+      }
+      return okJson(responseFor());
+    });
+    const { eventSource } = renderApp({ fetcher });
+    await screen.findByTitle('Navigator DSH session');
+    fireEvent.click(screen.getByRole('button', { name: 'Session Events' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/cursor/i);
+    expect(screen.getByRole('status', { name: /connection status/i })).toHaveTextContent(
+      'degraded',
+    );
+
+    act(() => eventSource.reconnect());
+
+    expect(screen.getByRole('status', { name: /connection status/i })).toHaveTextContent(
+      'degraded',
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent(/cursor/i);
+  });
+
+  test('does not make an ordinary Session Events network failure sticky', async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith('/session-events')) {
+        throw new TypeError('network unavailable');
+      }
+      return okJson(responseFor());
+    });
+    renderApp({ fetcher });
+    await screen.findByTitle('Navigator DSH session');
+    fireEvent.click(screen.getByRole('button', { name: 'Session Events' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('network unavailable');
+    expect(screen.getByRole('status', { name: /connection status/i })).toHaveTextContent(
+      'ready',
+    );
+  });
+
+  test('atomically isolates panes, forms and drafts while Pair identity changes', async () => {
+    const projectionA: PairProjection = {
+      ...baseProjection,
+      header: {
+        ...baseProjection.header,
+        pairId: parsePairId('pair-a'),
+        navigatorSessionId: 'pair:pair-a:navigator',
+        pilotSessionId: 'pair:pair-a:pilot',
+      },
+    };
+    const projectionB: PairProjection = {
+      ...baseProjection,
+      header: {
+        ...baseProjection.header,
+        pairId: parsePairId('pair-b'),
+        navigatorSessionId: 'pair:pair-b:navigator',
+        pilotSessionId: 'pair:pair-b:pilot',
+        ledgerHead: 5,
+        sharedHead: 5,
+      },
+      pause: { paused: false, changedAtSeq: 5 },
+    };
+    const pending = new Map<string, (response: Response) => void>();
+    const fetcher = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      return new Promise<Response>((resolve) => pending.set(url, resolve));
+    });
+    const config = {
+      apiBase: 'https://pair.example',
+      dshWebOrigin: 'https://dsh.example',
+      shellOrigin: window.location.origin,
+    };
+    const view = render(
+      <App
+        config={config}
+        locationSearch="?pairId=pair-a"
+        fetcher={fetcher}
+        eventSourceFactory={() => new FakeEventSource()}
+      />,
+    );
+    await waitFor(() =>
+      expect(pending.has('https://pair.example/api/pairs/pair-a')).toBe(true),
+    );
+    await act(async () => {
+      pending.get('https://pair.example/api/pairs/pair-a')!(okJson(responseFor(projectionA)));
+    });
+    const oldDraft = await screen.findByRole('textbox', { name: 'Message navigator' });
+    fireEvent.change(oldDraft, { target: { value: 'pair A only' } });
+
+    view.rerender(
+      <App
+        config={config}
+        locationSearch="?pairId=pair-b"
+        fetcher={fetcher}
+        eventSourceFactory={() => new FakeEventSource()}
+      />,
+    );
+
+    expect(screen.getByText('Loading Pair projection…')).toBeInTheDocument();
+    expect(screen.queryByRole('textbox', { name: 'Message navigator' })).toBeNull();
+    expect(screen.queryByText('pair A only')).toBeNull();
+    await waitFor(() =>
+      expect(pending.has('https://pair.example/api/pairs/pair-b')).toBe(true),
+    );
+    await act(async () => {
+      pending.get('https://pair.example/api/pairs/pair-b')!(okJson(responseFor(projectionB)));
+    });
+
+    const newDraft = await screen.findByRole('textbox', { name: 'Message navigator' });
+    expect(newDraft).toHaveValue('');
+    expect(screen.getByTitle('Navigator DSH session').getAttribute('src')).toContain(
+      'pairId=pair-b',
+    );
+  });
+
   test('closes the EventSource when unmounted', async () => {
     const { eventSource, unmount } = renderApp();
     await screen.findByTitle('Navigator DSH session');
@@ -666,5 +848,204 @@ describe('Pair Web App', () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(sources).toHaveLength(1);
+  });
+});
+
+describe('Pair Web typed clients', () => {
+  const event = (seq: number, text = `message-${seq}`) => ({
+    pairId: 'pair-web',
+    seq,
+    type: 'user.message',
+    actor: { kind: 'user' },
+    source: 'pair',
+    channel: 'navigator',
+    visibility: 'shared',
+    authority: 'user',
+    refs: {},
+    payload: { schemaVersion: 1, kind: 'user-input', text, content: [] },
+    occurredAt: '2026-09-01T00:00:00.000Z',
+  });
+
+  const page = (patch: Record<string, unknown> = {}) => ({
+    pairId: 'pair-web',
+    throughLedgerHead: 4,
+    sharedHead: 4,
+    events: [event(3), event(4)],
+    nextAfterSeq: 4,
+    hasMore: false,
+    ...patch,
+  });
+
+  test('validates exact Pair identity, ascending events and snapshot heads', () => {
+    expect(validateListPairSessionEventsResponse(page(), 'pair-web', 2)).toEqual(page());
+
+    expect(() =>
+      validateListPairSessionEventsResponse(page({ pairId: 'other' }), 'pair-web', 2),
+    ).toThrow(/pairId/i);
+    expect(() =>
+      validateListPairSessionEventsResponse(
+        page({ events: [event(4), event(3)] }),
+        'pair-web',
+        2,
+      ),
+    ).toThrow(/ascending/i);
+    expect(() =>
+      validateListPairSessionEventsResponse(
+        page({ throughLedgerHead: 3, events: [event(3), event(4)] }),
+        'pair-web',
+        2,
+      ),
+    ).toThrow(/throughLedgerHead/i);
+    expect(() =>
+      validateListPairSessionEventsResponse(page({ sharedHead: 5 }), 'pair-web', 2),
+    ).toThrow(/sharedHead/i);
+  });
+
+  test('rejects invalid physical cursor progression and unknown response fields', () => {
+    expect(() =>
+      validateListPairSessionEventsResponse(page({ nextAfterSeq: 1 }), 'pair-web', 2),
+    ).toThrow(/cursor/i);
+    expect(() =>
+      validateListPairSessionEventsResponse(
+        page({ events: [], nextAfterSeq: 2, throughLedgerHead: 4, hasMore: true }),
+        'pair-web',
+        2,
+      ),
+    ).toThrow(/cursor|advance/i);
+    expect(() =>
+      validateListPairSessionEventsResponse(
+        page({ nextAfterSeq: 3, events: [event(4)] }),
+        'pair-web',
+        2,
+      ),
+    ).toThrow(/cursor/i);
+    expect(() =>
+      validateListPairSessionEventsResponse(page({ surprise: true }), 'pair-web', 2),
+    ).toThrow(/unexpected/i);
+  });
+
+  test.each([
+    ['non-object goal ref', { goal: 1 }],
+    ['goal ref unknown field', { goal: { id: 'goal-1', version: 1, extra: true } }],
+    ['invalid task revision', { task: { id: 'task-1', revision: 0 } }],
+    ['invalid execution plan id', { executionPlan: { id: '', revision: 1 } }],
+    ['non-array source event IDs', { sourceEventIds: 'source-1' }],
+    ['non-string source event ID', { sourceEventIds: ['source-1', 2] }],
+    ['empty source event ID', { sourceEventIds: [''] }],
+  ])('rejects malformed PairEvent refs: %s', (_name, refs) => {
+    expect(() =>
+      validateListPairSessionEventsResponse(
+        page({ events: [{ ...event(3), refs }, event(4)] }),
+        'pair-web',
+        2,
+      ),
+    ).toThrow(/refs/i);
+  });
+
+  test.each([
+    ['an empty sourceEventIds array', []],
+    ['duplicate non-empty sourceEventIds', ['source-1', 'source-1']],
+  ])('accepts contract-valid PairEvent refs with %s', (_name, sourceEventIds) => {
+    expect(() =>
+      validateListPairSessionEventsResponse(
+        page({
+          events: [{ ...event(3), refs: { sourceEventIds } }, event(4)],
+        }),
+        'pair-web',
+        2,
+      ),
+    ).not.toThrow();
+  });
+
+  test('sends a role message and validates the 202 response', async () => {
+    const fetcher = vi.fn(async () => ({
+      ok: true,
+      status: 202,
+      json: async () => ({
+        acceptedAtLedgerHead: 5,
+        deliveryId: 'pair-web:5',
+        delivery: 'pending',
+      }),
+    }) as Response);
+
+    await expect(
+      sendPairMessage(
+        fetcher,
+        'https://pair.example',
+        'pair-web',
+        'pilot',
+        { text: 'hello', expectedLedgerHead: 4 },
+      ),
+    ).resolves.toEqual({
+      acceptedAtLedgerHead: 5,
+      deliveryId: 'pair-web:5',
+      delivery: 'pending',
+    });
+    expect(fetcher).toHaveBeenCalledWith(
+      'https://pair.example/api/pairs/pair-web/messages/pilot',
+      expect.objectContaining({
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text: 'hello', expectedLedgerHead: 4 }),
+      }),
+    );
+  });
+
+  test('surfaces a structured 409 ledger conflict', async () => {
+    const fetcher = vi.fn(async () => ({
+      ok: false,
+      status: 409,
+      json: async () => ({
+        error: {
+          code: 'LEDGER_CONFLICT',
+          message: 'Ledger head conflict',
+          details: { expectedLedgerHead: 4, actualLedgerHead: 6 },
+        },
+      }),
+    }) as Response);
+
+    await expect(
+      sendPairMessage(
+        fetcher,
+        'https://pair.example',
+        'pair-web',
+        'navigator',
+        { text: 'hello', expectedLedgerHead: 4 },
+      ),
+    ).rejects.toMatchObject({
+      name: 'LedgerConflictError',
+      expectedLedgerHead: 4,
+      actualLedgerHead: 6,
+    } satisfies Partial<LedgerConflictError>);
+  });
+
+  test('rejects malformed success bodies and preserves abort errors', async () => {
+    const malformed = vi.fn(async () => ({
+      ok: true,
+      status: 202,
+      json: async () => ({ delivery: 'delivered' }),
+    }) as Response);
+    await expect(
+      sendPairMessage(
+        malformed,
+        'https://pair.example',
+        'pair-web',
+        'navigator',
+        { text: 'hello', expectedLedgerHead: 4 },
+      ),
+    ).rejects.toBeInstanceOf(TypeError);
+
+    const aborted = new DOMException('aborted', 'AbortError');
+    const aborting = vi.fn(async () => Promise.reject(aborted));
+    await expect(
+      sendPairMessage(
+        aborting,
+        'https://pair.example',
+        'pair-web',
+        'navigator',
+        { text: 'hello', expectedLedgerHead: 4 },
+        new AbortController().signal,
+      ),
+    ).rejects.toBe(aborted);
   });
 });

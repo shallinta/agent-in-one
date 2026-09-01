@@ -1,13 +1,19 @@
 import {
   canonicalJsonStringify,
   createPairSessionIds,
+  isPairEventType,
   isPairTaskState,
   parsePairId,
   type GetPairResponse,
+  type ListPairSessionEventsQuery,
+  type ListPairSessionEventsResponse,
+  type PairEvent,
   type PairHeader,
   type PairPaneDescriptor,
   type PairProjection,
   type PairRole,
+  type SendPairMessageRequest,
+  type SendPairMessageResponse,
 } from '@pair-agent/contracts';
 
 export { normalizeDshWebOrigin, normalizeShellOrigin } from './origin.js';
@@ -43,8 +49,51 @@ function isPositiveInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) > 0;
 }
 
+export class InvalidPairHostResponseError extends TypeError {
+  constructor(detail: string) {
+    super(`Invalid Pair Host response: ${detail}`);
+    this.name = 'InvalidPairHostResponseError';
+  }
+}
+
 function invalidResponse(detail: string): never {
-  throw new TypeError(`Invalid Pair Host response: ${detail}`);
+  throw new InvalidPairHostResponseError(detail);
+}
+
+function hasExactKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+  label: string,
+): void {
+  const allowed = new Set(keys);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) invalidResponse(`${label}.${key} is unexpected`);
+  }
+  for (const key of keys) {
+    if (!Object.hasOwn(value, key)) invalidResponse(`${label}.${key} is required`);
+  }
+}
+
+function isJsonValue(value: unknown, ancestors = new Set<object>()): boolean {
+  if (
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'boolean' ||
+    (typeof value === 'number' && Number.isFinite(value))
+  ) {
+    return true;
+  }
+  if (typeof value !== 'object' || ancestors.has(value)) return false;
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return value.every((item) => isJsonValue(item, ancestors));
+    }
+    if (!isRecord(value)) return false;
+    return Object.values(value).every((item) => isJsonValue(item, ancestors));
+  } finally {
+    ancestors.delete(value);
+  }
 }
 
 function validateHeader(value: unknown, expectedPairId: string): PairHeader {
@@ -261,6 +310,282 @@ export function normalizeApiBase(
 
 export function pairApiUrl(apiBase: string, pairId: string, suffix = ''): string {
   return `${apiBase}/api/pairs/${encodeURIComponent(parsePairId(pairId))}${suffix}`;
+}
+
+const PAIR_EVENT_KEYS = [
+  'pairId',
+  'seq',
+  'type',
+  'actor',
+  'source',
+  'channel',
+  'visibility',
+  'authority',
+  'refs',
+  'payload',
+  'occurredAt',
+] as const;
+
+function validateVersionedRef(
+  value: unknown,
+  label: 'goal' | 'task' | 'executionPlan',
+  counter: 'version' | 'revision',
+): void {
+  if (!isRecord(value)) invalidResponse(`event.refs.${label} must be an object`);
+  hasExactKeys(value, ['id', counter], `event.refs.${label}`);
+  if (!isNonEmptyString(value.id) || !isPositiveInteger(value[counter])) {
+    invalidResponse(`event.refs.${label} must contain a non-empty id and positive ${counter}`);
+  }
+}
+
+function validatePairEvent(value: unknown, expectedPairId: string): PairEvent {
+  if (!isRecord(value)) invalidResponse('event must be an object');
+  hasExactKeys(value, PAIR_EVENT_KEYS, 'event');
+  if (value.pairId !== expectedPairId) invalidResponse('event pairId does not match the request');
+  if (!isPositiveInteger(value.seq)) invalidResponse('event seq must be a positive safe integer');
+  if (!isPairEventType(value.type)) invalidResponse('event type is invalid');
+
+  if (!isRecord(value.actor)) invalidResponse('event actor must be an object');
+  if (value.actor.kind === 'agent') {
+    hasExactKeys(value.actor, ['kind', 'role'], 'event.actor');
+    if (value.actor.role !== 'navigator' && value.actor.role !== 'pilot') {
+      invalidResponse('event actor role is invalid');
+    }
+  } else {
+    hasExactKeys(value.actor, ['kind'], 'event.actor');
+    if (
+      value.actor.kind !== 'user' &&
+      value.actor.kind !== 'host' &&
+      value.actor.kind !== 'pair'
+    ) {
+      invalidResponse('event actor kind is invalid');
+    }
+  }
+  if (
+    value.source !== 'pair' &&
+    value.source !== 'navigator-session' &&
+    value.source !== 'pilot-session'
+  ) {
+    invalidResponse('event source is invalid');
+  }
+  if (
+    value.channel !== 'navigator' &&
+    value.channel !== 'pilot' &&
+    value.channel !== 'shared-control'
+  ) {
+    invalidResponse('event channel is invalid');
+  }
+  if (
+    value.visibility !== 'shared' &&
+    value.visibility !== 'local' &&
+    value.visibility !== 'infrastructure'
+  ) {
+    invalidResponse('event visibility is invalid');
+  }
+  if (
+    value.authority !== 'user' &&
+    value.authority !== 'user-derived' &&
+    value.authority !== 'navigator' &&
+    value.authority !== 'pilot' &&
+    value.authority !== 'host'
+  ) {
+    invalidResponse('event authority is invalid');
+  }
+  if (!isRecord(value.refs)) invalidResponse('event refs must be an object');
+  const refKeys = new Set(['goal', 'task', 'executionPlan', 'sourceEventIds']);
+  for (const key of Object.keys(value.refs)) {
+    if (!refKeys.has(key)) invalidResponse(`event.refs.${key} is unexpected`);
+  }
+  if (value.refs.goal !== undefined) {
+    validateVersionedRef(value.refs.goal, 'goal', 'version');
+  }
+  if (value.refs.task !== undefined) {
+    validateVersionedRef(value.refs.task, 'task', 'revision');
+  }
+  if (value.refs.executionPlan !== undefined) {
+    validateVersionedRef(value.refs.executionPlan, 'executionPlan', 'revision');
+  }
+  if (value.refs.sourceEventIds !== undefined) {
+    if (
+      !Array.isArray(value.refs.sourceEventIds) ||
+      !value.refs.sourceEventIds.every(isNonEmptyString)
+    ) {
+      invalidResponse(
+        'event.refs.sourceEventIds must be an array of non-empty strings',
+      );
+    }
+  }
+  if (!isJsonValue(value.refs) || !isJsonValue(value.payload)) {
+    invalidResponse('event refs and payload must be JSON-safe');
+  }
+  if (
+    typeof value.occurredAt !== 'string' ||
+    value.occurredAt.length === 0 ||
+    !Number.isFinite(Date.parse(value.occurredAt))
+  ) {
+    invalidResponse('event occurredAt must be a timestamp');
+  }
+  return value as unknown as PairEvent;
+}
+
+export function validateListPairSessionEventsResponse(
+  value: unknown,
+  expectedPairId: string,
+  afterSeq: number,
+): ListPairSessionEventsResponse {
+  if (!isRecord(value)) invalidResponse('session-events body must be an object');
+  hasExactKeys(
+    value,
+    [
+      'pairId',
+      'throughLedgerHead',
+      'sharedHead',
+      'events',
+      'nextAfterSeq',
+      'hasMore',
+    ],
+    'session-events',
+  );
+  if (value.pairId !== expectedPairId) {
+    invalidResponse('session-events pairId does not match the request');
+  }
+  const throughLedgerHead = value.throughLedgerHead;
+  const sharedHead = value.sharedHead;
+  const nextAfterSeq = value.nextAfterSeq;
+  if (!isHead(throughLedgerHead) || !isHead(sharedHead)) {
+    invalidResponse('session-events heads must be non-negative safe integers');
+  }
+  if (sharedHead > throughLedgerHead) {
+    invalidResponse('session-events sharedHead cannot exceed throughLedgerHead');
+  }
+  if (!Array.isArray(value.events)) invalidResponse('session-events events must be an array');
+  if (!isHead(nextAfterSeq)) invalidResponse('session-events cursor must be non-negative');
+  if (typeof value.hasMore !== 'boolean') invalidResponse('session-events hasMore must be boolean');
+  if (nextAfterSeq < afterSeq || nextAfterSeq > throughLedgerHead) {
+    invalidResponse('session-events cursor did not progress within the snapshot');
+  }
+  if (value.hasMore && nextAfterSeq <= afterSeq) {
+    invalidResponse('session-events cursor must advance while hasMore is true');
+  }
+
+  let previousSeq = 0;
+  const events = value.events.map((candidate) => {
+    const event = validatePairEvent(candidate, expectedPairId);
+    if (event.seq <= previousSeq) invalidResponse('session-events events must be ascending');
+    if (event.seq > throughLedgerHead) {
+      invalidResponse('event seq cannot exceed throughLedgerHead');
+    }
+    if (event.seq > nextAfterSeq) {
+      invalidResponse('event seq cannot exceed the physical cursor');
+    }
+    previousSeq = event.seq;
+    return event;
+  });
+  if (value.hasMore && nextAfterSeq >= throughLedgerHead) {
+    invalidResponse('session-events cursor cannot have more past the snapshot head');
+  }
+  if (!value.hasMore && nextAfterSeq !== throughLedgerHead) {
+    invalidResponse('session-events terminal cursor must reach throughLedgerHead');
+  }
+  return { ...value, events } as unknown as ListPairSessionEventsResponse;
+}
+
+export async function listPairSessionEvents(
+  fetcher: typeof fetch,
+  apiBase: string,
+  pairId: string,
+  query: ListPairSessionEventsQuery,
+  signal?: AbortSignal,
+): Promise<ListPairSessionEventsResponse> {
+  const url = new URL(pairApiUrl(apiBase, pairId, '/session-events'));
+  url.searchParams.set('afterSeq', String(query.afterSeq));
+  url.searchParams.set('limit', String(query.limit));
+  url.searchParams.set('view', query.view);
+  const response = await fetcher(url.href, { signal });
+  const body = await response.json().catch(() => undefined) as unknown;
+  if (!response.ok) {
+    const message =
+      isRecord(body) && isRecord(body.error) && typeof body.error.message === 'string'
+        ? body.error.message
+        : `Pair Host request failed with HTTP ${response.status}`;
+    throw new Error(message);
+  }
+  return validateListPairSessionEventsResponse(body, pairId, query.afterSeq);
+}
+
+export class LedgerConflictError extends Error {
+  constructor(
+    message: string,
+    readonly expectedLedgerHead: number,
+    readonly actualLedgerHead: number,
+  ) {
+    super(message);
+    this.name = 'LedgerConflictError';
+  }
+}
+
+function validateSendPairMessageResponse(value: unknown): SendPairMessageResponse {
+  if (!isRecord(value)) invalidResponse('message body must be an object');
+  hasExactKeys(
+    value,
+    ['acceptedAtLedgerHead', 'deliveryId', 'delivery'],
+    'message',
+  );
+  if (
+    !isPositiveInteger(value.acceptedAtLedgerHead) ||
+    !isNonEmptyString(value.deliveryId) ||
+    (value.delivery !== 'delivered' && value.delivery !== 'pending')
+  ) {
+    invalidResponse('message body does not match SendPairMessageResponse');
+  }
+  return value as unknown as SendPairMessageResponse;
+}
+
+export async function sendPairMessage(
+  fetcher: typeof fetch,
+  apiBase: string,
+  pairId: string,
+  role: PairRole,
+  input: SendPairMessageRequest,
+  signal?: AbortSignal,
+): Promise<SendPairMessageResponse> {
+  if (role !== 'navigator' && role !== 'pilot') {
+    throw new TypeError('Pair message role must be navigator or pilot');
+  }
+  if (!isNonEmptyString(input.text) || !isHead(input.expectedLedgerHead)) {
+    throw new TypeError('Pair message input is invalid');
+  }
+  const response = await fetcher(pairApiUrl(apiBase, pairId, `/messages/${role}`), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+    signal,
+  });
+  const body = await response.json().catch(() => undefined) as unknown;
+  if (response.status === 409 && isRecord(body) && isRecord(body.error)) {
+    const { error } = body;
+    if (
+      error.code === 'LEDGER_CONFLICT' &&
+      typeof error.message === 'string' &&
+      isRecord(error.details) &&
+      isHead(error.details.expectedLedgerHead) &&
+      isHead(error.details.actualLedgerHead)
+    ) {
+      throw new LedgerConflictError(
+        error.message,
+        error.details.expectedLedgerHead,
+        error.details.actualLedgerHead,
+      );
+    }
+  }
+  if (!response.ok || response.status !== 202) {
+    const message =
+      isRecord(body) && isRecord(body.error) && typeof body.error.message === 'string'
+        ? body.error.message
+        : `Pair Host request failed with HTTP ${response.status}`;
+    throw new Error(message);
+  }
+  return validateSendPairMessageResponse(body);
 }
 
 export function validateGetPairResponse(

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { PairProjection } from '@pair-agent/contracts';
 
 import {
@@ -14,7 +14,9 @@ import {
   type ValidatedPairPane,
 } from './pair-client.js';
 import { PairHeaderView } from './pair-header.js';
+import { PairMessageForm } from './pair-message-form.js';
 import { PairPane } from './pair-pane.js';
+import { SessionEventsDrawer } from './session-events-drawer.js';
 import './styles.css';
 
 export interface PairEventSource {
@@ -26,6 +28,7 @@ export interface PairEventSource {
 
 interface LoadedState {
   readonly kind: 'ready' | 'degraded';
+  readonly pairId: string;
   readonly projection: PairProjection;
   readonly panes: readonly [ValidatedPairPane, ValidatedPairPane];
 }
@@ -92,6 +95,17 @@ export function App({
   const [state, setState] = useState<AppState>(() =>
     startup.ok ? { kind: 'loading' } : { kind: 'error', message: startup.error },
   );
+  const [sessionEventsOpen, setSessionEventsOpen] = useState(false);
+  const sessionEventsButtonRef = useRef<HTMLButtonElement>(null);
+  const sessionEventsIntegrityFaultRef = useRef<string>();
+  const markDegraded = useCallback((reason: string) => {
+    sessionEventsIntegrityFaultRef.current = reason;
+    setState((current) =>
+      current.kind === 'ready' || current.kind === 'degraded'
+        ? { ...current, kind: 'degraded' }
+        : current,
+    );
+  }, []);
 
   useEffect(() => {
     if (!startup.ok) {
@@ -102,6 +116,8 @@ export function App({
     const abortController = new AbortController();
     let active = true;
     let source: PairEventSource | undefined;
+    sessionEventsIntegrityFaultRef.current = undefined;
+    setSessionEventsOpen(false);
     setState({ kind: 'loading' });
 
     void loadPair(
@@ -112,14 +128,14 @@ export function App({
     )
       .then((loaded) => {
         if (!active) return;
-        setState({ kind: 'ready', ...loaded });
+        setState({ kind: 'ready', pairId: startup.pairId, ...loaded });
 
         try {
           source = eventSourceFactory(
             pairApiUrl(startup.apiBase, startup.pairId, '/events'),
           );
         } catch {
-          setState({ kind: 'degraded', ...loaded });
+          setState({ kind: 'degraded', pairId: startup.pairId, ...loaded });
           return;
         }
 
@@ -127,7 +143,13 @@ export function App({
           if (!active) return;
           setState((current) =>
             current.kind === 'ready' || current.kind === 'degraded'
-              ? { ...current, kind: 'ready' }
+              ? {
+                  ...current,
+                  kind:
+                    sessionEventsIntegrityFaultRef.current === undefined
+                      ? 'ready'
+                      : 'degraded',
+                }
               : current,
           );
         };
@@ -196,20 +218,49 @@ export function App({
       </main>
     );
   }
+  if (state.pairId !== startup.pairId) {
+    return <main className="shell-state">Loading Pair projection…</main>;
+  }
 
   return (
     <main className="pair-shell">
-      <PairHeaderView projection={state.projection} connectionState={state.kind} />
+      <PairHeaderView
+        projection={state.projection}
+        connectionState={state.kind}
+        onOpenSessionEvents={() => setSessionEventsOpen(true)}
+        sessionEventsButtonRef={sessionEventsButtonRef}
+      />
       <div className="pair-shell__panes">
         {state.panes.map((pane) => (
           <PairPane
-            key={pane.role}
+            key={`${startup.pairId}:${pane.role}`}
             dshWebOrigin={startup.dshWebOrigin}
             shellOrigin={startup.shellOrigin}
             pane={pane}
+            formSlot={
+              <PairMessageForm
+                key={`${startup.pairId}:${pane.role}:form`}
+                apiBase={startup.apiBase}
+                pairId={startup.pairId}
+                role={pane.role}
+                ledgerHead={state.projection.header.ledgerHead}
+                fetcher={fetcher}
+              />
+            }
           />
         ))}
       </div>
+      <SessionEventsDrawer
+        key={startup.pairId}
+        apiBase={startup.apiBase}
+        pairId={startup.pairId}
+        targetLedgerHead={state.projection.header.ledgerHead}
+        fetcher={fetcher}
+        open={sessionEventsOpen}
+        onClose={() => setSessionEventsOpen(false)}
+        openerRef={sessionEventsButtonRef}
+        onDegraded={markDegraded}
+      />
       <p className="mobile-note">
         Narrow screens stack the two panes for inspection; Phase 0 does not claim a
         product-grade mobile experience.
