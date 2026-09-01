@@ -223,6 +223,93 @@ describe('PairCoordinator durable delivery', () => {
     });
   });
 
+  test('deduplicates a durable peer message by sender Turn identity before retrying delivery', async () => {
+    const identity = 'dsh:pair:pair-commands:navigator:turn:7:peer-message';
+    adapter.onFollowup = async () => {
+      throw new Error('pilot offline');
+    };
+
+    const first = await coordinator
+      .sendPeerMessage({
+        pairId: 'pair-commands',
+        senderRole: 'navigator',
+        senderSessionId: 'pair:pair-commands:navigator',
+        senderTurn: 7,
+        sourceIdentity: identity,
+        text: 'one semantic message',
+        causalRootId: 'pair-commands:2',
+        hop: 1,
+      })
+      .catch((error: unknown) => error);
+
+    expect(first).toBeInstanceOf(DeliveryPendingError);
+    adapter.onFollowup = undefined;
+    await expect(
+      coordinator.sendPeerMessage({
+        pairId: 'pair-commands',
+        senderRole: 'navigator',
+        senderSessionId: 'pair:pair-commands:navigator',
+        senderTurn: 7,
+        sourceIdentity: identity,
+        text: 'one semantic message',
+        causalRootId: 'pair-commands:2',
+        hop: 1,
+      }),
+    ).resolves.toMatchObject({ delivery: 'delivered' });
+
+    const messages = (await store.read('pair-commands')).filter(
+      (event) => event.type === 'agent.message' && event.payload.kind === 'peer-message',
+    );
+    expect(messages).toHaveLength(1);
+    expect(adapter.followups).toHaveLength(2);
+    expect(adapter.followups[0]?.deliveryId).toBe(adapter.followups[1]?.deliveryId);
+  });
+
+  test('fails closed when a sender Turn identity is already owned by a non-canonical event', async () => {
+    const identity = 'dsh:pair:pair-commands:navigator:turn:8:peer-message';
+    const head = (await store.heads('pair-commands')).ledgerHead;
+    await store.append(
+      'pair-commands',
+      {
+        type: 'agent.message',
+        actor: { kind: 'agent', role: 'navigator' },
+        source: 'navigator-session',
+        channel: 'pilot',
+        visibility: 'local',
+        authority: 'navigator',
+        refs: { sourceEventIds: [identity] },
+        payload: {
+          schemaVersion: 1,
+          kind: 'peer-message',
+          text: 'must not deliver',
+          content: [{ type: 'text', text: 'must not deliver' }],
+          causalRootId: 'pair-commands:2',
+          hop: 1,
+        },
+      },
+      head,
+    );
+
+    await expect(
+      coordinator.sendPeerMessage({
+        pairId: 'pair-commands',
+        senderRole: 'navigator',
+        senderSessionId: 'pair:pair-commands:navigator',
+        senderTurn: 8,
+        sourceIdentity: identity,
+        text: 'must not deliver',
+        causalRootId: 'pair-commands:2',
+        hop: 1,
+      }),
+    ).rejects.toBeInstanceOf(InvalidCommandError);
+    expect(adapter.followups).toEqual([]);
+    expect(
+      (await store.read('pair-commands')).filter(
+        (event) => event.refs.sourceEventIds?.includes(identity),
+      ),
+    ).toHaveLength(1);
+  });
+
   test('applies expectedLedgerHead CAS before every command', async () => {
     const actual = (await store.heads('pair-commands')).ledgerHead;
 

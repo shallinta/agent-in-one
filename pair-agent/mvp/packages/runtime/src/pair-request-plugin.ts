@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 
 import {
   canonicalJsonStringify,
+  createPairSessionIds,
   type JsonObject,
   type JsonValue,
   type PairEvent,
@@ -17,6 +18,7 @@ import {
   type RequestLocalSessionLink,
   type SessionEventPairSpanLink,
 } from '@pair-agent/context';
+import { isCanonicalDirectedPeerMessage } from './peer-message-event.js';
 import {
   JsonlPairLedgerStore,
   LedgerConflictError,
@@ -203,7 +205,27 @@ function activeSessionLinkPayload(
 ): Record<string, unknown> | undefined {
   if (event.type !== 'session_event.linked') return undefined;
   const payload = plainRecord(event.payload);
-  return payload?.sessionId === activeSessionId ? payload : undefined;
+  const sessionId = payload?.sessionId;
+  const ids = createPairSessionIds(event.pairId);
+  const role: PairRole | undefined = sessionId === ids.navigatorSessionId
+    ? 'navigator'
+    : sessionId === ids.pilotSessionId
+      ? 'pilot'
+      : undefined;
+  if (
+    payload?.schemaVersion !== 1 ||
+    role === undefined ||
+    event.actor.kind !== 'host' ||
+    event.source !== `${role}-session` ||
+    event.channel !== role ||
+    event.visibility !== 'infrastructure' ||
+    event.authority !== 'host'
+  ) {
+    throw new PairRequestBindingError(
+      `Session link ${pairEventId(event)} has a non-canonical envelope or Session identity`,
+    );
+  }
+  return sessionId === activeSessionId ? payload : undefined;
 }
 
 function isCanonicalTaskAssignment(event: PairEvent): boolean {
@@ -230,18 +252,20 @@ function isCanonicalTaskAssignment(event: PairEvent): boolean {
   );
 }
 
-function isRepresentableSharedEvent(event: PairEvent): boolean {
+function isRepresentableSharedEvent(event: PairEvent, activeRole: PairRole): boolean {
   if (event.visibility !== 'shared') return false;
-  if (isCanonicalTaskAssignment(event)) return true;
+  if (isCanonicalTaskAssignment(event)) return activeRole === 'pilot';
   if (event.channel !== 'navigator' && event.channel !== 'pilot') return false;
   if (event.type === 'user.message') {
     return (
-      event.source === 'pair' ||
-      event.source === `${event.channel}-session`
+      event.channel === activeRole &&
+      (event.source === 'pair' || event.source === `${event.channel}-session`)
     );
   }
   if (event.type === 'agent.message' && event.actor.kind === 'agent') {
+    if (isCanonicalDirectedPeerMessage(event)) return event.channel === activeRole;
     return (
+      event.channel === activeRole &&
       event.source === `${event.actor.role}-session` &&
       event.channel === event.actor.role
     );
@@ -253,6 +277,9 @@ export function persistentSessionLinks(
   pairEvents: readonly PairEvent[],
   activeSessionId: string,
 ): readonly SessionEventPairSpanLink[] {
+  const activeRole: PairRole = activeSessionId.endsWith(':navigator')
+    ? 'navigator'
+    : 'pilot';
   const eventsById = new Map(
     pairEvents.map((event) => [pairEventId(event), event] as const),
   );
@@ -287,7 +314,7 @@ export function persistentSessionLinks(
       represented === undefined ||
       pairEventId(represented) !== representedId ||
       represented.seq >= event.seq ||
-      !isRepresentableSharedEvent(represented)
+      !isRepresentableSharedEvent(represented, activeRole)
     ) {
       throw new PairRequestBindingError(
         `Persisted Session link ${pairEventId(event)} has no earlier canonical represented Pair message`,
@@ -345,6 +372,16 @@ function expectedDeliveryTrigger(event: PairEvent): JsonObject | undefined {
       task: payload.task as JsonObject,
     };
   }
+  if (isCanonicalDirectedPeerMessage(event)) {
+    return {
+      kind: event.type,
+      role: event.channel,
+      text: payload.text as string,
+      pairEventId: pairEventId(event),
+      causalRootId: payload.causalRootId as string,
+      hop: payload.hop as number,
+    };
+  }
   return undefined;
 }
 
@@ -356,6 +393,7 @@ function deliveryTargetRole(event: PairEvent): PairRole | undefined {
     return event.channel;
   }
   if (isCanonicalTaskAssignment(event)) return 'pilot';
+  if (isCanonicalDirectedPeerMessage(event)) return event.channel as PairRole;
   return undefined;
 }
 

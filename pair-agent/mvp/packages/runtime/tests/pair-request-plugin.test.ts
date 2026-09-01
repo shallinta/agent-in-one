@@ -87,6 +87,46 @@ function sharedUserMessage(
   };
 }
 
+function directedPeerMessage(
+  pairId: string,
+  overrides: Partial<PairEvent> = {},
+): PairEvent {
+  return {
+    pairId: parsePairId(pairId),
+    seq: 2,
+    type: 'agent.message',
+    actor: { kind: 'agent', role: 'navigator' },
+    source: 'navigator-session',
+    channel: 'pilot',
+    visibility: 'shared',
+    authority: 'navigator',
+    refs: {
+      sourceEventIds: [`dsh:pair:${pairId}:navigator:turn:1:peer-message`],
+    },
+    payload: {
+      schemaVersion: 1,
+      kind: 'peer-message',
+      text: 'bounded peer input',
+      content: [{ type: 'text', text: 'bounded peer input' }],
+      causalRootId: `${pairId}:root`,
+      hop: 2,
+    },
+    occurredAt: '2026-08-31T00:00:02.000Z',
+    ...overrides,
+  };
+}
+
+function directedPeerTrigger(pairId: string): JsonObject {
+  return {
+    kind: 'agent.message',
+    role: 'pilot',
+    text: 'bounded peer input',
+    pairEventId: `${pairId}:2`,
+    causalRootId: `${pairId}:root`,
+    hop: 2,
+  };
+}
+
 function persistedLink(
   pairId: string,
   sessionId: string,
@@ -359,6 +399,428 @@ describe('PairRequestPlugin request-layout ownership', () => {
 });
 
 describe('PairRequestPlugin exactly-once request projection', () => {
+  test('accepts a canonical directed peer delivery as request-local proof', () => {
+    const pairId = 'pair-peer-delivery-proof';
+    const sessionId = createPairSessionIds(pairId).pilotSessionId;
+    const durableId = `${pairId}:2`;
+    const delivery = createPairDeliveryMessageInput(
+      durableId,
+      directedPeerTrigger(pairId),
+    );
+    const message = {
+      id: 'peer-delivery-message',
+      role: 'user' as const,
+      content: delivery.content,
+      source: delivery.source,
+    };
+
+    const result = rebuild(
+      pairId,
+      [pairCreated(pairId), directedPeerMessage(pairId)],
+      requestPayload(sessionId, message),
+    );
+
+    expect(result.messages.some(({ id }) => id === message.id)).toBe(false);
+    expect(result.manifest.spans).toEqual([
+      expect.objectContaining({
+        messageIds: [message.id],
+        decision: 'excluded',
+        linkedPairEventIds: [durableId],
+      }),
+    ]);
+    expect(result.messages.at(-1)?.content[0]?.text).toBe(
+      `<pair-trigger schema="pair-trigger/v1">\n` +
+      `{"causalRootId":"${pairId}:root","deliveryId":"${durableId}","hop":2,"kind":"agent.message","pairEventId":"${durableId}"}\n` +
+      '</pair-trigger>',
+    );
+  });
+
+  test('accepts only a canonical directed peer event as persistent full-link proof', () => {
+    const pairId = 'pair-peer-persistent-proof';
+    const sessionId = createPairSessionIds(pairId).pilotSessionId;
+    const message = dshUserMessage('peer-linked-message', 'already represented', {
+      kind: 'plugin',
+      plugin: 'pair-agent:delivery-replay',
+    });
+    const link = persistedLink(pairId, sessionId, message.id);
+
+    const result = rebuild(
+      pairId,
+      [pairCreated(pairId), directedPeerMessage(pairId), link],
+      requestPayload(sessionId, message),
+    );
+
+    expect(result.messages.some(({ id }) => id === message.id)).toBe(false);
+    expect(result.manifest.spans).toEqual([
+      expect.objectContaining({
+        decision: 'excluded',
+        linkedPairEventIds: [`${pairId}:2`],
+      }),
+    ]);
+  });
+
+  test('rejects a whitespace-only directed peer event as persistent full-link proof', () => {
+    const pairId = 'pair-peer-whitespace-persistent-proof';
+    const sessionId = createPairSessionIds(pairId).pilotSessionId;
+    const text = '   ';
+    const message = dshUserMessage('peer-linked-whitespace', 'already represented', {
+      kind: 'plugin',
+      plugin: 'pair-agent:delivery-replay',
+    });
+    const durable = directedPeerMessage(pairId, {
+      payload: {
+        schemaVersion: 1,
+        kind: 'peer-message',
+        text,
+        content: [{ type: 'text', text }],
+        causalRootId: `${pairId}:root`,
+        hop: 2,
+      },
+    });
+
+    expect(() =>
+      rebuild(
+        pairId,
+        [pairCreated(pairId), durable, persistedLink(pairId, sessionId, message.id)],
+        requestPayload(sessionId, message),
+      ),
+    ).toThrow(PairRequestBindingError);
+  });
+
+  test('rejects a canonical peer persistent link owned by the non-receiver Session', () => {
+    const pairId = 'pair-peer-wrong-persistent-owner';
+    const sessionId = createPairSessionIds(pairId).navigatorSessionId;
+    const message = dshUserMessage('wrong-owner-message', 'must not deduplicate', {
+      kind: 'plugin',
+      plugin: 'pair-agent:delivery-replay',
+    });
+    const link = persistedLink(pairId, sessionId, message.id);
+
+    expect(() =>
+      rebuild(
+        pairId,
+        [pairCreated(pairId), directedPeerMessage(pairId), link],
+        requestPayload(sessionId, message),
+      ),
+    ).toThrow(PairRequestBindingError);
+  });
+
+  test.each([
+    ['actor', { actor: { kind: 'user' } }],
+    ['source', { source: 'pilot-session' }],
+    ['channel', { channel: 'pilot' }],
+    ['visibility', { visibility: 'shared' }],
+    ['authority', { authority: 'user' }],
+    [
+      'missing payload.schemaVersion',
+      {
+        payload: {
+          sessionId: 'pair:pair-link-envelope:navigator',
+          fromSessionSeq: 1,
+          throughSessionSeq: 1,
+          messageIds: ['linked-message'],
+          pairEventId: 'pair-link-envelope:2',
+          representation: 'full',
+        },
+      },
+    ],
+    [
+      'wrong payload.schemaVersion',
+      {
+        payload: {
+          schemaVersion: 2,
+          sessionId: 'pair:pair-link-envelope:navigator',
+          fromSessionSeq: 1,
+          throughSessionSeq: 1,
+          messageIds: ['linked-message'],
+          pairEventId: 'pair-link-envelope:2',
+          representation: 'full',
+        },
+      },
+    ],
+    [
+      'payload.sessionId',
+      {
+        payload: {
+          schemaVersion: 1,
+          sessionId: 'pair:pair-link-envelope:pilot',
+          fromSessionSeq: 1,
+          throughSessionSeq: 1,
+          messageIds: ['linked-message'],
+          pairEventId: 'pair-link-envelope:2',
+          representation: 'full',
+        },
+      },
+    ],
+  ] as const)(
+    'rejects session_event.linked with mismatched %s envelope or payload',
+    (_name, overrides) => {
+      const pairId = 'pair-link-envelope';
+      const sessionId = createPairSessionIds(pairId).navigatorSessionId;
+      const message = dshUserMessage('linked-message', 'already represented', {
+        kind: 'plugin',
+        plugin: 'pair-agent:linked-history',
+      });
+      const link = persistedLink(pairId, sessionId, message.id, overrides as Partial<PairEvent>);
+
+      expect(() =>
+        rebuild(
+          pairId,
+          [
+            pairCreated(pairId),
+            sharedUserMessage(pairId, sessionId, message.id, 'already represented'),
+            link,
+          ],
+          requestPayload(sessionId, message),
+        ),
+      ).toThrow(PairRequestBindingError);
+    },
+  );
+
+  test.each([
+    ['actor', { actor: { kind: 'host' } }],
+    ['source', { source: 'pilot-session' }],
+    ['authority', { authority: 'pilot' }],
+    ['channel', { channel: 'navigator' }],
+    ['visibility', { visibility: 'local' }],
+    ['sourceEventIds', { refs: {} }],
+    [
+      'sourceEventId binding',
+      {
+        refs: {
+          sourceEventIds: [
+            'dsh:pair:pair-peer-malformed:pilot:turn:1:peer-message',
+          ],
+        },
+      },
+    ],
+    [
+      'payload.kind',
+      {
+        payload: {
+          schemaVersion: 1,
+          kind: 'turn-output',
+          text: 'bounded peer input',
+          content: [{ type: 'text', text: 'bounded peer input' }],
+          completion: 'complete',
+          causalRootId: 'pair-peer-malformed:root',
+          hop: 2,
+        },
+      },
+    ],
+    [
+      'payload.causalRootId',
+      {
+        payload: {
+          schemaVersion: 1,
+          kind: 'peer-message',
+          text: 'bounded peer input',
+          content: [{ type: 'text', text: 'bounded peer input' }],
+          causalRootId: '',
+          hop: 2,
+        },
+      },
+    ],
+    [
+      'payload.hop',
+      {
+        payload: {
+          schemaVersion: 1,
+          kind: 'peer-message',
+          text: 'bounded peer input',
+          content: [{ type: 'text', text: 'bounded peer input' }],
+          causalRootId: 'pair-peer-malformed:root',
+          hop: 5,
+        },
+      },
+    ],
+    [
+      'payload.text',
+      {
+        payload: {
+          schemaVersion: 1,
+          kind: 'peer-message',
+          text: '',
+          content: [{ type: 'text', text: '' }],
+          causalRootId: 'pair-peer-malformed:root',
+          hop: 2,
+        },
+      },
+    ],
+    [
+      'payload UTF-8 byte bound',
+      {
+        payload: {
+          schemaVersion: 1,
+          kind: 'peer-message',
+          text: '🙂'.repeat(16_385),
+          content: [{ type: 'text', text: '🙂'.repeat(16_385) }],
+          causalRootId: 'pair-peer-malformed:root',
+          hop: 2,
+        },
+      },
+    ],
+    [
+      'payload content',
+      {
+        payload: {
+          schemaVersion: 1,
+          kind: 'peer-message',
+          text: 'bounded peer input',
+          content: [{ type: 'text', text: 'different content' }],
+          causalRootId: 'pair-peer-malformed:root',
+          hop: 2,
+        },
+      },
+    ],
+  ] as const)(
+    'rejects directed peer delivery with malformed %s',
+    (_name, overrides) => {
+      const pairId = 'pair-peer-malformed';
+      const sessionId = createPairSessionIds(pairId).pilotSessionId;
+      const durableId = `${pairId}:2`;
+      const delivery = createPairDeliveryMessageInput(
+        durableId,
+        directedPeerTrigger(pairId),
+      );
+      const message = {
+        id: 'peer-delivery-message',
+        role: 'user' as const,
+        content: delivery.content,
+        source: delivery.source,
+      };
+
+      expect(() =>
+        rebuild(
+          pairId,
+          [pairCreated(pairId), directedPeerMessage(pairId, overrides as Partial<PairEvent>)],
+          requestPayload(sessionId, message),
+        ),
+      ).toThrow(PairRequestBindingError);
+    },
+  );
+
+  test('rejects a self-consistent directed peer delivery over the UTF-8 byte bound', () => {
+    const pairId = 'pair-peer-oversized-proof';
+    const sessionId = createPairSessionIds(pairId).pilotSessionId;
+    const durableId = `${pairId}:2`;
+    const text = '🙂'.repeat(16_385);
+    const durable = directedPeerMessage(pairId, {
+      payload: {
+        schemaVersion: 1,
+        kind: 'peer-message',
+        text,
+        content: [{ type: 'text', text }],
+        causalRootId: `${pairId}:root`,
+        hop: 2,
+      },
+    });
+    const delivery = createPairDeliveryMessageInput(durableId, {
+      kind: 'agent.message',
+      role: 'pilot',
+      text,
+      pairEventId: durableId,
+      causalRootId: `${pairId}:root`,
+      hop: 2,
+    });
+    const message = {
+      id: 'oversized-peer-delivery',
+      role: 'user' as const,
+      content: delivery.content,
+      source: delivery.source,
+    };
+
+    expect(() =>
+      rebuild(
+        pairId,
+        [pairCreated(pairId), durable],
+        requestPayload(sessionId, message),
+      ),
+    ).toThrow(PairRequestBindingError);
+  });
+
+  test('rejects a self-consistent whitespace-only directed peer delivery', () => {
+    const pairId = 'pair-peer-whitespace-proof';
+    const sessionId = createPairSessionIds(pairId).pilotSessionId;
+    const durableId = `${pairId}:2`;
+    const text = '   ';
+    const durable = directedPeerMessage(pairId, {
+      payload: {
+        schemaVersion: 1,
+        kind: 'peer-message',
+        text,
+        content: [{ type: 'text', text }],
+        causalRootId: `${pairId}:root`,
+        hop: 2,
+      },
+    });
+    const delivery = createPairDeliveryMessageInput(durableId, {
+      kind: 'agent.message',
+      role: 'pilot',
+      text,
+      pairEventId: durableId,
+      causalRootId: `${pairId}:root`,
+      hop: 2,
+    });
+    const message = {
+      id: 'whitespace-peer-delivery',
+      role: 'user' as const,
+      content: delivery.content,
+      source: delivery.source,
+    };
+
+    expect(() =>
+      rebuild(
+        pairId,
+        [pairCreated(pairId), durable],
+        requestPayload(sessionId, message),
+      ),
+    ).toThrow(PairRequestBindingError);
+  });
+
+  test.each([
+    [
+      'trigger',
+      (delivery: ReturnType<typeof createPairDeliveryMessageInput>) => ({
+        content: delivery.content,
+        source: {
+          ...delivery.source,
+          trigger: { ...directedPeerTrigger('pair-peer-proof-tamper'), hop: 3 },
+        },
+      }),
+    ],
+    [
+      'content',
+      (delivery: ReturnType<typeof createPairDeliveryMessageInput>) => ({
+        content: [{ type: 'text', text: 'tampered peer delivery' }],
+        source: delivery.source,
+      }),
+    ],
+  ] as const)('rejects directed peer delivery with malformed Host %s proof', (_name, mutate) => {
+    const pairId = 'pair-peer-proof-tamper';
+    const sessionId = createPairSessionIds(pairId).pilotSessionId;
+    const durableId = `${pairId}:2`;
+    const delivery = createPairDeliveryMessageInput(
+      durableId,
+      directedPeerTrigger(pairId),
+    );
+    const changed = mutate(delivery);
+    const message = {
+      id: 'peer-delivery-message',
+      role: 'user' as const,
+      content: changed.content,
+      source: changed.source,
+    };
+
+    expect(() =>
+      rebuild(
+        pairId,
+        [pairCreated(pairId), directedPeerMessage(pairId)],
+        requestPayload(sessionId, message as never),
+      ),
+    ).toThrow(PairRequestBindingError);
+  });
+
   test('uses a verified current Pair delivery as request-local proof and emits only a reference trigger', () => {
     const pairId = 'pair-delivery-proof';
     const sessionId = createPairSessionIds(pairId).navigatorSessionId;
@@ -893,7 +1355,7 @@ describe('PairRequestPlugin exactly-once request projection', () => {
     ]);
   });
 
-  test('rejects a persisted link represented by a cross-channel agent.message', () => {
+  test('rejects a persisted link represented by an ordinary cross-channel agent.message', () => {
     const pairId = 'pair-link-cross-channel-agent';
     const ids = createPairSessionIds(pairId);
     const message = dshUserMessage('local-message', 'must remain local', {
@@ -909,11 +1371,10 @@ describe('PairRequestPlugin exactly-once request projection', () => {
       authority: 'pilot',
       payload: {
         schemaVersion: 1,
-        kind: 'peer-message',
+        kind: 'turn-output',
         text: 'peer',
         content: [{ type: 'text', text: 'peer' }],
-        causalRootId: `${pairId}:1`,
-        hop: 1,
+        completion: 'complete',
       },
     };
     const link = persistedLink(pairId, ids.navigatorSessionId, message.id);

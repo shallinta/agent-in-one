@@ -1,6 +1,10 @@
 import {
   type AssignPairTaskRequest,
   assertJsonObject,
+  canonicalJsonStringify,
+  createPairSessionIds,
+  isPeerAgentMessage,
+  MAX_PEER_HOPS,
   parsePairId,
   type DshBuildRef,
   type GetPairResponse,
@@ -59,6 +63,17 @@ export interface SendMessageCommand extends SendPairMessageRequest {
 
 export interface AssignTaskCommand extends AssignPairTaskRequest {
   pairId: string;
+}
+
+export interface SendPeerMessageCommand {
+  readonly pairId: string;
+  readonly senderRole: PairRole;
+  readonly senderSessionId: string;
+  readonly senderTurn: number;
+  readonly sourceIdentity: string;
+  readonly text: string;
+  readonly causalRootId: string;
+  readonly hop: number;
 }
 
 export interface DeliveryResult extends SendPairMessageResponse {
@@ -182,6 +197,102 @@ export class PairCoordinator {
         });
       },
     );
+  }
+
+  async sendPeerMessage(command: SendPeerMessageCommand): Promise<DeliveryResult> {
+    const pairId = parsePairId(command.pairId);
+    const text = validateText(command.text, 'text');
+    const ids = createPairSessionIds(pairId);
+    const expectedSenderSessionId = command.senderRole === 'navigator'
+      ? ids.navigatorSessionId
+      : ids.pilotSessionId;
+    if (command.senderSessionId !== expectedSenderSessionId) {
+      throw new InvalidCommandError('Peer sender Session does not match its Pair role');
+    }
+    if (!Number.isSafeInteger(command.senderTurn) || command.senderTurn <= 0) {
+      throw new InvalidCommandError('Peer sender Turn must be a positive integer');
+    }
+    const expectedSourceIdentity =
+      `dsh:${command.senderSessionId}:turn:${String(command.senderTurn)}:peer-message`;
+    if (command.sourceIdentity !== expectedSourceIdentity) {
+      throw new InvalidCommandError('Peer source identity is not canonical for the sender Turn');
+    }
+    if (typeof command.causalRootId !== 'string' || command.causalRootId.length === 0) {
+      throw new InvalidCommandError('Peer causal root must be non-empty');
+    }
+    if (
+      !Number.isSafeInteger(command.hop) ||
+      command.hop < 1 ||
+      command.hop > MAX_PEER_HOPS
+    ) {
+      throw new InvalidCommandError(`Peer hop must be between 1 and ${MAX_PEER_HOPS}`);
+    }
+
+    const receiverRole: PairRole =
+      command.senderRole === 'navigator' ? 'pilot' : 'navigator';
+    const receiverSessionId = receiverRole === 'navigator'
+      ? ids.navigatorSessionId
+      : ids.pilotSessionId;
+    const source = command.senderRole === 'navigator'
+      ? 'navigator-session' as const
+      : 'pilot-session' as const;
+
+    return this.registry.runDerivedMutation(pairId, async ({ events, appendDerived }) => {
+      const prior = events.filter(
+        (event) => event.refs.sourceEventIds?.includes(command.sourceIdentity),
+      );
+      if (prior.length > 1) {
+        throw new InvalidCommandError(
+          'Peer sender Turn has multiple durable semantic messages',
+        );
+      }
+      const event = prior[0] ?? await appendDerived({
+        type: 'agent.message',
+        actor: { kind: 'agent', role: command.senderRole },
+        source,
+        channel: receiverRole,
+        visibility: 'shared',
+        authority: command.senderRole,
+        refs: { sourceEventIds: [command.sourceIdentity] },
+        payload: {
+          schemaVersion: 1,
+          kind: 'peer-message',
+          text,
+          content: [{ type: 'text', text }],
+          causalRootId: command.causalRootId,
+          hop: command.hop,
+        },
+      });
+      if (
+        !isPeerAgentMessage(event) ||
+        event.type !== 'agent.message' ||
+        event.actor.kind !== 'agent' ||
+        event.actor.role !== command.senderRole ||
+        event.source !== source ||
+        event.channel !== receiverRole ||
+        event.visibility !== 'shared' ||
+        event.authority !== command.senderRole ||
+        event.refs.sourceEventIds?.length !== 1 ||
+        event.payload.kind !== 'peer-message' ||
+        event.payload.text !== text ||
+        canonicalJsonStringify(event.payload.content) !==
+          canonicalJsonStringify([{ type: 'text', text }]) ||
+        event.payload.causalRootId !== command.causalRootId ||
+        event.payload.hop !== command.hop
+      ) {
+        throw new InvalidCommandError(
+          'Peer sender Turn already owns a different durable semantic message',
+        );
+      }
+      return this.#deliver(pairId, receiverSessionId, event, {
+        kind: 'agent.message',
+        role: receiverRole,
+        text,
+        pairEventId: pairEventId(event),
+        causalRootId: command.causalRootId,
+        hop: command.hop,
+      });
+    });
   }
 
   subscribe(pairId: string, listener: PairProjectionListener): () => void {

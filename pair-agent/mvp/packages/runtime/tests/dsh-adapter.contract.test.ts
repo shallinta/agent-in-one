@@ -613,7 +613,14 @@ describe('DshPairAgentAdapter real-runtime contract', () => {
     const requests = runtime.adapter.captureRequests();
     expect(requests).toHaveLength(2);
     expect(requests[0]?.tools).toEqual([
-      expect.objectContaining({ name: 'echo' }),
+      {
+        name: 'echo',
+        description: 'Echo text without side effects.',
+        parameters: {
+          type: 'object',
+          properties: { text: { type: 'string' } },
+        },
+      },
     ]);
     expect(JSON.stringify(requests[0]?.messages)).toContain('<pair-trigger');
     expect(JSON.stringify(requests[1]?.messages)).not.toContain('<pair-trigger');

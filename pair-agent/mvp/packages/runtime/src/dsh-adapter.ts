@@ -30,6 +30,12 @@ import {
   type PairRequestMaterialEntry,
 } from './request-material-registry.js';
 import { PairDerivedEventWriter } from './pair-derived-event-writer.js';
+import type {
+  PeerMessageExecutionPort,
+  PeerMessageServiceContext,
+  PeerMessageToolExecutionContext,
+  PeerMessageTurnProvenance,
+} from './peer-message.js';
 import type { DshSessionEvent } from './session-event-derive.js';
 import {
   SessionToPairBridge,
@@ -170,7 +176,15 @@ interface VerifiedDshModules {
     name: string;
     description: string;
     parameters: JsonObject;
-    execute(args: JsonObject): Promise<readonly JsonObject[]>;
+    execute(
+      args: JsonObject,
+      context: {
+        readonly agent?: { readonly id: string };
+        readonly callId: string;
+        readonly rootCallId: string;
+        readonly signal: AbortSignal;
+      },
+    ): Promise<readonly JsonObject[]>;
   }) => DshRegisteredToolDefinition;
   readonly LlmAdapter: DshLlmAdapterConstructor;
   readonly createUserMessage: (input: {
@@ -256,7 +270,17 @@ export interface DshPairToolDefinition {
   readonly name: string;
   readonly description: string;
   readonly parameters: JsonObject;
-  execute(args: JsonObject): Promise<readonly JsonObject[]>;
+  execute(
+    args: JsonObject,
+    context: DshPairToolExecutionContext,
+  ): Promise<readonly JsonObject[]>;
+}
+
+export interface DshPairToolExecutionContext {
+  readonly agentId?: string;
+  readonly callId: string;
+  readonly rootCallId: string;
+  readonly signal: AbortSignal;
 }
 
 export interface OpenAiCompletionsProviderOptions {
@@ -879,7 +903,7 @@ export function validatePairRequestCoordinates(
   return requests;
 }
 
-export class DshPairAgentAdapter implements AgentAdapter {
+export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPort {
   readonly closeOwnsHandles = true as const;
   readonly #handles = new Map<string, DshOwnedAgentHandle>();
   readonly #pairHandles = new WeakMap<PairAgentHandle, DshOwnedAgentHandle>();
@@ -959,9 +983,50 @@ export class DshPairAgentAdapter implements AgentAdapter {
     ownsContext: boolean,
   ): Promise<DshPairAgentAdapter> {
     assertExactToolCatalog(context.tools.schemas(), [], 'pre-registration');
-    const definitions = (options.tools ?? []).map((tool) =>
-      modules.defineContentToolFixture(tool),
-    );
+    const definitions = (options.tools ?? []).map((tool) => {
+      const properties = jsonRecord(tool.parameters.properties);
+      const required = Array.isArray(tool.parameters.required)
+        ? new Set(tool.parameters.required)
+        : undefined;
+      const fixtureParameters =
+        tool.parameters.type === 'object' && properties !== undefined
+          ? Object.fromEntries(
+              Object.entries(properties).map(([name, value]) => {
+                const schema = jsonRecord(value) ?? {};
+                const {
+                  minLength: _minLength,
+                  maxLength: _maxLength,
+                  ...fixtureSchema
+                } = schema;
+                return [
+                  name,
+                  {
+                    ...fixtureSchema,
+                    ...(required?.has(name) === true ? { required: true } : {}),
+                  },
+                ];
+              }),
+            ) as JsonObject
+          : tool.parameters;
+      const definition = modules.defineContentToolFixture({
+        name: tool.name,
+        description: tool.description,
+        parameters: fixtureParameters,
+        execute: (args, execution) => tool.execute(args, {
+          ...(execution.agent === undefined
+            ? {}
+            : { agentId: execution.agent.id }),
+          callId: execution.callId,
+          rootCallId: execution.rootCallId,
+          signal: execution.signal,
+        }),
+      });
+      return tool.parameters.type === 'object' && properties !== undefined
+        ? Object.assign(definition, {
+            parameters: structuredClone(tool.parameters),
+          })
+        : definition;
+    });
     const expectedToolSchemas = definitions.map(({ name, description, parameters }) => ({
       name,
       description,
@@ -1113,6 +1178,126 @@ export class DshPairAgentAdapter implements AgentAdapter {
 
   preparePairAgent(input: PreparePairAgentInput): Promise<PreparedPairAgent> {
     return this.#prepare(input, false);
+  }
+
+  activeContext(
+    execution: PeerMessageToolExecutionContext,
+  ): PeerMessageServiceContext {
+    const agentId = execution.agentId;
+    if (agentId === undefined || agentId.length === 0) {
+      throw new PairRequestBindingError(
+        'Peer Message tool execution lacks an active DSH Agent identity',
+      );
+    }
+    const binding = this.#bindings.get(agentId);
+    const handle = this.#handles.get(agentId);
+    if (
+      binding === undefined ||
+      handle === undefined ||
+      handle.agent.id !== agentId ||
+      handle.agent.session.id !== agentId
+    ) {
+      throw new PairRequestBindingError(
+        'Peer Message tool Agent does not match an active Pair Session binding',
+      );
+    }
+    const turn = this.#openTurn(handle.agent.session);
+    return { agentId, sessionId: handle.agent.session.id, turn };
+  }
+
+  async turnProvenance(
+    context: PeerMessageServiceContext,
+  ): Promise<PeerMessageTurnProvenance> {
+    if (context.agentId !== context.sessionId) {
+      throw new PairRequestBindingError(
+        'Peer Message Agent and Session identities diverged',
+      );
+    }
+    const binding = this.#bindings.get(context.sessionId);
+    const handle = this.#handles.get(context.sessionId);
+    if (
+      binding === undefined ||
+      handle === undefined ||
+      handle.agent.id !== context.agentId ||
+      handle.agent.session.id !== context.sessionId ||
+      this.#openTurn(handle.agent.session) !== context.turn
+    ) {
+      throw new PairRequestBindingError(
+        'Peer Message context is not the active open Pair Session Turn',
+      );
+    }
+    await this.#requireBridge().whenCaughtUp([context.sessionId]);
+    const caughtUpBinding = this.#bindings.get(context.sessionId);
+    const caughtUpHandle = this.#handles.get(context.sessionId);
+    if (
+      caughtUpBinding === undefined ||
+      caughtUpHandle === undefined ||
+      caughtUpBinding.pairId !== binding.pairId ||
+      caughtUpBinding.role !== binding.role ||
+      caughtUpHandle !== handle ||
+      caughtUpHandle.agent.id !== context.agentId ||
+      caughtUpHandle.agent.session.id !== context.sessionId ||
+      this.#openTurn(caughtUpHandle.agent.session) !== context.turn
+    ) {
+      throw new PairRequestBindingError(
+        'Peer Message context changed while awaiting durable Pair provenance',
+      );
+    }
+    const pairEvents = await this.options.store.read(binding.pairId);
+    const byId = new Map<string, PairEvent>(
+      pairEvents.map((event) => [`${event.pairId}:${String(event.seq)}`, event] as const),
+    );
+    const startIndex = handle.agent.session.events.findLastIndex((event) => {
+      const data = jsonRecord(event.data);
+      return event.type === 'turn/start' && data?.turn === context.turn;
+    });
+    if (startIndex < 0) {
+      throw new PairRequestBindingError('Peer Message open Turn start is not durable');
+    }
+    const pairEventIds = new Set<string>();
+    for (const event of handle.agent.session.events.slice(startIndex + 1)) {
+      if (event.type !== 'user/message') continue;
+      const data = jsonRecord(event.data);
+      const source = jsonRecord(data?.source);
+      if (
+        source?.kind === 'plugin' &&
+        source.plugin === 'pair-agent:delivery' &&
+        typeof source.pairEventId === 'string'
+      ) {
+        pairEventIds.add(source.pairEventId);
+      }
+    }
+    for (const event of pairEvents) {
+      if (event.type !== 'user.message') continue;
+      const payload = jsonRecord(event.payload);
+      const origin = jsonRecord(payload?.origin);
+      if (
+        origin?.sessionId === context.sessionId &&
+        origin.turn === context.turn &&
+        event.channel === binding.role
+      ) {
+        pairEventIds.add(`${event.pairId}:${String(event.seq)}`);
+      }
+    }
+    const inputEvents = [...pairEventIds].map((id) => {
+      const event = byId.get(id);
+      if (event === undefined) {
+        throw new PairRequestBindingError(
+          `Peer Message Turn input ${id} is absent from the durable Pair Ledger`,
+        );
+      }
+      return event;
+    });
+    if (inputEvents.length === 0) {
+      throw new PairRequestBindingError(
+        'Peer Message open Turn has no durable Pair input provenance',
+      );
+    }
+    return {
+      pairId: binding.pairId,
+      senderRole: binding.role,
+      inputEvents,
+    };
   }
 
   resumePairAgent(input: PreparePairAgentInput): Promise<PreparedPairAgent> {
@@ -1924,6 +2109,27 @@ export class DshPairAgentAdapter implements AgentAdapter {
       );
     }
     return this.#bridge;
+  }
+
+  #openTurn(session: DshSession): number {
+    const start = session.events.findLast((event) => event.type === 'turn/start');
+    const data = jsonRecord(start?.data);
+    const turn = data?.turn;
+    if (!Number.isSafeInteger(turn) || (turn as number) <= 0) {
+      throw new PairRequestBindingError(
+        'Peer Message tool execution is outside an open DSH Turn',
+      );
+    }
+    const ended = session.events.some((event) => {
+      const end = jsonRecord(event.data);
+      return event.type === 'turn/end' && end?.turn === turn;
+    });
+    if (ended) {
+      throw new PairRequestBindingError(
+        'Peer Message tool execution references a closed DSH Turn',
+      );
+    }
+    return turn as number;
   }
 
   #assertToolCatalog(scope?: unknown): void {
