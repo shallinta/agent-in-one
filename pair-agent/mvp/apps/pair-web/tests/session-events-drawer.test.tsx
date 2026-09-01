@@ -57,9 +57,11 @@ function Harness({
   onDegraded?: (reason: string) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [connectionState, setConnectionState] = useState<'ready' | 'degraded'>('ready');
   const openerRef = useRef<HTMLButtonElement>(null);
   return (
     <>
+      <span role="status" aria-label="Host connection status">{connectionState}</span>
       <button ref={openerRef} onClick={() => setOpen(true)}>Session Events</button>
       <SessionEventsDrawer
         apiBase="https://pair.example"
@@ -69,7 +71,10 @@ function Harness({
         open={open}
         onClose={() => setOpen(false)}
         openerRef={openerRef}
-        onDegraded={onDegraded}
+        onDegraded={(reason) => {
+          setConnectionState('degraded');
+          onDegraded(reason);
+        }}
       />
     </>
   );
@@ -178,6 +183,49 @@ describe('SessionEventsDrawer', () => {
 
     expect(await screen.findByText('Readable message 4')).toBeInTheDocument();
     expect(new URL(String(fetcher.mock.calls[1]![0])).searchParams.get('afterSeq')).toBe('3');
+  });
+
+  test('keeps the bounded page cap local and resumes from its physical cursor after reopen', async () => {
+    const onDegraded = vi.fn();
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const afterSeq = Number(new URL(String(input)).searchParams.get('afterSeq'));
+      const nextAfterSeq = afterSeq + 1;
+      return response(
+        page([pairEvent(nextAfterSeq)], nextAfterSeq, {
+          hasMore: nextAfterSeq < 65,
+          throughLedgerHead: 65,
+          sharedHead: 65,
+        }),
+      );
+    });
+    render(
+      <Harness
+        targetLedgerHead={65}
+        fetcher={fetcher}
+        onDegraded={onDegraded}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Session Events' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/bounded page limit/i);
+    expect(fetcher).toHaveBeenCalledTimes(64);
+    expect(onDegraded).not.toHaveBeenCalled();
+    expect(screen.getByRole('status', { name: 'Host connection status' })).toHaveTextContent(
+      'ready',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close session events' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Session Events' }));
+
+    expect(await screen.findByText('Readable message 65')).toBeInTheDocument();
+    expect(new URL(String(fetcher.mock.calls[64]![0])).searchParams.get('afterSeq')).toBe(
+      '64',
+    );
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(onDegraded).not.toHaveBeenCalled();
+    expect(screen.getByRole('status', { name: 'Host connection status' })).toHaveTextContent(
+      'ready',
+    );
   });
 
   test.each([

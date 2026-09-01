@@ -189,7 +189,7 @@ export function SessionEventsDrawer({
           setHasMore(more);
           if (cursor >= targetLedgerHead || !more) break;
           if (pageIndex === MAX_CATCH_UP_PAGES - 1) {
-            degrade('Session Events catch-up exceeded the bounded page limit.');
+            setError('Session Events catch-up exceeded the bounded page limit.');
           }
         }
       } catch (caught) {
