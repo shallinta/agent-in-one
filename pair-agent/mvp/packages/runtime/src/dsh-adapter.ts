@@ -16,7 +16,10 @@ import {
   type PairId,
   type PairRole,
 } from '@pair-agent/contracts';
-import type { CommonSystemDefinition } from '@pair-agent/context';
+import {
+  assertContentAddressedPairPrompt,
+  type CommonSystemDefinition,
+} from '@pair-agent/context';
 import { JsonlPairLedgerStore } from '@pair-agent/ledger';
 
 import {
@@ -364,6 +367,32 @@ export interface DshPairAgentAdapterOptions {
     /** Simulates an unexpected future global DSH tool in capture tests. */
     readonly hostedExtraTool?: DshPairToolDefinition;
   };
+}
+
+const DEFAULT_ROLE_TOOL_GUIDANCE: Readonly<Record<PairRole, string>> = {
+  navigator: 'Clarify and govern the Pair goal; do not perform Pilot work.',
+  pilot: 'Execute the delegated task; escalate goal-changing decisions.',
+};
+
+function resolveRoleToolGuidance(
+  options: DshPairAgentAdapterOptions,
+): Readonly<Record<PairRole, string>> {
+  return options.roleToolGuidance ?? DEFAULT_ROLE_TOOL_GUIDANCE;
+}
+
+function validatePromptBundle(options: DshPairAgentAdapterOptions): void {
+  if (
+    options.commonSystem.version.startsWith('pair-prompt/sha256:') &&
+    options.roleToolGuidance === undefined
+  ) {
+    throw new Error(
+      'Prompt bundle identity mismatch: explicit roleToolGuidance is required',
+    );
+  }
+  assertContentAddressedPairPrompt({
+    commonSystem: options.commonSystem,
+    roleToolGuidance: resolveRoleToolGuidance(options),
+  });
 }
 
 export interface DshPairWebRuntimeOptions
@@ -989,6 +1018,7 @@ export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPo
   static async create(
     options: DshPairAgentAdapterOptions,
   ): Promise<DshPairAgentAdapter> {
+    validatePromptBundle(options);
     if (!isAbsolute(options.sessionRoot)) {
       throw new TypeError('DSH sessionRoot must be an explicit absolute path');
     }
@@ -1115,11 +1145,7 @@ export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPo
         },
       });
     }
-    const roleToolGuidance =
-      options.roleToolGuidance ?? {
-        navigator: 'Clarify and govern the Pair goal; do not perform Pilot work.',
-        pilot: 'Execute the delegated task; escalate goal-changing decisions.',
-      };
+    const roleToolGuidance = resolveRoleToolGuidance(options);
     const proposedConfig = {
       provider: options.provider,
       model: options.model,
@@ -1165,6 +1191,7 @@ export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPo
     modules: VerifiedDshModules,
     context: DshContext,
   ): Promise<DshPairAgentAdapter> {
+    validatePromptBundle(options);
     if (!isAbsolute(options.sessionRoot)) {
       throw new TypeError('DSH sessionRoot must be an explicit absolute path');
     }

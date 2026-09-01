@@ -16,6 +16,7 @@ import {
 } from '../../packages/runtime/src/index.js';
 import { createPairHostServer } from '../../apps/pair-host/src/server.js';
 import { afterEach, describe, expect, test } from 'vitest';
+import { P05_PAIR_PROMPT } from '../../scripts/pair-prompt.js';
 import { closeBestEffort, pairWebRuntimeDefines } from '../../scripts/runtime-utils.js';
 
 const roots: string[] = [];
@@ -338,7 +339,8 @@ describe('Pair Agent Phase 0 live DSH Web composition', () => {
       source: { derivedRoot: dshRoot, lockPath: dshLockPath },
       dataRoot,
       store,
-      commonSystem,
+      commonSystem: P05_PAIR_PROMPT.commonSystem,
+      roleToolGuidance: P05_PAIR_PROMPT.roleToolGuidance,
       provider: 'openai-completions',
       model: 'capture-model',
       capture: {
@@ -552,6 +554,28 @@ describe('Pair Agent Phase 0 live DSH Web composition', () => {
         },
       ].sort((left, right) => left.name.localeCompare(right.name));
       expect(runtime.adapter.captureRequests()).toHaveLength(4);
+      const navigatorRequest = runtime.adapter.captureRequests().find(
+        (request) => request.sessionId === ids.navigatorSessionId,
+      );
+      const pilotRequest = runtime.adapter.captureRequests().find(
+        (request) => request.sessionId === ids.pilotSessionId,
+      );
+      expect(navigatorRequest?.system).toBe(P05_PAIR_PROMPT.commonSystem.content);
+      expect(pilotRequest?.system).toBe(P05_PAIR_PROMPT.commonSystem.content);
+      const navigatorMessageText = navigatorRequest?.messages
+        .flatMap((message) => message.content)
+        .map((content) => typeof content.text === 'string' ? content.text : '')
+        .join('\n');
+      const pilotMessageText = pilotRequest?.messages
+        .flatMap((message) => message.content)
+        .map((content) => typeof content.text === 'string' ? content.text : '')
+        .join('\n');
+      expect(navigatorMessageText).toContain(
+        JSON.stringify({ text: P05_PAIR_PROMPT.roleToolGuidance.navigator }),
+      );
+      expect(pilotMessageText).toContain(
+        JSON.stringify({ text: P05_PAIR_PROMPT.roleToolGuidance.pilot }),
+      );
       for (const request of runtime.adapter.captureRequests()) {
         expect(request.tools).toEqual(expectedTools);
       }
@@ -574,7 +598,8 @@ describe('Pair Agent Phase 0 live DSH Web composition', () => {
       source: { derivedRoot: dshRoot, lockPath: dshLockPath },
       dataRoot,
       store: resumedStore,
-      commonSystem,
+      commonSystem: P05_PAIR_PROMPT.commonSystem,
+      roleToolGuidance: P05_PAIR_PROMPT.roleToolGuidance,
       provider: 'openai-completions',
       model: 'capture-model',
       capture: { responses: [] },

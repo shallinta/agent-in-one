@@ -15,6 +15,7 @@ import {
 } from '../packages/runtime/src/index.js';
 
 import { readPhase0DevConfig } from './dev-config.js';
+import { P05_PAIR_PROMPT } from './pair-prompt.js';
 import { closeP05DevComposition, pairWebRuntimeDefines } from './runtime-utils.js';
 
 const mvpRoot = fileURLToPath(new URL('..', import.meta.url));
@@ -86,14 +87,8 @@ export async function runPhase0Dev(environment: NodeJS.ProcessEnv = process.env)
       },
       dataRoot: config.dataRoot,
       store,
-      commonSystem: {
-        version: 'pair-prompt/v1',
-        content: [
-          'You are one member of a Pair Agent.',
-          'Navigator owns goal clarification and Pilot owns delegated execution.',
-          'The active role is supplied by a later active-role reminder.',
-        ].join('\n'),
-      },
+      commonSystem: P05_PAIR_PROMPT.commonSystem,
+      roleToolGuidance: P05_PAIR_PROMPT.roleToolGuidance,
       provider: 'openai-completions',
       model: config.provider.model,
       ...(config.provider.kind === 'capture'

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 import { createPairSessionIds, type DshBuildRef } from '@pair-agent/contracts';
+import { createContentAddressedPairPrompt } from '@pair-agent/context';
 import { JsonlPairLedgerStore, LedgerConflictError } from '@pair-agent/ledger';
 import { afterEach, describe, expect, test } from 'vitest';
 
@@ -144,6 +145,38 @@ async function createRuntime(
 }
 
 describe('DshPairAgentAdapter real-runtime contract', () => {
+  test('rejects actual Prompt material that disagrees with its bundle identity', async () => {
+    const dataRoot = await temporaryRoot('prompt-bundle-mismatch');
+    const bundle = createContentAddressedPairPrompt({
+      commonSystem: 'PAIR SESSION IDENTITY\ncontract',
+      roleToolGuidance: {
+        navigator: 'navigator guidance',
+        pilot: 'pilot guidance',
+      },
+    });
+    const outcome = await launchDshPairWebRuntime({
+      source: { derivedRoot: dshRoot, lockPath: dshLockPath },
+      dataRoot,
+      store: new JsonlPairLedgerStore(join(dataRoot, 'pairs')),
+      commonSystem: bundle.commonSystem,
+      provider: 'openai-completions',
+      model: 'capture-model',
+      capture: { responses: [] },
+      web: { host: '127.0.0.1', port: 0 },
+    }).then(
+      async (runtime) => {
+        await runtime.close();
+        return { kind: 'resolved' as const };
+      },
+      (error: unknown) => ({ kind: 'rejected' as const, error }),
+    );
+
+    expect(outcome.kind).toBe('rejected');
+    if (outcome.kind === 'rejected') {
+      expect(String(outcome.error)).toContain('Prompt bundle identity mismatch');
+    }
+  }, 60_000);
+
   test('passes DeepSeek reasoning_content back on the tool continuation request', async () => {
     const pairId = 'pair-deepseek-reasoning-continuation';
     const ids = createPairSessionIds(pairId);
