@@ -331,6 +331,8 @@ export interface OpenAiCompletionsProviderOptions {
   readonly apiKeyEnv: string;
   readonly contextWindow: number;
   readonly maxTokens: number;
+  /** Explicit wire-compatibility contract for a private Chat Completions endpoint. */
+  readonly compatibility?: 'openai' | 'deepseek';
 }
 
 export interface DshPairAgentAdapterOptions {
@@ -1095,7 +1097,18 @@ export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPo
                 contextWindow: options.openai.contextWindow,
                 maxTokens: options.openai.maxTokens,
                 input: ['text'],
-                reasoningEfforts: false,
+                ...(options.openai.compatibility === 'deepseek'
+                  ? {
+                      reasoningEfforts: { high: 'high', max: 'max' },
+                      compat: {
+                        supportsStore: false,
+                        supportsDeveloperRole: false,
+                        supportsReasoningEffort: false,
+                        requiresReasoningContentOnAssistantMessages: true,
+                        thinkingFormat: 'deepseek',
+                      },
+                    }
+                  : { reasoningEfforts: false }),
               },
             ],
           },

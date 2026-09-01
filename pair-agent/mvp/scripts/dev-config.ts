@@ -18,6 +18,7 @@ export interface Phase0DevConfig {
         readonly apiKeyEnv: string;
         readonly contextWindow: number;
         readonly maxTokens: number;
+        readonly compatibility: 'openai' | 'deepseek';
       };
 }
 
@@ -44,6 +45,20 @@ function positiveInteger(
     throw new TypeError(`${name} must be a positive integer`);
   }
   return Number(raw);
+}
+
+function openAiCompatibility(
+  environment: NodeJS.ProcessEnv,
+  model: string,
+): 'openai' | 'deepseek' {
+  const configured = environment.PAIR_OPENAI_COMPATIBILITY;
+  if (configured === undefined || configured === '') {
+    return model.toLowerCase().startsWith('deepseek-') ? 'deepseek' : 'openai';
+  }
+  if (configured !== 'openai' && configured !== 'deepseek') {
+    throw new TypeError('PAIR_OPENAI_COMPATIBILITY must be openai or deepseek');
+  }
+  return configured;
 }
 
 export function readPhase0DevConfig(environment: NodeJS.ProcessEnv): Phase0DevConfig {
@@ -103,6 +118,7 @@ export function readPhase0DevConfig(environment: NodeJS.ProcessEnv): Phase0DevCo
       apiKeyEnv: providerFields[2]!,
       contextWindow: positiveInteger(environment, 'PAIR_OPENAI_CONTEXT_WINDOW', 128_000),
       maxTokens: positiveInteger(environment, 'PAIR_OPENAI_MAX_TOKENS', 4_096),
+      compatibility: openAiCompatibility(environment, providerFields[1]!),
     },
   };
 }

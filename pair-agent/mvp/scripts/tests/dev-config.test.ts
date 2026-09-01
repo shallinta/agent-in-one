@@ -21,6 +21,27 @@ describe('Phase 0 dev configuration', () => {
       .toThrow(/absolute/);
   });
 
+  test('selects DeepSeek wire compatibility for DeepSeek models and allows an explicit override', () => {
+    const base = {
+      PAIR_OPENAI_BASE_URL: 'https://example.test/v1',
+      PAIR_OPENAI_API_KEY_ENV: 'PAIR_TEST_KEY',
+    };
+    expect(readPhase0DevConfig({
+      ...base,
+      PAIR_OPENAI_MODEL: 'deepseek-v4-flash',
+    }).provider).toMatchObject({ compatibility: 'deepseek' });
+    expect(readPhase0DevConfig({
+      ...base,
+      PAIR_OPENAI_MODEL: 'deepseek-v4-flash',
+      PAIR_OPENAI_COMPATIBILITY: 'openai',
+    }).provider).toMatchObject({ compatibility: 'openai' });
+    expect(() => readPhase0DevConfig({
+      ...base,
+      PAIR_OPENAI_MODEL: 'deepseek-v4-flash',
+      PAIR_OPENAI_COMPATIBILITY: 'unknown',
+    })).toThrow(/PAIR_OPENAI_COMPATIBILITY/);
+  });
+
   test('rejects duplicate, privileged, fractional, and out-of-range ports', () => {
     expect(() => readPhase0DevConfig({ PAIR_WEB_PORT: '3080' })).toThrow(/distinct/);
     expect(() => readPhase0DevConfig({ DSH_WEB_PORT: '80' })).toThrow(/1024/);

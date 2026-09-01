@@ -89,7 +89,7 @@ export PAIR_OPENAI_API_KEY_ENV='OPENAI_API_KEY'
 corepack pnpm@11.7.0 dev
 ```
 
-可选 `PAIR_OPENAI_CONTEXT_WINDOW`（默认 `128000`）和 `PAIR_OPENAI_MAX_TOKENS`（默认 `4096`）。MVP 始终使用本地 Session 重建 continuation，不发送 Provider stateful continuation ID。
+可选 `PAIR_OPENAI_CONTEXT_WINDOW`（默认 `128000`）、`PAIR_OPENAI_MAX_TOKENS`（默认 `4096`）和 `PAIR_OPENAI_COMPATIBILITY`（`openai` 或 `deepseek`）。兼容模式默认根据 model ID 选择：`deepseek-*` 使用 `deepseek`，其他 model 使用 `openai`；私有网关的模型命名与其 wire protocol 不一致时应显式设置。DeepSeek 模式会按 thinking + tool continuation 规则回传 `reasoning_content`。MVP 始终使用本地 Session 重建 continuation，不发送 Provider stateful continuation ID。
 
 ## 4. 界面中能看到什么
 

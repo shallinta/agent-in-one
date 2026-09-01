@@ -1,4 +1,5 @@
 import { mkdir, readFile, realpath, rm, writeFile, mkdtemp } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -143,6 +144,141 @@ async function createRuntime(
 }
 
 describe('DshPairAgentAdapter real-runtime contract', () => {
+  test('passes DeepSeek reasoning_content back on the tool continuation request', async () => {
+    const pairId = 'pair-deepseek-reasoning-continuation';
+    const ids = createPairSessionIds(pairId);
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on('data', (chunk: Buffer) => chunks.push(chunk));
+      request.on('end', () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
+        requestBodies.push(body);
+        const messages = body.messages as Array<Record<string, unknown>>;
+        if (requestBodies.length === 3) {
+          const toolCall = messages.find((message) =>
+            message.role === 'assistant' && Array.isArray(message.tool_calls),
+          );
+          const everyAssistantHasReasoningContent = messages
+            .filter((message) => message.role === 'assistant')
+            .every((message) => Object.hasOwn(message, 'reasoning_content'));
+          if (
+            toolCall?.reasoning_content !== 'Need the echo tool.' ||
+            !everyAssistantHasReasoningContent
+          ) {
+            response.writeHead(400, { 'content-type': 'application/json' });
+            response.end(JSON.stringify({
+              error: {
+                message: 'The `reasoning_content` in the thinking mode must be passed back to the API.',
+                type: 'invalid_request_error',
+                code: 'invalid_request_error',
+              },
+            }));
+            return;
+          }
+        }
+
+        response.writeHead(200, {
+          'content-type': 'text/event-stream',
+          connection: 'keep-alive',
+          'cache-control': 'no-cache',
+        });
+        const send = (value: unknown) => response.write(`data: ${JSON.stringify(value)}\n\n`);
+        const envelope = (delta: Record<string, unknown>, finishReason: string | null) => ({
+          id: `response-${requestBodies.length}`,
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: 'deepseek-v4-flash',
+          choices: [{ index: 0, delta, finish_reason: finishReason }],
+        });
+        if (requestBodies.length === 1) {
+          send(envelope({ role: 'assistant', content: 'First answer without thinking.' }, null));
+          send(envelope({}, 'stop'));
+        } else if (requestBodies.length === 2) {
+          send(envelope({ role: 'assistant', content: null, reasoning_content: '' }, null));
+          send(envelope({ content: null, reasoning_content: 'Need the echo tool.' }, null));
+          send(envelope({
+            tool_calls: [{
+              index: 0,
+              id: 'call-reasoning-1',
+              type: 'function',
+              function: { name: 'echo', arguments: '{"text":"hello"}' },
+            }],
+          }, null));
+          send(envelope({}, 'tool_calls'));
+        } else {
+          send(envelope({ role: 'assistant', content: 'Continuation completed.' }, null));
+          send(envelope({}, 'stop'));
+        }
+        response.write('data: [DONE]\n\n');
+        response.end();
+      });
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+    const address = server.address();
+    if (address === null || typeof address === 'string') throw new Error('test server did not bind TCP');
+    const apiKeyEnv = 'PAIR_AGENT_TEST_DEEPSEEK_REASONING_KEY';
+    const priorKey = process.env[apiKeyEnv];
+    process.env[apiKeyEnv] = 'test-key';
+
+    const store = new JsonlPairLedgerStore(await temporaryRoot('deepseek-reasoning-ledger'));
+    const adapter = await DshPairAgentAdapter.create({
+      source: { derivedRoot: dshRoot, lockPath: dshLockPath },
+      store,
+      sessionRoot: await temporaryRoot('deepseek-reasoning-sessions'),
+      commonSystem,
+      provider: 'openai-completions',
+      model: 'deepseek-v4-flash',
+      openai: {
+        baseURL: `http://127.0.0.1:${address.port}/v1`,
+        apiKeyEnv,
+        contextWindow: 128_000,
+        maxTokens: 4_096,
+        compatibility: 'deepseek',
+      },
+      tools: [{
+        name: 'echo',
+        description: 'Echo text without side effects.',
+        parameters: { text: { type: 'string' } },
+        async execute(args: Record<string, unknown>) {
+          return [{ type: 'text', text: `echo: ${String(args.text)}` }];
+        },
+      }],
+    });
+    const registry = new PairRegistry(store, adapter);
+    const coordinator = new PairCoordinator(registry, store, adapter);
+    try {
+      await coordinator.createPair({ pairId, dshBuild, expectedLedgerHead: 0 });
+      await coordinator.sendPilot({
+        pairId,
+        text: 'Answer once before using a tool.',
+        expectedLedgerHead: (await store.heads(pairId)).ledgerHead,
+      });
+      await adapter.whenIdle(ids.pilotSessionId);
+      await coordinator.sendPilot({
+        pairId,
+        text: 'Now use the echo tool.',
+        expectedLedgerHead: (await store.heads(pairId)).ledgerHead,
+      });
+      await adapter.whenIdle(ids.pilotSessionId);
+
+      expect(requestBodies).toHaveLength(3);
+      expect(requestBodies.every((body) => !Object.hasOwn(body, 'thinking'))).toBe(true);
+      expect(
+        (await store.read(pairId)).some(
+          (event) => event.type === 'agent.message' && event.payload.text === 'Continuation completed.',
+        ),
+      ).toBe(true);
+    } finally {
+      await coordinator.close();
+      await new Promise<void>((resolveClose, rejectClose) =>
+        server.close((error) => error === undefined ? resolveClose() : rejectClose(error)),
+      );
+      if (priorKey === undefined) delete process.env[apiKeyEnv];
+      else process.env[apiKeyEnv] = priorKey;
+    }
+  }, 30_000);
+
   test('registers immutable tool materials in the canonical Provider order', async () => {
     const pairId = 'pair-provider-tool-order';
     const ids = createPairSessionIds(pairId);

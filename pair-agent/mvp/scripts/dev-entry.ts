@@ -104,6 +104,7 @@ export async function runPhase0Dev(environment: NodeJS.ProcessEnv = process.env)
               apiKeyEnv: config.provider.apiKeyEnv,
               contextWindow: config.provider.contextWindow,
               maxTokens: config.provider.maxTokens,
+              compatibility: config.provider.compatibility,
             },
           }),
       tools: [
