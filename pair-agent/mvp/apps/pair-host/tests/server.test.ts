@@ -6,6 +6,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { type DshBuildRef } from '@pair-agent/contracts';
 import { JsonlPairLedgerStore } from '@pair-agent/ledger';
 import {
+  BridgeFault,
   PairCoordinator,
   PairRegistry,
   type AgentAdapter,
@@ -44,6 +45,7 @@ class FakeAdapter implements AgentAdapter {
   readonly released: AgentHandle[] = [];
   readonly resumeCalls: PreparePairAgentInput[] = [];
   failDelivery = false;
+  healthError?: Error;
   onResume?: (input: PreparePairAgentInput) => Promise<void>;
 
   getDshRuntimeAttestation() {
@@ -83,6 +85,10 @@ class FakeAdapter implements AgentAdapter {
   async followup(input: FollowupInput): Promise<void> {
     this.followups.push(input);
     if (this.failDelivery) throw new Error('adapter offline');
+  }
+
+  assertPairHealthy(): void {
+    if (this.healthError !== undefined) throw this.healthError;
   }
 }
 
@@ -280,6 +286,50 @@ describe('Pair Host HTTP API', () => {
       )).toBe(false);
     },
   );
+
+  test('maps a degraded Pair bridge to a non-leaking 503 before mutating the ledger', async () => {
+    const pairId = 'message-bridge-degraded';
+    await coordinator.createPair({ pairId, dshBuild, expectedLedgerHead: 0 });
+    const before = await store.read(pairId);
+    adapter.healthError = new BridgeFault(
+      pairId as never,
+      `pair:${pairId}:navigator`,
+      new Error('secret bridge fault cause'),
+    );
+
+    const attempted = await json(
+      origin,
+      `/api/pairs/${pairId}/messages/navigator`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          text: 'This input must fail closed.',
+          expectedLedgerHead: before.at(-1)!.seq,
+        }),
+      },
+    );
+
+    expect(attempted.response.status).toBe(503);
+    expect(attempted.body).toEqual({
+      error: {
+        code: 'PAIR_BRIDGE_DEGRADED',
+        message: 'Pair shared-conversation bridge is degraded',
+      },
+    });
+    expect(JSON.stringify(attempted.body)).not.toContain('secret bridge fault cause');
+    expect(JSON.stringify(attempted.body)).not.toContain('BridgeFault');
+    expect(await store.read(pairId)).toEqual(before);
+    expect(adapter.followups).toHaveLength(0);
+
+    const loaded = await json(origin, `/api/pairs/${pairId}`);
+    const audit = await json(
+      origin,
+      `/api/pairs/${pairId}/session-events?afterSeq=0&limit=100&view=all`,
+    );
+    expect(loaded.response.status).toBe(200);
+    expect(audit.response.status).toBe(200);
+  });
 
   test('lists Pair Session Events with physical pagination and semantic filtering', async () => {
     await coordinator.createPair({ pairId: 'pair-demo', dshBuild, expectedLedgerHead: 0 });

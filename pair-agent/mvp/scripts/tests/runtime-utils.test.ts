@@ -2,6 +2,7 @@ import { describe, expect, test, vi } from 'vitest';
 
 import {
   closeBestEffort,
+  closeP05DevComposition,
   pairWebRuntimeDefines,
 } from '../runtime-utils.js';
 
@@ -63,6 +64,57 @@ describe('Phase 0 runtime utilities', () => {
       'first:settled',
       'second:settled',
       'third:settled',
+    ]);
+  });
+
+  test('closes P0.5 composition in supervisor order and awaits Host final drain', async () => {
+    let admissionOpen = true;
+    let announceHostDrain!: () => void;
+    let releaseHostDrain!: () => void;
+    const hostDrainStarted = new Promise<void>((resolveStarted) => {
+      announceHostDrain = resolveStarted;
+    });
+    const hostDrainGate = new Promise<void>((resolveGate) => {
+      releaseHostDrain = resolveGate;
+    });
+    const events: string[] = [];
+    const pairWeb = {
+      close: vi.fn(async () => {
+        events.push('pair-web:closed');
+      }),
+    };
+    const pairHost = {
+      close: vi.fn(async () => {
+        admissionOpen = false;
+        events.push('pair-host:closing');
+        announceHostDrain();
+        await hostDrainGate;
+        events.push('pair-host:drained');
+      }),
+    };
+    const hostedRuntime = {
+      close: vi.fn(async () => {
+        events.push('hosted-runtime:closed');
+      }),
+    };
+
+    const closing = closeP05DevComposition({
+      pairWeb,
+      pairHost,
+      hostedRuntime,
+    });
+    await hostDrainStarted;
+    expect(admissionOpen).toBe(false);
+    expect(events).toEqual(['pair-web:closed', 'pair-host:closing']);
+    expect(hostedRuntime.close).not.toHaveBeenCalled();
+
+    releaseHostDrain();
+    await closing;
+    expect(events).toEqual([
+      'pair-web:closed',
+      'pair-host:closing',
+      'pair-host:drained',
+      'hosted-runtime:closed',
     ]);
   });
 });

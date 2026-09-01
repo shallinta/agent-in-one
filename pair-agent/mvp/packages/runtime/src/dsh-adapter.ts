@@ -147,6 +147,9 @@ interface DshContext {
     register(tool: object): () => void;
     schemas(scope?: unknown): readonly JsonObject[];
   };
+  readonly systemPrompt: {
+    assemble(): Promise<{ readonly tools: readonly JsonObject[] }>;
+  };
 }
 
 interface DshLlmAdapterBase {
@@ -245,10 +248,19 @@ export interface DshSourceOptions {
   readonly lockPath: string;
 }
 
-export interface CaptureProviderOptions {
-  readonly responses: readonly CaptureProviderResponse[];
-  readonly retryFailures?: boolean;
-}
+export type CaptureProviderOptions =
+  | {
+      readonly responses: readonly CaptureProviderResponse[];
+      readonly responsesBySession?: never;
+      readonly retryFailures?: boolean;
+    }
+  | {
+      readonly responses?: never;
+      readonly responsesBySession: Readonly<
+        Record<string, readonly CaptureProviderResponse[]>
+      >;
+      readonly retryFailures?: boolean;
+    };
 
 export type CaptureProviderResponse =
   | string
@@ -265,6 +277,37 @@ export type CaptureProviderResponse =
         readonly arguments: JsonObject;
       };
     };
+
+interface CaptureProviderQueues {
+  readonly global?: CaptureProviderResponse[];
+  readonly bySession?: ReadonlyMap<string, CaptureProviderResponse[]>;
+}
+
+function captureProviderQueues(
+  capture: CaptureProviderOptions | undefined,
+): CaptureProviderQueues {
+  if (capture === undefined) return {};
+  if (capture.responsesBySession === undefined) {
+    return { global: [...capture.responses] };
+  }
+  const prototype = Object.getPrototypeOf(capture.responsesBySession);
+  if (
+    prototype !== Object.prototype &&
+    prototype !== null
+  ) {
+    throw new TypeError('capture.responsesBySession must be a plain object');
+  }
+  const bySession = new Map<string, CaptureProviderResponse[]>();
+  for (const [sessionId, responses] of Object.entries(capture.responsesBySession)) {
+    if (sessionId.length === 0 || !Array.isArray(responses)) {
+      throw new TypeError(
+        'capture.responsesBySession requires non-empty Session IDs and response arrays',
+      );
+    }
+    bySession.set(sessionId, [...responses]);
+  }
+  return { bySession };
+}
 
 export interface DshPairToolDefinition {
   readonly name: string;
@@ -936,7 +979,7 @@ export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPo
     readonly modules: VerifiedDshModules,
     readonly context: DshContext,
     readonly requestMaterials: ImmutablePairRequestMaterialRegistry,
-    private readonly captureResponses: CaptureProviderResponse[],
+    private readonly captureQueues: CaptureProviderQueues,
     private readonly ownsContext: boolean,
     private readonly expectedToolSchemas: readonly JsonObject[],
   ) {}
@@ -1033,8 +1076,10 @@ export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPo
       parameters,
     }));
     for (const definition of definitions) context.tools.register(definition);
-    const tools = context.tools.schemas();
-    assertExactToolCatalog(tools, expectedToolSchemas, 'global');
+    const registeredTools = context.tools.schemas();
+    assertExactToolCatalog(registeredTools, expectedToolSchemas, 'global');
+    const tools = (await context.systemPrompt.assemble()).tools;
+    assertExactToolCatalog(tools, expectedToolSchemas, 'assembled Provider boundary');
     if (options.openai !== undefined) {
       await context.plugin(modules.PiAiProvider, {
         providers: {
@@ -1088,7 +1133,7 @@ export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPo
       modules,
       context,
       requestMaterials,
-      [...(options.capture?.responses ?? [])],
+      captureProviderQueues(options.capture),
       ownsContext,
       structuredClone(expectedToolSchemas),
     );
@@ -1948,9 +1993,13 @@ export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPo
           snapshotLedgerSeq: persisted.seq,
           providerStartedAtLedgerHead,
         });
-        const response = owner.captureResponses.shift();
+        const response = owner.#takeCaptureResponse(sessionId);
         if (response === undefined) {
-          throw new Error('Capture Provider response script exhausted');
+          throw new Error(
+            owner.captureQueues.bySession === undefined
+              ? 'Capture Provider response script exhausted'
+              : `Capture Provider response script exhausted for Session ${sessionId}`,
+          );
         }
         if (typeof response === 'string') {
           for (const chunk of textResponse(response)) yield chunk;
@@ -1990,6 +2039,18 @@ export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPo
 
   #assertOpen(): void {
     if (this.#closed) throw new DshAdapterClosedError();
+  }
+
+  #takeCaptureResponse(sessionId: string): CaptureProviderResponse | undefined {
+    const bySession = this.captureQueues.bySession;
+    if (bySession === undefined) return this.captureQueues.global?.shift();
+    const queue = bySession.get(sessionId);
+    if (queue === undefined) {
+      throw new PairRequestBindingError(
+        `Capture Provider has no response script for Session ${sessionId}`,
+      );
+    }
+    return queue.shift();
   }
 
   #installObservationHook(): void {

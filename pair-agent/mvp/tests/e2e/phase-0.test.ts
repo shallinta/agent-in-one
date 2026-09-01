@@ -10,6 +10,8 @@ import {
   DshPairAgentAdapter,
   launchDshPairWebRuntime,
   PairCoordinator,
+  PeerMessageRouter,
+  PeerMessageService,
   PairRegistry,
 } from '../../packages/runtime/src/index.js';
 import { createPairHostServer } from '../../apps/pair-host/src/server.js';
@@ -330,6 +332,7 @@ describe('Pair Agent Phase 0 live DSH Web composition', () => {
       announcePilotTool = resolveStarted;
     });
     const store = new JsonlPairLedgerStore(pairRoot);
+    const peerRouter = new PeerMessageRouter();
     let registry!: PairRegistry;
     const runtime = await launchDshPairWebRuntime({
       source: { derivedRoot: dshRoot, lockPath: dshLockPath },
@@ -353,6 +356,7 @@ describe('Pair Agent Phase 0 live DSH Web composition', () => {
         ],
       },
       tools: [
+        peerRouter.toolDefinition(),
         {
           name: 'phase0_echo',
           description: 'A deterministic harmless Phase 0 echo tool.',
@@ -371,6 +375,7 @@ describe('Pair Agent Phase 0 live DSH Web composition', () => {
     });
     registry = new PairRegistry(store, runtime.adapter);
     const coordinator = new PairCoordinator(registry, store, runtime.adapter);
+    peerRouter.bind(new PeerMessageService(coordinator, runtime.adapter));
     const attestation = runtime.adapter.getDshRuntimeAttestation();
     let pairHost: ReturnType<typeof createPairHostServer> | undefined;
     let viteServer:
@@ -527,11 +532,25 @@ describe('Pair Agent Phase 0 live DSH Web composition', () => {
           (event.payload as { snapshot: { fullRequestDigest: string } }).snapshot.fullRequestDigest,
         );
       expect(digestsBeforeRestart).toHaveLength(4);
-      const expectedTools = [{
-        name: 'phase0_echo',
-        description: 'A deterministic harmless Phase 0 echo tool.',
-        parameters: { type: 'object', properties: { text: { type: 'string' } } },
-      }];
+      const expectedTools = [
+        {
+          name: 'pair_message_peer',
+          description: 'Send one bounded message to the other Pair Agent and wake it.',
+          parameters: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['text'],
+            properties: {
+              text: { type: 'string', minLength: 1, maxLength: 65536 },
+            },
+          },
+        },
+        {
+          name: 'phase0_echo',
+          description: 'A deterministic harmless Phase 0 echo tool.',
+          parameters: { type: 'object', properties: { text: { type: 'string' } } },
+        },
+      ].sort((left, right) => left.name.localeCompare(right.name));
       expect(runtime.adapter.captureRequests()).toHaveLength(4);
       for (const request of runtime.adapter.captureRequests()) {
         expect(request.tools).toEqual(expectedTools);
@@ -550,6 +569,7 @@ describe('Pair Agent Phase 0 live DSH Web composition', () => {
     }
 
     const resumedStore = new JsonlPairLedgerStore(pairRoot);
+    const resumedPeerRouter = new PeerMessageRouter();
     const resumedRuntime = await launchDshPairWebRuntime({
       source: { derivedRoot: dshRoot, lockPath: dshLockPath },
       dataRoot,
@@ -559,6 +579,7 @@ describe('Pair Agent Phase 0 live DSH Web composition', () => {
       model: 'capture-model',
       capture: { responses: [] },
       tools: [
+        resumedPeerRouter.toolDefinition(),
         {
           name: 'phase0_echo',
           description: 'A deterministic harmless Phase 0 echo tool.',
@@ -576,6 +597,7 @@ describe('Pair Agent Phase 0 live DSH Web composition', () => {
       resumedStore,
       resumedRuntime.adapter,
     );
+    resumedPeerRouter.bind(new PeerMessageService(resumedCoordinator, resumedRuntime.adapter));
     try {
       const recovered = await resumedRegistry.recoverPair(pairId);
       expect(recovered.projection.header).toEqual(headerBeforeRestart);

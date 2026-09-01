@@ -625,12 +625,7 @@ export class PairRegistry {
     if (resumeError !== undefined) return Promise.reject(resumeError);
     const cached = this.#states.get(pairId);
     if (cached?.status === 'ready') {
-      try {
-        this.adapter.assertPairHealthy?.(pairId);
-        return Promise.resolve(cached);
-      } catch (error) {
-        return Promise.reject(error);
-      }
+      return Promise.resolve(cached);
     }
     if (cached?.status === 'failed') {
       return Promise.reject(new PairNotReadyError(pairId, cached.reason));
@@ -868,46 +863,76 @@ export class PairRegistry {
         throw new PairNotReadyError(pairId, 'Registry does not own this Pair');
       }
 
-      for (;;) {
-        const events = await this.store.replay(pairId);
-        if (events.length === 0) throw new PairNotFoundError(pairId);
-        if (events[0]?.type !== 'pair.created') {
-          throw new PairNotReadyError(pairId, 'canonical pair.created is missing');
-        }
-        let projection = replayPairProjection(events);
-        try {
-          const result = await operation({
-            pairId,
-            events: structuredClone(events),
-            appendDerived: async (draft) => {
-              if (
-                draft.type !== 'user.message' &&
-                draft.type !== 'agent.message' &&
-                draft.type !== 'session_event.linked'
-              ) {
-                throw new TypeError(
-                  `Derived mutation cannot append ${draft.type}`,
-                );
-              }
-              assertP05PairEventPayload(draft.type, draft.payload);
-              const event = await this.store.append(
-                pairId,
-                draft,
-                projection.header.ledgerHead,
-              );
-              projection = foldPairEvent(projection, event);
-              return event;
-            },
-          });
-          this.publishProjection(projection);
-          return result;
-        } catch (error) {
-          this.publishProjection(projection);
-          if (error instanceof LedgerConflictError) continue;
-          throw error;
-        }
-      }
+      return this.#runDerivedMutationLocked(pairId, operation);
     });
+  }
+
+  async runPeerMutation<TResult>(
+    pairIdInput: string,
+    operation: (context: PairDerivedMutationContext) => Promise<TResult>,
+  ): Promise<TResult> {
+    const pairId = parsePairId(pairIdInput);
+    const storageIdentity = await this.#getStorageIdentity();
+    return serializePairMutation(`${storageIdentity}\0${pairId}`, async () => {
+      this.#assertOpen();
+      if (!this.#ownedLeaseKeys.has(pairId)) {
+        throw new PairNotReadyError(pairId, 'Registry does not own this Pair');
+      }
+      const state = this.#states.get(pairId);
+      if (state?.status !== 'ready') {
+        throw new PairNotReadyError(
+          pairId,
+          state?.status === 'failed' ? state.reason : 'ready agent mapping is incomplete',
+        );
+      }
+      this.adapter.assertPairHealthy?.(pairId);
+      return this.#runDerivedMutationLocked(pairId, operation);
+    });
+  }
+
+  async #runDerivedMutationLocked<TResult>(
+    pairId: PairId,
+    operation: (context: PairDerivedMutationContext) => Promise<TResult>,
+  ): Promise<TResult> {
+    for (;;) {
+      const events = await this.store.replay(pairId);
+      if (events.length === 0) throw new PairNotFoundError(pairId);
+      if (events[0]?.type !== 'pair.created') {
+        throw new PairNotReadyError(pairId, 'canonical pair.created is missing');
+      }
+      let projection = replayPairProjection(events);
+      try {
+        const result = await operation({
+          pairId,
+          events: structuredClone(events),
+          appendDerived: async (draft) => {
+            if (
+              draft.type !== 'user.message' &&
+              draft.type !== 'agent.message' &&
+              draft.type !== 'session_event.linked'
+            ) {
+              throw new TypeError(
+                `Derived mutation cannot append ${draft.type}`,
+              );
+            }
+            assertP05PairEventPayload(draft.type, draft.payload);
+            const event = await this.store.append(
+              pairId,
+              draft,
+              projection.header.ledgerHead,
+            );
+            projection = foldPairEvent(projection, event);
+            return event;
+          },
+        });
+        this.publishProjection(projection);
+        return result;
+      } catch (error) {
+        this.publishProjection(projection);
+        if (error instanceof LedgerConflictError) continue;
+        throw error;
+      }
+    }
   }
 
   async readDerivedEvents(pairIdInput: string): Promise<readonly PairEvent[]> {

@@ -281,7 +281,7 @@ export class PairCoordinator {
       ? 'navigator-session' as const
       : 'pilot-session' as const;
 
-    return this.registry.runDerivedMutation(pairId, async ({ events, appendDerived }) => {
+    return this.registry.runPeerMutation(pairId, async ({ events, appendDerived }) => {
       const prior = events.filter(
         (event) => event.refs.sourceEventIds?.includes(command.sourceIdentity),
       );

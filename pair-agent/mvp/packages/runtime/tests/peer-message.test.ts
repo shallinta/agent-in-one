@@ -26,14 +26,24 @@ import {
 } from '../src/peer-message.js';
 import {
   PairRegistry,
+  RegistryClosedError,
   type AgentAdapter,
   type AgentHandle,
   type FollowupInput,
   type PreparePairAgentInput,
   type PreparedPairAgent,
 } from '../src/pair-registry.js';
+import { BridgeFault } from '../src/session-to-pair-bridge.js';
 
 const roots: string[] = [];
+
+function deferred(): { promise: Promise<void>; resolve(): void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
+}
 
 async function createRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'pair-runtime-peer-message-'));
@@ -55,7 +65,9 @@ const dshBuild: DshBuildRef = {
 
 class RecordingAdapter implements AgentAdapter {
   readonly followups: FollowupInput[] = [];
+  healthError?: Error;
   onFollowup?: (input: FollowupInput) => Promise<void>;
+  onRelease?: (handle: AgentHandle) => Promise<void>;
 
   getDshRuntimeAttestation() {
     return {
@@ -81,7 +93,9 @@ class RecordingAdapter implements AgentAdapter {
     };
   }
 
-  async release(_handle: AgentHandle): Promise<void> {}
+  async release(handle: AgentHandle): Promise<void> {
+    await this.onRelease?.(handle);
+  }
 
   async resumePairAgent(input: PreparePairAgentInput): Promise<PreparedPairAgent> {
     return this.preparePairAgent(input);
@@ -90,6 +104,10 @@ class RecordingAdapter implements AgentAdapter {
   async followup(input: FollowupInput): Promise<void> {
     this.followups.push(structuredClone(input));
     await this.onFollowup?.(input);
+  }
+
+  assertPairHealthy(): void {
+    if (this.healthError !== undefined) throw this.healthError;
   }
 }
 
@@ -227,6 +245,7 @@ describe('bounded bidirectional Peer Message communication', () => {
   let pairId: string;
   let store: JsonlPairLedgerStore;
   let adapter: RecordingAdapter;
+  let registry: PairRegistry;
   let coordinator: PairCoordinator;
   let port: MutableExecutionPort;
   let router: PeerMessageRouter;
@@ -235,7 +254,8 @@ describe('bounded bidirectional Peer Message communication', () => {
     pairId = 'pair-peer-message';
     store = new JsonlPairLedgerStore(await createRoot());
     adapter = new RecordingAdapter();
-    coordinator = new PairCoordinator(new PairRegistry(store, adapter), store, adapter);
+    registry = new PairRegistry(store, adapter);
+    coordinator = new PairCoordinator(registry, store, adapter);
     await coordinator.createPair({ pairId, dshBuild, expectedLedgerHead: 0 });
     port = new MutableExecutionPort(pairId);
     router = new PeerMessageRouter();
@@ -327,6 +347,71 @@ describe('bounded bidirectional Peer Message communication', () => {
         hop: 1,
       },
     });
+  });
+
+  test('rejects a queued Peer tool admission when the opposite Session Bridge becomes faulty', async () => {
+    const mutationEntered = deferred();
+    const releaseMutation = deferred();
+    const blocker = registry.runDerivedMutation(pairId, async () => {
+      mutationEntered.resolve();
+      await releaseMutation.promise;
+    });
+    await mutationEntered.promise;
+    router.bind(new PeerMessageService(coordinator, port));
+    const before = await store.read(pairId);
+    const sending = router.toolDefinition().execute(
+      { text: 'Do not append across a Pilot Bridge fault.' },
+      toolContext(port.context.agentId),
+    );
+    await new Promise<void>((resolveQueued) => setImmediate(resolveQueued));
+    const ids = createPairSessionIds(pairId);
+    adapter.healthError = new BridgeFault(
+      pairId as never,
+      ids.pilotSessionId,
+      new Error('Pilot Bridge failed'),
+    );
+    releaseMutation.resolve();
+
+    await expect(sending).rejects.toBeInstanceOf(BridgeFault);
+    await blocker;
+    expect(await store.read(pairId)).toEqual(before);
+    expect(adapter.followups).toEqual([]);
+  });
+
+  test('rejects an already-queued Peer tool when Registry shutdown starts before admission', async () => {
+    const mutationEntered = deferred();
+    const releaseMutation = deferred();
+    const blocker = registry.runDerivedMutation(pairId, async () => {
+      mutationEntered.resolve();
+      await releaseMutation.promise;
+    });
+    await mutationEntered.promise;
+    router.bind(new PeerMessageService(coordinator, port));
+    const before = await store.read(pairId);
+    const sending = router.toolDefinition().execute(
+      { text: 'Do not append after shutdown admission closes.' },
+      toolContext(port.context.agentId),
+    );
+    await new Promise<void>((resolveQueued) => setImmediate(resolveQueued));
+
+    const releaseEntered = deferred();
+    const releaseShutdown = deferred();
+    adapter.onRelease = async () => {
+      releaseEntered.resolve();
+      await releaseShutdown.promise;
+    };
+    const closing = coordinator.close();
+    await releaseEntered.promise;
+    releaseMutation.resolve();
+    try {
+      await expect(sending).rejects.toBeInstanceOf(RegistryClosedError);
+      await blocker;
+      expect(await store.read(pairId)).toEqual(before);
+      expect(adapter.followups).toEqual([]);
+    } finally {
+      releaseShutdown.resolve();
+      await closing;
+    }
   });
 
   test.each(['', '   ', 'x'.repeat(65_537), '🙂'.repeat(16_385)])(
@@ -665,6 +750,157 @@ describe('bounded bidirectional Peer Message communication', () => {
       ),
     ).toBe(true);
     await realCoordinator.close();
+  }, 30_000);
+
+  test('rejects a real Navigator Peer tool when the opposite Pilot Bridge is degraded', async () => {
+    const realPairId = 'pair-peer-opposite-bridge-fault';
+    const mvpRoot = resolve(import.meta.dirname, '../../..');
+    const lockPath = join(mvpRoot, 'dsh.lock.json');
+    const lock = JSON.parse(await readFile(lockPath, 'utf8')) as {
+      upstreamRepository: string;
+      upstreamCommit: string;
+      sourceRepository: string;
+      expectedDerivedCommit: string;
+      requestLayoutSeamVersion: 1;
+    };
+    const ids = createPairSessionIds(realPairId);
+    let faultActive = false;
+    const realRouter = new PeerMessageRouter();
+    const realStore = new JsonlPairLedgerStore(await createRoot());
+    let realRegistry: PairRegistry;
+    const realAdapter = await DshPairAgentAdapter.create({
+      source: {
+        derivedRoot: join(mvpRoot, '.runtime/deepseek-harness'),
+        lockPath,
+      },
+      store: realStore,
+      sessionRoot: await createRoot(),
+      commonSystem: {
+        version: 'pair-prompt/v1',
+        content: 'Navigator governs and Pilot executes.',
+      },
+      provider: 'openai-completions',
+      model: 'capture-model',
+      capture: {
+        responsesBySession: {
+          [ids.pilotSessionId]: ['Pilot completed the faulting native Turn.'],
+          [ids.navigatorSessionId]: [
+            {
+              toolCall: {
+                id: 'call-peer-opposite-bridge-fault',
+                name: 'pair_message_peer',
+                arguments: { text: 'This must not cross the Pilot Bridge fault.' },
+              },
+            },
+            'Navigator observed the rejected Peer tool.',
+          ],
+        },
+      },
+      tools: [realRouter.toolDefinition()],
+      lifecycleFaults: {
+        beforeBridgeRead(sessionId) {
+          if (faultActive && sessionId === ids.pilotSessionId) {
+            throw new Error('Pilot Bridge injected fault');
+          }
+        },
+      },
+      onLedgerAdvanced: async (advancedPairId) => {
+        await realRegistry.publish(advancedPairId);
+      },
+    });
+    realRegistry = new PairRegistry(realStore, realAdapter);
+    const realCoordinator = new PairCoordinator(realRegistry, realStore, realAdapter);
+    realRouter.bind(new PeerMessageService(realCoordinator, realAdapter));
+    const created = await realCoordinator.createPair({
+      pairId: realPairId,
+      dshBuild: {
+        upstreamRepository: lock.upstreamRepository,
+        upstreamCommit: lock.upstreamCommit,
+        sourceRepository: lock.sourceRepository,
+        sourceCommit: lock.expectedDerivedCommit,
+        requestLayoutSeamVersion: lock.requestLayoutSeamVersion,
+      },
+      expectedLedgerHead: 0,
+    });
+    expect(created.status).toBe('ready');
+    faultActive = true;
+    const agents = realAdapter.context.agents as unknown as {
+      get(sessionId: string): {
+        followup(message: {
+          id: string;
+          role: 'user';
+          content: readonly JsonObject[];
+          source: JsonObject;
+        }): void;
+        whenIdle(): Promise<void>;
+      } | undefined;
+    };
+    const pilot = agents.get(ids.pilotSessionId);
+    const navigator = agents.get(ids.navigatorSessionId);
+    expect(pilot).toBeDefined();
+    expect(navigator).toBeDefined();
+
+    try {
+      pilot!.followup({
+        id: 'pilot-native-bridge-fault',
+        role: 'user',
+        content: [{ type: 'text', text: 'Degrade only the Pilot Bridge.' }],
+        source: { kind: 'user' },
+      });
+      await pilot!.whenIdle();
+      await expect(
+        realAdapter.whenIdle(ids.pilotSessionId),
+      ).rejects.toBeInstanceOf(BridgeFault);
+      expect(() => realAdapter.assertPairHealthy(realPairId as never))
+        .toThrow(BridgeFault);
+      const beforePeer = await realStore.read(realPairId);
+      const pilotTurnsBefore = realAdapter
+        .sessionEvents(ids.pilotSessionId)
+        .filter((event) => event.type === 'turn/start').length;
+      const pilotCapturesBefore = realAdapter.captureRequests().filter(
+        (request) => request.sessionId === ids.pilotSessionId,
+      ).length;
+
+      navigator!.followup({
+        id: 'navigator-native-peer-attempt',
+        role: 'user',
+        content: [{ type: 'text', text: 'Attempt the Peer tool while Pilot is degraded.' }],
+        source: { kind: 'user' },
+      });
+      await navigator!.whenIdle();
+
+      expect(
+        realAdapter.captureRequests().some(
+          (request) => request.sessionId === ids.navigatorSessionId,
+        ),
+      ).toBe(true);
+      expect(
+        (await realStore.read(realPairId)).filter(
+          (event) =>
+            event.type === 'agent.message' &&
+            event.payload.kind === 'peer-message' &&
+            event.payload.text === 'This must not cross the Pilot Bridge fault.',
+        ),
+      ).toHaveLength(0);
+      expect(
+        realAdapter
+          .sessionEvents(ids.pilotSessionId)
+          .filter((event) => event.type === 'turn/start'),
+      ).toHaveLength(pilotTurnsBefore);
+      expect(
+        realAdapter.captureRequests().filter(
+          (request) => request.sessionId === ids.pilotSessionId,
+        ),
+      ).toHaveLength(pilotCapturesBefore);
+      expect(
+        beforePeer.some(
+          (event) => event.payload.text === 'This must not cross the Pilot Bridge fault.',
+        ),
+      ).toBe(false);
+    } finally {
+      faultActive = false;
+      await realCoordinator.close();
+    }
   }, 30_000);
 
   test('waits for delayed native-composer Bridge derivation before resolving Peer provenance', async () => {

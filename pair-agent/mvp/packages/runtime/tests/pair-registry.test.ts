@@ -69,6 +69,7 @@ class FakeAdapter implements AgentAdapter {
   readonly calls: string[] = [];
   readonly released: AgentHandle[] = [];
   closeCalls = 0;
+  followupCalls = 0;
   failRole?: PairRole;
   failResumeRole?: PairRole;
   onPrepare?: (input: PreparePairAgentInput) => Promise<void>;
@@ -130,7 +131,9 @@ class FakeAdapter implements AgentAdapter {
     };
   }
 
-  async followup(): Promise<void> {}
+  async followup(): Promise<void> {
+    this.followupCalls += 1;
+  }
 
   async auditPairRequests(): Promise<void> {
     if (this.auditError !== undefined) throw this.auditError;
@@ -799,22 +802,37 @@ describe('PairRegistry recovery and subscriptions', () => {
     await registry.close();
   });
 
-  test('cached ready lookup fails closed after adapter health becomes faulty', async () => {
+  test('keeps a degraded cached Pair readable while rejecting mutation before append', async () => {
     const adapter = new FakeAdapter();
-    const registry = new PairRegistry(
-      new JsonlPairLedgerStore(await createRoot()),
-      adapter,
-    );
+    const store = new JsonlPairLedgerStore(await createRoot());
+    const registry = new PairRegistry(store, adapter);
     await registry.createPair({
       pairId: 'pair-cached-health',
       dshBuild,
       expectedLedgerHead: 0,
     });
+    const before = await store.read('pair-cached-health');
     adapter.healthError = new Error('bridge async fault');
 
-    await expect(registry.getReadyPair('pair-cached-health')).rejects.toThrow(
-      /bridge async fault/,
-    );
+    await expect(registry.getReadyPair('pair-cached-health')).resolves.toMatchObject({
+      projection: { header: { ledgerHead: before.at(-1)!.seq } },
+    });
+    await expect(
+      registry.readSnapshot('pair-cached-health', ({ projection }) => projection),
+    ).resolves.toMatchObject({ header: { ledgerHead: before.at(-1)!.seq } });
+    let mutationEntered = false;
+    await expect(
+      registry.runPairMutation(
+        'pair-cached-health',
+        before.at(-1)!.seq,
+        async () => {
+          mutationEntered = true;
+        },
+      ),
+    ).rejects.toThrow(/bridge async fault/);
+    expect(mutationEntered).toBe(false);
+    expect(await store.read('pair-cached-health')).toEqual(before);
+    expect(adapter.followupCalls).toBe(0);
     await registry.close();
   });
 

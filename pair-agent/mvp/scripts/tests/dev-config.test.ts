@@ -9,7 +9,7 @@ import { readPhase0DevConfig } from '../dev-config.js';
 describe('Phase 0 dev configuration', () => {
   test('defaults persistence outside the repository and capture mode without a key', () => {
     const config = readPhase0DevConfig({});
-    expect(config.dataRoot).toBe(join(homedir(), '.pair-agent', 'phase0'));
+    expect(config.dataRoot).toBe(join(homedir(), '.pair-agent', 'p0.5'));
     expect(config.provider).toEqual({ kind: 'capture', model: 'capture-model' });
     expect(config.ports).toEqual({ pairWeb: 3070, dshWeb: 3080, pairHost: 3090 });
   });

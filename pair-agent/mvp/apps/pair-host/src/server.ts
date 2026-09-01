@@ -24,6 +24,7 @@ import {
 } from '@pair-agent/contracts';
 import { LedgerConflictError, ProjectionInvariantError } from '@pair-agent/ledger';
 import {
+  BridgeFault,
   DeliveryPendingError,
   DuplicatePairError,
   InvalidCommandError,
@@ -501,6 +502,13 @@ function handleError(response: ServerResponse, error: unknown): void {
   if (response.destroyed || response.writableEnded) return;
   if (error instanceof HttpRequestError) {
     writeError(response, error.status, error.code, error.message);
+  } else if (error instanceof BridgeFault) {
+    writeError(
+      response,
+      503,
+      'PAIR_BRIDGE_DEGRADED',
+      'Pair shared-conversation bridge is degraded',
+    );
   } else if (error instanceof DuplicatePairError) {
     writeError(response, 409, 'PAIR_DUPLICATE', error.message);
   } else if (error instanceof LedgerConflictError) {

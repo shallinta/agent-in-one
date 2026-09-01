@@ -48,7 +48,7 @@ function positiveInteger(
 
 export function readPhase0DevConfig(environment: NodeJS.ProcessEnv): Phase0DevConfig {
   const configuredRoot = environment.PAIR_DATA_ROOT;
-  const dataRoot = configuredRoot ?? join(homedir(), '.pair-agent', 'phase0');
+  const dataRoot = configuredRoot ?? join(homedir(), '.pair-agent', 'p0.5');
   if (!isAbsolute(dataRoot)) throw new TypeError('PAIR_DATA_ROOT must be absolute');
   const ports = {
     pairWeb: port(environment, 'PAIR_WEB_PORT', 3070),

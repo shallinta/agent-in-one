@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 import { createPairSessionIds, type DshBuildRef } from '@pair-agent/contracts';
-import { JsonlPairLedgerStore } from '@pair-agent/ledger';
+import { JsonlPairLedgerStore, LedgerConflictError } from '@pair-agent/ledger';
 import { afterEach, describe, expect, test } from 'vitest';
 
 import { PairCoordinator } from '../src/coordinator.js';
@@ -12,6 +12,8 @@ import {
   DshSourceVerificationError,
   launchDshPairWebRuntime,
   measureRuntimeArtifacts,
+  type CaptureProviderResponse,
+  type DshPairToolDefinition,
   verifyRuntimeArtifacts,
 } from '../src/dsh-adapter.js';
 import { PairRegistry } from '../src/pair-registry.js';
@@ -65,19 +67,11 @@ async function createRuntime(
   sessionRoot: string,
   options: {
     model?: string;
-    responses?: readonly (
-      | string
-      | { readonly failure: { readonly message: string; readonly code: string } }
-      | {
-          readonly toolCall: {
-            readonly id: string;
-            readonly name: string;
-            readonly arguments: Record<string, string>;
-          };
-        }
-    )[];
+    responses?: readonly CaptureProviderResponse[];
+    responsesBySession?: Readonly<Record<string, readonly CaptureProviderResponse[]>>;
     retryFailures?: boolean;
     echoTool?: boolean;
+    tools?: readonly DshPairToolDefinition[];
     maxTokens?: number;
     reasoningEffort?: string;
     historicalRequestMaterials?: readonly PairRequestMaterialEntry[];
@@ -98,11 +92,18 @@ async function createRuntime(
     commonSystem: options.commonSystem ?? commonSystem,
     provider: 'openai-completions',
     model: options.model ?? 'capture-model',
-    capture: {
-      responses: [...(options.responses ?? ['Navigator accepted.', 'Pilot accepted.'])],
-      ...(options.retryFailures === true ? { retryFailures: true } : {}),
-    },
-    ...(options.echoTool === true
+    capture: options.responsesBySession === undefined
+      ? {
+          responses: [...(options.responses ?? ['Navigator accepted.', 'Pilot accepted.'])],
+          ...(options.retryFailures === true ? { retryFailures: true } : {}),
+        }
+      : {
+          responsesBySession: options.responsesBySession,
+          ...(options.retryFailures === true ? { retryFailures: true } : {}),
+        },
+    ...(options.tools !== undefined
+      ? { tools: options.tools }
+      : options.echoTool === true
       ? {
           tools: [
             {
@@ -142,6 +143,252 @@ async function createRuntime(
 }
 
 describe('DshPairAgentAdapter real-runtime contract', () => {
+  test('registers immutable tool materials in the canonical Provider order', async () => {
+    const pairId = 'pair-provider-tool-order';
+    const ids = createPairSessionIds(pairId);
+    const tools: readonly DshPairToolDefinition[] = [
+      {
+        name: 'zeta_tool',
+        description: 'Registered first on purpose.',
+        parameters: { value: { type: 'string' } },
+        async execute() {
+          return [{ type: 'text', text: 'zeta' }];
+        },
+      },
+      {
+        name: 'alpha_tool',
+        description: 'Registered second on purpose.',
+        parameters: { value: { type: 'string' } },
+        async execute() {
+          return [{ type: 'text', text: 'alpha' }];
+        },
+      },
+    ];
+    const runtime = await createRuntime(
+      pairId,
+      await temporaryRoot('provider-tool-order-ledger'),
+      await temporaryRoot('provider-tool-order-sessions'),
+      { tools, responses: ['Canonical tool order accepted.'] },
+    );
+    try {
+      await runtime.coordinator.createPair({ pairId, dshBuild, expectedLedgerHead: 0 });
+      await runtime.coordinator.sendNavigator({
+        pairId,
+        text: 'Exercise a non-canonical registration order.',
+        expectedLedgerHead: (await runtime.store.heads(pairId)).ledgerHead,
+      });
+      await runtime.adapter.whenIdle(ids.navigatorSessionId);
+
+      const captures = runtime.adapter.captureRequests();
+      expect(captures).toHaveLength(1);
+      expect(captures[0]?.tools?.map((tool) => tool.name)).toEqual([
+        'alpha_tool',
+        'zeta_tool',
+      ]);
+      expect(
+        runtime.adapter.exportRequestMaterials().at(-1)?.tools.map((tool) => tool.name),
+      ).toEqual(captures[0]?.tools?.map((tool) => tool.name));
+    } finally {
+      await runtime.coordinator.close();
+    }
+  }, 30_000);
+
+  test('routes concurrent capture responses by Session without cross-consuming queues', async () => {
+    const pairId = 'pair-capture-session-routing';
+    const ids = createPairSessionIds(pairId);
+    const runtime = await createRuntime(
+      pairId,
+      await temporaryRoot('capture-session-routing-ledger'),
+      await temporaryRoot('capture-session-routing-sessions'),
+      {
+        responsesBySession: {
+          [ids.navigatorSessionId]: ['Navigator routed response.'],
+          [ids.pilotSessionId]: ['Pilot routed response.'],
+        },
+      },
+    );
+    try {
+      await runtime.coordinator.createPair({ pairId, dshBuild, expectedLedgerHead: 0 });
+      await runtime.coordinator.sendNavigator({
+        pairId,
+        text: 'Start Navigator concurrently.',
+        expectedLedgerHead: (await runtime.store.heads(pairId)).ledgerHead,
+      });
+      for (;;) {
+        try {
+          await runtime.coordinator.sendPilot({
+            pairId,
+            text: 'Start Pilot concurrently.',
+            expectedLedgerHead: (await runtime.store.heads(pairId)).ledgerHead,
+          });
+          break;
+        } catch (error) {
+          if (!(error instanceof LedgerConflictError)) throw error;
+        }
+      }
+      await Promise.all([
+        runtime.adapter.whenIdle(ids.navigatorSessionId),
+        runtime.adapter.whenIdle(ids.pilotSessionId),
+      ]);
+
+      const finals = (await runtime.store.read(pairId)).filter(
+        (event) => event.type === 'agent.message' && event.payload.kind === 'turn-output',
+      );
+      expect(
+        finals.map((event) => [event.source, event.payload.text]),
+      ).toEqual(expect.arrayContaining([
+        ['navigator-session', 'Navigator routed response.'],
+        ['pilot-session', 'Pilot routed response.'],
+      ]));
+    } finally {
+      await runtime.coordinator.close();
+    }
+  }, 30_000);
+
+  test('fails a missing Session capture queue without consuming another Session response', async () => {
+    const pairId = 'pair-capture-session-missing';
+    const ids = createPairSessionIds(pairId);
+    const runtime = await createRuntime(
+      pairId,
+      await temporaryRoot('capture-session-missing-ledger'),
+      await temporaryRoot('capture-session-missing-sessions'),
+      {
+        responsesBySession: {
+          [ids.navigatorSessionId]: ['Navigator queue remains isolated.'],
+        },
+      },
+    );
+    try {
+      await runtime.coordinator.createPair({ pairId, dshBuild, expectedLedgerHead: 0 });
+      await runtime.coordinator.sendPilot({
+        pairId,
+        text: 'Pilot has no configured capture queue.',
+        expectedLedgerHead: (await runtime.store.heads(pairId)).ledgerHead,
+      });
+      await runtime.adapter.whenIdle(ids.pilotSessionId);
+      expect(runtime.adapter.sessionEvents(ids.pilotSessionId)).toContainEqual(
+        expect.objectContaining({
+          type: 'turn/end',
+          data: expect.objectContaining({
+            reason: expect.objectContaining({
+              kind: 'error',
+              error: expect.objectContaining({
+                message: expect.stringContaining('no response script for Session'),
+              }),
+            }),
+          }),
+        }),
+      );
+
+      await runtime.coordinator.sendNavigator({
+        pairId,
+        text: 'Navigator consumes only its own queue.',
+        expectedLedgerHead: (await runtime.store.heads(pairId)).ledgerHead,
+      });
+      await runtime.adapter.whenIdle(ids.navigatorSessionId);
+      expect(
+        (await runtime.store.read(pairId)).some(
+          (event) => event.payload.text === 'Navigator queue remains isolated.',
+        ),
+      ).toBe(true);
+    } finally {
+      await runtime.coordinator.close();
+    }
+  }, 30_000);
+
+  test('fails an exhausted Session capture queue without consuming another Session response', async () => {
+    const pairId = 'pair-capture-session-exhausted';
+    const ids = createPairSessionIds(pairId);
+    const runtime = await createRuntime(
+      pairId,
+      await temporaryRoot('capture-session-exhausted-ledger'),
+      await temporaryRoot('capture-session-exhausted-sessions'),
+      {
+        responsesBySession: {
+          [ids.navigatorSessionId]: ['Navigator only response.'],
+          [ids.pilotSessionId]: ['Pilot queue remains isolated.'],
+        },
+      },
+    );
+    try {
+      await runtime.coordinator.createPair({ pairId, dshBuild, expectedLedgerHead: 0 });
+      await runtime.coordinator.sendNavigator({
+        pairId,
+        text: 'Consume the only Navigator response.',
+        expectedLedgerHead: (await runtime.store.heads(pairId)).ledgerHead,
+      });
+      await runtime.adapter.whenIdle(ids.navigatorSessionId);
+
+      await runtime.coordinator.sendNavigator({
+        pairId,
+        text: 'Navigator queue is now exhausted.',
+        expectedLedgerHead: (await runtime.store.heads(pairId)).ledgerHead,
+      });
+      await runtime.adapter.whenIdle(ids.navigatorSessionId);
+      expect(runtime.adapter.sessionEvents(ids.navigatorSessionId)).toContainEqual(
+        expect.objectContaining({
+          type: 'turn/end',
+          data: expect.objectContaining({
+            reason: expect.objectContaining({
+              kind: 'error',
+              error: expect.objectContaining({
+                message: expect.stringContaining(
+                  `response script exhausted for Session ${ids.navigatorSessionId}`,
+                ),
+              }),
+            }),
+          }),
+        }),
+      );
+
+      await runtime.coordinator.sendPilot({
+        pairId,
+        text: 'Pilot still consumes its own response.',
+        expectedLedgerHead: (await runtime.store.heads(pairId)).ledgerHead,
+      });
+      await runtime.adapter.whenIdle(ids.pilotSessionId);
+      const events = await runtime.store.read(pairId);
+      expect(
+        events.filter((event) => event.payload.text === 'Pilot queue remains isolated.'),
+      ).toHaveLength(1);
+      expect(
+        events.some((event) => event.payload.text === 'Navigator only response.'),
+      ).toBe(true);
+      expect(
+        events.some((event) => event.payload.text === 'Pilot queue remains isolated.'),
+      ).toBe(true);
+    } finally {
+      await runtime.coordinator.close();
+    }
+  }, 30_000);
+
+  test('keeps the legacy global capture response FIFO behavior', async () => {
+    const pairId = 'pair-capture-global-legacy';
+    const ids = createPairSessionIds(pairId);
+    const runtime = await createRuntime(
+      pairId,
+      await temporaryRoot('capture-global-legacy-ledger'),
+      await temporaryRoot('capture-global-legacy-sessions'),
+      { responses: ['Legacy global response.'] },
+    );
+    try {
+      await runtime.coordinator.createPair({ pairId, dshBuild, expectedLedgerHead: 0 });
+      await runtime.coordinator.sendNavigator({
+        pairId,
+        text: 'Use the legacy global capture queue.',
+        expectedLedgerHead: (await runtime.store.heads(pairId)).ledgerHead,
+      });
+      await runtime.adapter.whenIdle(ids.navigatorSessionId);
+      expect(
+        (await runtime.store.read(pairId)).some(
+          (event) => event.payload.text === 'Legacy global response.',
+        ),
+      ).toBe(true);
+    } finally {
+      await runtime.coordinator.close();
+    }
+  }, 30_000);
+
   test('rejects a prepared checkout whose HEAD does not equal dsh.lock', async () => {
     const badLockRoot = await temporaryRoot('bad-lock');
     const lock = JSON.parse(await readFile(dshLockPath, 'utf8')) as Record<string, unknown>;

@@ -1,8 +1,8 @@
-# Pair Agent Phase 0 MVP
+# Pair Agent P0.5 MVP
 
-这是一个基于固定 DeepSeek Harness（DSH）源码快照的本地探索原型。它验证一条 Pair Session 映射为两个独立 DSH Agent Session，并由 Pair Web Shell 同时展示 Navigator 与 Pilot 的原生 DSH Web 会话。
+这是一个基于固定 DeepSeek Harness（DSH）源码快照的本地探索原型。它验证一条 Pair Session 映射为两个独立 DSH Agent Session，由 Pair Web Shell 同时展示 Navigator 与 Pilot 的原生 DSH Web 会话，并把两条本地 Session 中可共享的用户输入与最终回答投影到同一 Pair Ledger。
 
-它不是生产部署方案，也不声称实现完整权限系统、可靠消息投递或完整的 Sub-agent / workflow 语义。
+它不是生产部署方案，也不声称实现 P1 的 Goal-impact/权限语义，或 P2 的 delivery crash-window exactly-once reconciliation、Sub-agent/workflow 等能力。
 
 ## 1. 运行边界
 
@@ -20,6 +20,8 @@ Pair Web (3070) ──/api proxy──> Pair Host (3090)
 ```
 
 DSH Host/API 与两个 Agent 使用同一个 live `Context`、`AgentRegistry` 和 `SessionPersistence`。Pair Web 是独立 origin；两个 iframe 通过 addressed-session 启动参数固定到各自 Session。这里没有另启一套只共享 JSONL 的 DSH Runtime。
+
+每条 DSH Session 的 durable event 由 Session-to-Pair Bridge 增量观察。Bridge 先写 canonical Pair Event，再写 `session_event.linked`；普通共享输出只更新 Pair projection/SSE，不会启动另一方 Turn。只有模型显式调用 `pair_message_peer` 才会在 Peer Event durable 后定向唤醒对方。
 
 ## 2. 前置条件
 
@@ -53,7 +55,7 @@ cd pair-agent/mvp
 corepack pnpm@11.7.0 dev
 ```
 
-首次启动会创建 `pair-demo`，运行一次 Navigator → Pilot harmless echo 演示，并打印实际 URL：
+首次启动会在独立的 P0.5 data root 创建 `pair-demo`，运行一次 Navigator → Pilot harmless echo 演示，并打印实际 URL：
 
 - Pair Web：`http://127.0.0.1:3070/pair.html?pairId=pair-demo`
 - DSH Web/API：`http://127.0.0.1:3080`
@@ -61,11 +63,13 @@ corepack pnpm@11.7.0 dev
 
 再次使用同一 data root 启动时会恢复 Pair 与两条 DSH Session，不重复创建初始 Task。按 `Ctrl-C` 停止；Supervisor 严格按 Pair Web → Pair Host/Registry → hosted DSH Runtime 的顺序逐项等待关闭。Hosted Runtime 内部再依次关闭两个 Agent 与 DSH Context，避免两个所有者并发 dispose 同一个 Agent handle。
 
+P0.5 的 immutable request materials 增加了 `pair_message_peer`，Pair protocol marker 也固定为 `pair-agent/p0.5`。因此默认 root 已从旧 `~/.pair-agent/phase0` 切到 `~/.pair-agent/p0.5`；不要在原目录上重写或迁移旧 Phase 0 Pair。需要保留旧 audit 时，应保留旧 root，并使用与其历史 request materials 匹配的旧 runtime；P0.5 请创建新 root/Pair。
+
 可配置项：
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `PAIR_DATA_ROOT` | `~/.pair-agent/phase0` | 必须是绝对路径，不会默认写入仓库 |
+| `PAIR_DATA_ROOT` | `~/.pair-agent/p0.5` | 必须是绝对路径，不会默认写入仓库；P0.5 应使用 fresh root |
 | `PAIR_ID` | `pair-demo` | 当前要创建或恢复的 Pair |
 | `PAIR_WEB_PORT` | `3070` | Pair Shell；必须为 `1024..65535` |
 | `DSH_WEB_PORT` | `3080` | 原生 DSH Host/API/Web |
@@ -91,23 +95,29 @@ corepack pnpm@11.7.0 dev
 
 - Pair Header：共同 Pair ID、Goal/Task/Execution Plan projection、attention/pause 与连接状态。
 - Navigator/Pilot：两个独立的原生 DSH transcript 与 composer；iframe URL 同时携带 `session` 和 `expectedSession`，刷新后仍固定在原 Session。
+- Pair-level input：每个 Pane 上方的 Pair form 先以 CAS 写 Pair Ledger，再定向投递到对应 Session。发生 `409` 时草稿保留，等待 projection 追上后必须显式复核并重试；结果未知时也保留草稿并提示先查 Session Events。
+- Native DSH composer：iframe 内输入仍由 DSH 原生 `source.kind=user` 接收；其 durable `user/message` 会被 Bridge 投影为 shared `user.message`。这不会自动改写 Goal/Task，也不会唤醒另一方。
+- Session Events：`Semantic` 隐藏 infrastructure records，适合阅读共同对话；`All / Audit` 使用 physical Pair sequence 展示 `session_event.linked`、`pair.request_built` 等完整审计记录。
 - Tool：capture 演示的 `phase0_echo` 会出现在 Pilot Chat 和 `Trajectory` 页签中。
-- Sub-agent：Phase 0 的 `pair-safe` preset 未安装 delegation plugin。验收以 Provider request 的精确 tool allowlist 与原生 DSH UI/API 中不存在 child Session/入口为准；Pair Shell 不自行宣称运行时能力。P2 才考虑真实 Sub-agent/workflow 能力。
+- Peer Message：两个角色的精确 tool allowlist 都包含 `pair_message_peer({ text })`。它每个 sender Turn 最多成功一次，Peer Event 必须先 durable 才会唤醒对方；双向回复保持同一 `causalRootId`，hop 逐次增加，最多四跳，第五跳 fail closed 且不 append、不 wake。模型参数不能指定 authority、目标 Session、wake、causal root 或 hop。
+- Sub-agent：P0.5 的 `pair-safe` preset 未安装 delegation plugin。验收以 Provider request 的精确 tool allowlist 与原生 DSH UI/API 中不存在 child Session/入口为准；Pair Shell 不自行宣称运行时能力。P2 才考虑真实 Sub-agent/workflow 能力。
 - Reasoning：只展示 Provider 明确返回并进入标准 Session Event 的 reasoning block。Provider 隐藏的 chain-of-thought 不存在可读取或展示的接口；capture demo 不伪造 reasoning。
 
-用户可在各原生 Pane 查看该 Agent 的执行轨迹。涉及 Pair 共同事实或任务分派的输入应通过 Pair Host API 进入 Pair Ledger；直接在 iframe composer 中输入属于该 Agent 的本地会话输入，Phase 0 尚未把它提升为共同 Goal/Task 变更。
+用户可在各原生 Pane 查看该 Agent 的执行轨迹。无论输入来自 Pair form 还是 native composer，共享 conversation 都只从 durable Session/Pair facts 派生；普通 Agent 最终回答必须等对应 durable `turn/end` 后才发布为 complete shared `agent.message`。普通对话共享是 passive 的，只有 Pair 命令或 `pair_message_peer` 才会启动目标 Turn。
 
 ## 5. 持久化与恢复
 
-默认 `PAIR_DATA_ROOT=~/.pair-agent/phase0`。以 `PAIR_ID=pair-demo` 为例，三类关键产物是：
+默认 `PAIR_DATA_ROOT=~/.pair-agent/p0.5`。以 `PAIR_ID=pair-demo` 为例，三类关键产物是：
 
-1. Pair Ledger：`~/.pair-agent/phase0/pairs/pair-obqws4rnmrsw23y/pair.jsonl`。`pair.request_built` infrastructure event 内含不可变 Request Snapshot 与 digest。
-2. Navigator Session：`~/.pair-agent/phase0/dsh-sessions/_no-cwd/pair~003Apair-demo~003Anavigator/session.jsonl`。
-3. Pilot Session：`~/.pair-agent/phase0/dsh-sessions/_no-cwd/pair~003Apair-demo~003Apilot/session.jsonl`。
+1. Pair Ledger：`~/.pair-agent/p0.5/pairs/pair-obqws4rnmrsw23y/pair.jsonl`。`pair.request_built` infrastructure event 内含不可变 Request Snapshot 与 digest。
+2. Navigator Session：`~/.pair-agent/p0.5/dsh-sessions/_no-cwd/pair~003Apair-demo~003Anavigator/session.jsonl`。
+3. Pilot Session：`~/.pair-agent/p0.5/dsh-sessions/_no-cwd/pair~003Apair-demo~003Apilot/session.jsonl`。
 
 `dsh-storage/` 保存 Web projection/workspace 辅助状态，`dsh-home/` 保存该运行实例的隔离设置，`agent-presets/pair-safe/` 是运行时生成的安全 preset。它们都位于显式 data root 内。
 
-恢复只依赖 Pair Ledger、两条本地 DSH Session Log 和固定版本材料；同一 data root 重启后，Pair Header 与历史 Request digest 必须保持一致。不要手工编辑 JSONL。
+恢复只依赖 Pair Ledger、两条本地 DSH Session Log 和固定版本材料；同一 data root 重启后，Pair Header 与历史 Request digest 必须保持一致。P0.5 为短日志原型，恢复会 full-scan 两条 durable Session logs，并只补缺失的 canonical Pair Event/link；重复重启必须幂等。不要手工编辑 JSONL。
+
+Pair vocabulary 只写 Pair Ledger，DSH JSONL 只保留 DSH Session Event vocabulary；Bridge 不向 DSH fork 回写 Pair custom event。
 
 ## 6. 验证
 
@@ -119,12 +129,12 @@ corepack pnpm@11.7.0 verify
 该命令顺序执行：
 
 1. prepared DSH Git/patch/runtime-artifact lock 校验；
-2. Pair 全量测试（包含从 clean temp data root 启动的 Phase 0 capture/browser E2E）；
+2. Pair 全量测试（包含 legacy Phase 0 browser regression，以及从 clean temp root 启动的 P0.5 passive sharing、native composer、Peer round-trip 和 crash/restart capture E2E）；
 3. Pair typecheck 与 build；
 4. DSH `agent/request-layout`、addressed-session、fixed-root Workspace guard 与 Composer unit regressions；
 5. DSH 原生 addressed embedded Chromium regression。
 
-Phase 0 E2E 真实创建 Pair，运行 Navigator，显式调用 Coordinator 分派 Task，让 Pilot 进入受门控的 harmless tool；在 Pilot 尚未结束时证明 Navigator 第二条消息已被接收并完成。随后它打开 Pair Web，核对两个 iframe 的 Session ID、Pilot tool/Trajectory 与 Sub-agent empty 状态，再停止、使用同一 data root 恢复并比对 Header、历史 digest、Pair JSONL 和两条 DSH JSONL。
+P0.5 E2E 使用 clean temp root 与 capture Provider：验证 ordinary conversation passive sharing、later peer request 的 Shared Events 恰好一次、native composer 的 durable ordering、双向 Peer Message 与四跳上限，以及在 DSH message durable、Pair link 尚未写入时崩溃后的两次幂等恢复。测试直接读取临时 Pair/DSH artifacts 并在结束时自行清理，不依赖人工保留目录。
 
 `verify` 不调用 `install`/`postinstall`，不使用网络模型，也不读取真实 API Key。
 
@@ -139,9 +149,10 @@ Phase 0 E2E 真实创建 Pair，运行 Navigator，显式调用 Coordinator 分�
 
 ## 8. 已知限制
 
-- P1 Goal/Task 权限矩阵尚未实现；Phase 0 只保留后续能力所需的边界。
-- durable append 与 delivery acknowledgement 之间的 crash window 尚未完成 P2 reconciliation。
+- P1 Goal-impact 判断、Goal/Task 权限矩阵、Revision fencing 与 Pause/Resume/Cancel 语义尚未实现；P0.5 只保留后续能力所需的边界。
+- P0.5 的正常运行使用内存 Session cursor，恢复时 full-scan 短日志。持久化 per-Agent unread cursor、Shared Checkpoint 与长日志增量恢复属于 P2。
+- durable Peer/Pair append 与 delivery acknowledgement 之间的 crash window 尚未完成 P2 exactly-once reconciliation；P0.5 不声称已经解决。
 - runtime artifact 校验会在 import 前后复查，但不能抵御同机恶意进程在 TOCTOU 窗口持续篡改文件。
 - Provider 隐藏 chain-of-thought 不可见；界面只显示显式 reasoning block。
 - OpenAI-compatible 路径已做本地装配和无网络 prepare-call 验证，本阶段没有把真实网络调用作为自动验收项。
-- safe preset 只提供 Pair 注册的 harmless tool；启动时会校验全局及 Pair Agent scope 的 model-facing tool catalog 与配置 allowlist 完整 schema 精确一致，否则 fail closed。Sub-agent、workflow、shell、文件写入和网络搜索均不属于 Phase 0 dev 默认能力。即使这些工具未挂载，host 侧 sandbox-policy 与 fs-sandbox 的 fallback root 仍固定在 data root，默认策略为 read-only。
+- safe preset 只提供 Pair 注册的 `pair_message_peer` 与演示用 harmless tool；启动时会校验全局、assembled Provider boundary 及 Pair Agent scope 的 model-facing tool catalog 与配置 allowlist 完整 schema 精确一致，否则 fail closed。Sub-agent、workflow、shell、文件写入和网络搜索均不属于 P0.5 dev 默认能力。即使这些工具未挂载，host 侧 sandbox-policy 与 fs-sandbox 的 fallback root 仍固定在 data root，默认策略为 read-only。

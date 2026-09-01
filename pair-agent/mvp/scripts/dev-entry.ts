@@ -8,12 +8,14 @@ import { JsonlPairLedgerStore } from '../packages/ledger/src/index.js';
 import {
   launchDshPairWebRuntime,
   PairCoordinator,
+  PeerMessageRouter,
+  PeerMessageService,
   PairRegistry,
   type DshPairWebRuntime,
 } from '../packages/runtime/src/index.js';
 
 import { readPhase0DevConfig } from './dev-config.js';
-import { closeBestEffort, pairWebRuntimeDefines } from './runtime-utils.js';
+import { closeP05DevComposition, pairWebRuntimeDefines } from './runtime-utils.js';
 
 const mvpRoot = fileURLToPath(new URL('..', import.meta.url));
 
@@ -38,6 +40,7 @@ export async function runPhase0Dev(environment: NodeJS.ProcessEnv = process.env)
   await mkdir(config.dataRoot, { recursive: true });
   const pairRoot = join(config.dataRoot, 'pairs');
   const store = new JsonlPairLedgerStore(pairRoot);
+  const peerRouter = new PeerMessageRouter();
   let registry!: PairRegistry;
   let dshRuntime: DshPairWebRuntime | undefined;
   let pairHost: ReturnType<typeof createPairHostServer> | undefined;
@@ -51,11 +54,11 @@ export async function runPhase0Dev(environment: NodeJS.ProcessEnv = process.env)
   let closing: Promise<void> | undefined;
   const close = (): Promise<void> => {
     if (closing !== undefined) return closing;
-    const attempt = closeBestEffort('Phase 0 shutdown failed', [
-      async () => pairWeb?.close(),
-      async () => pairHost?.close(),
-      async () => dshRuntime?.close(),
-    ]);
+    const attempt = closeP05DevComposition({
+      pairWeb,
+      pairHost,
+      hostedRuntime: dshRuntime,
+    });
     closing = attempt;
     void attempt.catch(() => {
       if (closing === attempt) closing = undefined;
@@ -65,15 +68,15 @@ export async function runPhase0Dev(environment: NodeJS.ProcessEnv = process.env)
 
   try {
     const captureResponses = [
-      'Navigator accepted the Phase 0 demonstration.',
+      'Navigator accepted the P0.5 demonstration.',
       {
         toolCall: {
           id: 'call-phase0-demo',
           name: 'phase0_echo',
-          arguments: { text: 'Pair Agent Phase 0 is live' },
+          arguments: { text: 'Pair Agent P0.5 is live' },
         },
       } as const,
-      'Pilot completed the harmless Phase 0 demonstration.',
+      'Pilot completed the harmless P0.5 demonstration.',
       ...Array.from({ length: 128 }, (_, index) => `Capture response ${String(index + 1)}.`),
     ];
     dshRuntime = await launchDshPairWebRuntime({
@@ -104,6 +107,7 @@ export async function runPhase0Dev(environment: NodeJS.ProcessEnv = process.env)
             },
           }),
       tools: [
+        peerRouter.toolDefinition(),
         {
           name: 'phase0_echo',
           description: 'Echo text without side effects.',
@@ -120,6 +124,7 @@ export async function runPhase0Dev(environment: NodeJS.ProcessEnv = process.env)
     });
     registry = new PairRegistry(store, dshRuntime.adapter);
     const coordinator = new PairCoordinator(registry, store, dshRuntime.adapter);
+    peerRouter.bind(new PeerMessageService(coordinator, dshRuntime.adapter));
     const existingHead = (await store.heads(config.pairId)).ledgerHead;
     if (existingHead === 0) {
       await coordinator.createPair({
@@ -130,7 +135,7 @@ export async function runPhase0Dev(environment: NodeJS.ProcessEnv = process.env)
       if (config.provider.kind === 'capture') {
         await coordinator.sendNavigator({
           pairId: config.pairId,
-          text: 'Start the local Pair Agent Phase 0 demonstration.',
+          text: 'Start the local Pair Agent P0.5 demonstration.',
           expectedLedgerHead: (await store.heads(config.pairId)).ledgerHead,
         });
         await dshRuntime.adapter.whenIdle(`pair:${config.pairId}:navigator`);
@@ -140,7 +145,7 @@ export async function runPhase0Dev(environment: NodeJS.ProcessEnv = process.env)
           task: {
             id: 'phase0-demo',
             revision: 1,
-            summary: 'Run the harmless Phase 0 echo tool.',
+            summary: 'Run the harmless P0.5 echo tool.',
             state: 'queued',
           },
         });
@@ -186,7 +191,7 @@ export async function runPhase0Dev(environment: NodeJS.ProcessEnv = process.env)
       ready(pairUrl, 'Pair Web'),
     ]);
     process.stdout.write([
-      'Pair Agent Phase 0 ready',
+      'Pair Agent P0.5 ready',
       `Pair Web: ${pairUrl}`,
       `DSH Web: ${dshRuntime.origin}`,
       `Pair Host: ${pairHostAddress.origin}`,
@@ -207,7 +212,7 @@ export async function runPhase0Dev(environment: NodeJS.ProcessEnv = process.env)
     });
   } catch (error) {
     await close().catch((closeError: unknown) => {
-      throw new AggregateError([error, closeError], 'Phase 0 startup and cleanup failed');
+      throw new AggregateError([error, closeError], 'P0.5 startup and cleanup failed');
     });
     throw error;
   }
