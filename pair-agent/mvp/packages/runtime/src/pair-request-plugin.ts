@@ -666,15 +666,32 @@ function materializeMessages(
     }
     return original;
   });
-  const prefixCount = 3;
-  const syntheticPrefix = layout.messages.slice(0, prefixCount).map(syntheticMessage);
+  const sharedPrefix = layout.messages.slice(0, 2).map(syntheticMessage);
+  const reminderIndex = layout.messages.length - (hasTrigger ? 2 : 1);
+  const reminder = layout.messages[reminderIndex];
+  if (reminder === undefined) {
+    throw new PairRequestBindingError(
+      'Pair request layout omitted its active role reminder',
+    );
+  }
+  if (
+    typeof reminder.content !== 'string' ||
+    !/^<system-reminder><active-role>(navigator|pilot)<\/active-role><role-tool-guidance>.+<\/role-tool-guidance><\/system-reminder>$/.test(
+      reminder.content,
+    )
+  ) {
+    throw new PairRequestBindingError(
+      'Pair request layout misplaced its active role reminder',
+    );
+  }
   const trigger = hasTrigger ? layout.messages.at(-1) : undefined;
   if (hasTrigger && trigger === undefined) {
     throw new PairRequestBindingError('Pair request layout omitted its trigger');
   }
   return [
-    ...syntheticPrefix,
+    ...sharedPrefix,
     ...local,
+    syntheticMessage(reminder),
     ...(trigger === undefined ? [] : [syntheticMessage(trigger)]),
   ];
 }

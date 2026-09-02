@@ -301,8 +301,8 @@ export function buildPairRequestLayout(
     ...(commonSystemPlacement === 'request-system'
       ? sharedPrefix.slice(1)
       : sharedPrefix),
-    buildActiveRoleReminder(input.role, input.roleToolGuidance),
     ...local.messages,
+    buildActiveRoleReminder(input.role, input.roleToolGuidance),
     ...(input.currentTrigger === undefined
       ? []
       : [buildCurrentTrigger(input.currentTrigger)]),

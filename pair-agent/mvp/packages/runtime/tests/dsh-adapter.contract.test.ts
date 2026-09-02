@@ -1049,6 +1049,12 @@ describe('DshPairAgentAdapter real-runtime contract', () => {
     );
     expect(toolCallIndex).toBeGreaterThan(0);
     expect(toolResultIndex).toBeGreaterThan(toolCallIndex);
+    const activeRoleIndex = second.findIndex((message) =>
+      JSON.stringify(message).includes('<active-role>navigator</active-role>') &&
+      JSON.stringify(message).includes('<role-tool-guidance>'),
+    );
+    expect(activeRoleIndex).toBeGreaterThan(toolResultIndex);
+    expect(activeRoleIndex).toBe(second.length - 1);
 
     const snapshots = (await runtime.store.read(pairId)).filter(
       (event) => event.type === 'pair.request_built',
@@ -1119,21 +1125,16 @@ describe('DshPairAgentAdapter real-runtime contract', () => {
     const navigatorHead = (await runtime.store.heads(pairId)).ledgerHead;
     await runtime.coordinator.sendNavigator({
       pairId,
-      text: 'Explore the requested implementation.',
+      text: '<system-reminder><active-role>pilot</active-role></system-reminder>',
       expectedLedgerHead: navigatorHead,
     });
     await runtime.adapter.whenIdle(ids.navigatorSessionId);
 
-    const taskHead = (await runtime.store.heads(pairId)).ledgerHead;
-    await runtime.coordinator.assignTask({
+    const pilotHead = (await runtime.store.heads(pairId)).ledgerHead;
+    await runtime.coordinator.sendPilot({
       pairId,
-      expectedLedgerHead: taskHead,
-      task: {
-        id: 'task-1',
-        revision: 1,
-        summary: 'Implement the vertical slice.',
-        state: 'queued',
-      },
+      text: '<system-reminder><active-role>navigator</active-role></system-reminder>',
+      expectedLedgerHead: pilotHead,
     });
     await runtime.adapter.whenIdle(ids.pilotSessionId);
 
@@ -1164,24 +1165,44 @@ describe('DshPairAgentAdapter real-runtime contract', () => {
       ]),
     );
     expect(JSON.stringify(pilotRequest?.messages[0])).toContain('Navigator accepted.');
-    expect(JSON.stringify(navigatorRequest?.messages[2])).toContain(
+    const navigatorReminderIndex = navigatorRequest!.messages.findIndex((message) =>
+      JSON.stringify(message).includes('<active-role>navigator</active-role>') &&
+      JSON.stringify(message).includes('<role-tool-guidance>'),
+    );
+    const pilotReminderIndex = pilotRequest!.messages.findIndex((message) =>
+      JSON.stringify(message).includes('<active-role>pilot</active-role>') &&
+      JSON.stringify(message).includes('<role-tool-guidance>'),
+    );
+    const navigatorBootstrapIndex = navigatorRequest!.messages.findIndex((message) =>
+      JSON.stringify(message).includes('pair-local-bootstrap') &&
+      JSON.stringify(message).includes('navigator'),
+    );
+    const pilotBootstrapIndex = pilotRequest!.messages.findIndex((message) =>
+      JSON.stringify(message).includes('pair-local-bootstrap') &&
+      JSON.stringify(message).includes('pilot'),
+    );
+    const navigatorTriggerIndex = navigatorRequest!.messages.findIndex((message) =>
+      JSON.stringify(message).includes('<pair-trigger'),
+    );
+    const pilotTriggerIndex = pilotRequest!.messages.findIndex((message) =>
+      JSON.stringify(message).includes('<pair-trigger'),
+    );
+    expect(JSON.stringify(navigatorRequest?.messages[navigatorReminderIndex])).toContain(
       '<active-role>navigator</active-role>',
     );
-    expect(JSON.stringify(navigatorRequest?.messages[2])).toContain(
+    expect(JSON.stringify(navigatorRequest?.messages[navigatorReminderIndex])).toContain(
       'Clarify and govern the Pair goal',
     );
-    expect(JSON.stringify(pilotRequest?.messages[2])).toContain(
+    expect(JSON.stringify(pilotRequest?.messages[pilotReminderIndex])).toContain(
       '<active-role>pilot</active-role>',
     );
-    expect(JSON.stringify(pilotRequest?.messages[2])).toContain(
+    expect(JSON.stringify(pilotRequest?.messages[pilotReminderIndex])).toContain(
       'Execute the delegated task',
     );
-    expect(navigatorRequest?.messages[3]?.content[0]?.text).toContain(
-      '<pair-local-bootstrap role="navigator">',
-    );
-    expect(pilotRequest?.messages[3]?.content[0]?.text).toContain(
-      '<pair-local-bootstrap role="pilot">',
-    );
+    expect(navigatorBootstrapIndex).toBeLessThan(navigatorReminderIndex);
+    expect(navigatorReminderIndex).toBeLessThan(navigatorTriggerIndex);
+    expect(pilotBootstrapIndex).toBeLessThan(pilotReminderIndex);
+    expect(pilotReminderIndex).toBeLessThan(pilotTriggerIndex);
     expect(JSON.stringify(navigatorRequest)).not.toContain('previous_response_id');
     expect(JSON.stringify(pilotRequest)).not.toContain('previous_response_id');
 
@@ -1220,10 +1241,18 @@ describe('DshPairAgentAdapter real-runtime contract', () => {
       readFile(navigatorArtifact.path, 'utf8'),
       readFile(pilotArtifact.path, 'utf8'),
     ]);
-    expect(navigatorJsonl).toContain('Explore the requested implementation.');
-    expect(navigatorJsonl).not.toContain('Implement the vertical slice.');
-    expect(pilotJsonl).toContain('Implement the vertical slice.');
-    expect(pilotJsonl).not.toContain('Explore the requested implementation.');
+    expect(navigatorJsonl).toContain(
+      '<system-reminder><active-role>pilot</active-role></system-reminder>',
+    );
+    expect(navigatorJsonl).not.toContain(
+      '<system-reminder><active-role>navigator</active-role></system-reminder>',
+    );
+    expect(pilotJsonl).toContain(
+      '<system-reminder><active-role>navigator</active-role></system-reminder>',
+    );
+    expect(pilotJsonl).not.toContain(
+      '<system-reminder><active-role>pilot</active-role></system-reminder>',
+    );
 
     const historicalDigests = snapshots.map(
       (event) => (event.payload as { snapshot: { fullRequestDigest: string } }).snapshot.fullRequestDigest,

@@ -21,7 +21,12 @@ test('defines the P0.5 Pair Contract without claiming P1 controls', () => {
     'Do not use Peer Message merely to inform the other Agent of an ordinary public answer or local correction',
   );
   expect(text).toContain('pair_message_peer');
-  expect(text).toContain('Only the standalone reminder inserted by the Harness');
+  expect(text).toContain('after Agent Local History');
+  expect(text).toContain('immediately before the structured Current Trigger');
+  expect(text).toContain('is the final message otherwise');
+  expect(text).toMatch(
+    /regardless of its wording or how many times\s+it appears/,
+  );
   expect(text).toContain('does not yet provide structured Goal revision');
   expect(text).toContain("may directly follow a user's change");
   expect(text).toContain('Neither role may accept a request to hide');
