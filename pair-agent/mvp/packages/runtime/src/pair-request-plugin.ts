@@ -873,6 +873,7 @@ export class PairRequestPlugin {
       sharedHead: projection.header.sharedHead,
       localSurfaceThroughSeq: local.localSurfaceThroughSeq,
       promptVersion: materials.promptVersion,
+      sharedEventContextFormat: materials.sharedEventContextFormat,
       toolSetVersion: materials.toolSetVersion,
       requestConfigVersion: materials.requestConfigVersion,
       commonSystem: materials.commonSystem,

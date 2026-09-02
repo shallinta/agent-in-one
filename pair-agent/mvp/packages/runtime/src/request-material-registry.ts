@@ -3,10 +3,16 @@ import {
   type JsonObject,
   type PairRole,
 } from '@pair-agent/contracts';
-import type { CommonSystemDefinition } from '@pair-agent/context';
+import {
+  SHARED_EVENT_CONTEXT_FULL_V1,
+  SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
+  type CommonSystemDefinition,
+  type SharedEventContextFormat,
+} from '@pair-agent/context';
 
 export interface PairRequestMaterialEntry {
   readonly promptVersion: string;
+  readonly sharedEventContextFormat: SharedEventContextFormat;
   readonly commonSystem: CommonSystemDefinition;
   readonly roleToolGuidance: Readonly<Record<PairRole, string>>;
   readonly toolSetVersion: string;
@@ -17,6 +23,7 @@ export interface PairRequestMaterialEntry {
 
 export interface PairRequestMaterialVersions {
   readonly promptVersion: string;
+  readonly sharedEventContextFormat: SharedEventContextFormat;
   readonly toolSetVersion: string;
   readonly requestConfigVersion: string;
 }
@@ -31,6 +38,7 @@ export class RequestMaterialRegistryError extends Error {
 function key(versions: PairRequestMaterialVersions): string {
   return canonicalJsonStringify({
     promptVersion: versions.promptVersion,
+    sharedEventContextFormat: versions.sharedEventContextFormat,
     toolSetVersion: versions.toolSetVersion,
     requestConfigVersion: versions.requestConfigVersion,
   });
@@ -77,6 +85,9 @@ export class ImmutablePairRequestMaterialRegistry {
   #add(entry: PairRequestMaterialEntry): void {
     if (
       entry.promptVersion.length === 0 ||
+      (entry.sharedEventContextFormat !== SHARED_EVENT_CONTEXT_FULL_V1 &&
+        entry.sharedEventContextFormat !==
+          SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1) ||
       entry.toolSetVersion.length === 0 ||
       entry.requestConfigVersion.length === 0 ||
       entry.commonSystem.version !== entry.promptVersion

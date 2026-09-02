@@ -18,7 +18,9 @@ import {
 } from '@pair-agent/contracts';
 import {
   assertContentAddressedPairPrompt,
+  SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
   type CommonSystemDefinition,
+  type SharedEventContextFormat,
 } from '@pair-agent/context';
 import { JsonlPairLedgerStore } from '@pair-agent/ledger';
 
@@ -353,6 +355,7 @@ export interface DshPairAgentAdapterOptions {
     readonly reasoningEffort?: string;
   };
   readonly roleToolGuidance?: Readonly<Record<PairRole, string>>;
+  readonly sharedEventContextFormat?: SharedEventContextFormat;
   readonly historicalRequestMaterials?: readonly PairRequestMaterialEntry[];
   readonly onLedgerAdvanced?: (pairId: PairId) => Promise<void> | void;
   /** Capture-mode fault injection for lifecycle rollback contract tests only. */
@@ -1156,6 +1159,8 @@ export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPo
       : structuredClone((await context.llm.prepareCall(proposedConfig)).config);
     const activeMaterials: PairRequestMaterialEntry = {
       promptVersion: options.commonSystem.version,
+      sharedEventContextFormat:
+        options.sharedEventContextFormat ?? SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
       commonSystem: options.commonSystem,
       roleToolGuidance,
       toolSetVersion: `pair-tools/v1:${sha256Request(tools)}`,
@@ -1817,6 +1822,7 @@ export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPo
         typeof snapshot.sourceLedgerHead !== 'number' ||
         typeof snapshot.localSurfaceThroughSeq !== 'number' ||
         typeof snapshot.promptVersion !== 'string' ||
+        typeof snapshot.sharedEventContextFormat !== 'string' ||
         typeof snapshot.toolSetVersion !== 'string' ||
         typeof snapshot.requestConfigVersion !== 'string'
       ) {
@@ -1826,6 +1832,8 @@ export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPo
       }
       const materials = this.requestMaterials.resolve({
         promptVersion: snapshot.promptVersion,
+        sharedEventContextFormat:
+          snapshot.sharedEventContextFormat as SharedEventContextFormat,
         toolSetVersion: snapshot.toolSetVersion,
         requestConfigVersion: snapshot.requestConfigVersion,
       });

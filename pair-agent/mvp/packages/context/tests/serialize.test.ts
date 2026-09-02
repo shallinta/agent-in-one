@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  SHARED_EVENT_CONTEXT_FULL_V1,
+  SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
   SharedContextInvariantError,
   buildSharedProjection,
   buildSharedContext,
@@ -209,8 +211,14 @@ describe('shared context serialization', () => {
     const events = [event(1), event(2)];
     const current = projection(2);
 
-    const navigatorPrefix = buildSharedContext(events, current, { commonSystem });
-    const pilotPrefix = buildSharedContext(events, current, { commonSystem });
+    const navigatorPrefix = buildSharedContext(events, current, {
+      commonSystem,
+      sharedEventContextFormat: SHARED_EVENT_CONTEXT_FULL_V1,
+    });
+    const pilotPrefix = buildSharedContext(events, current, {
+      commonSystem,
+      sharedEventContextFormat: SHARED_EVENT_CONTEXT_FULL_V1,
+    });
 
     expect(navigatorPrefix).toHaveLength(3);
     expect(pilotPrefix).toEqual(navigatorPrefix);
@@ -234,7 +242,11 @@ describe('shared context serialization', () => {
       },
     });
 
-    const serialized = serializeSharedEvents([event(1), injected], 2);
+    const serialized = serializeSharedEvents(
+      [event(1), injected],
+      2,
+      SHARED_EVENT_CONTEXT_FULL_V1,
+    );
     const jsonLines = serialized
       .split('\n')
       .filter((line) => line.startsWith('{'));
@@ -245,6 +257,99 @@ describe('shared context serialization', () => {
     );
     expect(serialized).toMatch(
       /<pair-events-watermark shared-head="2" digest="sha256:[0-9a-f]{64}" \/>/,
+    );
+  });
+
+  it('removes an exactly duplicated text content block only from the model projection', () => {
+    const message = event(2, {
+      payload: {
+        schemaVersion: 1,
+        kind: 'user-input',
+        text: 'hello',
+        content: [{ type: 'text', text: 'hello' }],
+      },
+    });
+    const original = structuredClone(message);
+
+    const serialized = serializeSharedEvents(
+      [event(1), message],
+      2,
+      SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
+    );
+    const projected = JSON.parse(
+      serialized.split('\n').find((line) => line.includes('"seq":2'))!,
+    ) as PairEvent;
+
+    expect(serialized).toContain(
+      '<pair-session-events schema="pair-event-context/text-dedup-v1"',
+    );
+    expect(projected.payload).toEqual({
+      schemaVersion: 1,
+      kind: 'user-input',
+      text: 'hello',
+    });
+    expect(message).toEqual(original);
+  });
+
+  it.each([
+    {
+      name: 'different text',
+      content: [{ type: 'text', text: 'different' }],
+    },
+    {
+      name: 'an additional block',
+      content: [
+        { type: 'text', text: 'hello' },
+        { type: 'text', text: 'more' },
+      ],
+    },
+    {
+      name: 'additional block metadata',
+      content: [{ type: 'text', text: 'hello', language: 'en' }],
+    },
+  ])('keeps non-equivalent content for $name', ({ content }) => {
+    const message = event(2, {
+      payload: {
+        schemaVersion: 1,
+        kind: 'user-input',
+        text: 'hello',
+        content,
+      },
+    });
+
+    const serialized = serializeSharedEvents(
+      [event(1), message],
+      2,
+      SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
+    );
+    const projected = JSON.parse(
+      serialized.split('\n').find((line) => line.includes('"seq":2'))!,
+    ) as PairEvent;
+
+    expect(projected.payload.content).toEqual(content);
+  });
+
+  it('preserves the legacy full event representation byte shape', () => {
+    const message = event(2, {
+      payload: {
+        schemaVersion: 1,
+        kind: 'user-input',
+        text: 'hello',
+        content: [{ type: 'text', text: 'hello' }],
+      },
+    });
+
+    const serialized = serializeSharedEvents(
+      [event(1), message],
+      2,
+      SHARED_EVENT_CONTEXT_FULL_V1,
+    );
+
+    expect(serialized).toContain(
+      '<pair-session-events schema="pair-events/v1" pair-id="pair-01" from-seq="1">',
+    );
+    expect(serialized).toContain(
+      '"content":[{"text":"hello","type":"text"}],"kind":"user-input","schemaVersion":1,"text":"hello"',
     );
   });
 
@@ -313,8 +418,16 @@ describe('shared context serialization', () => {
     });
 
     expect(
-      buildSharedContext(sharedEvents, second, { commonSystem }),
-    ).toEqual(buildSharedContext(sharedEvents, first, { commonSystem }));
+      buildSharedContext(sharedEvents, second, {
+        commonSystem,
+        sharedEventContextFormat: SHARED_EVENT_CONTEXT_FULL_V1,
+      }),
+    ).toEqual(
+      buildSharedContext(sharedEvents, first, {
+        commonSystem,
+        sharedEventContextFormat: SHARED_EVENT_CONTEXT_FULL_V1,
+      }),
+    );
   });
 
   it('changes shared projection bytes when shared business state changes', () => {
@@ -358,7 +471,9 @@ describe('shared context serialization', () => {
       message: /end at sharedHead/,
     },
   ])('rejects $name', ({ events, head, message }) => {
-    expect(() => serializeSharedEvents(events, head)).toThrow(message);
+    expect(() =>
+      serializeSharedEvents(events, head, SHARED_EVENT_CONTEXT_FULL_V1),
+    ).toThrow(message);
   });
 
   it('rejects a projection whose pair or shared head differs from its events', () => {
@@ -367,10 +482,16 @@ describe('shared context serialization', () => {
     wrongPair.header.pairId = parsePairId('other-pair');
 
     expect(() =>
-      buildSharedContext(events, wrongPair, { commonSystem }),
+      buildSharedContext(events, wrongPair, {
+        commonSystem,
+        sharedEventContextFormat: SHARED_EVENT_CONTEXT_FULL_V1,
+      }),
     ).toThrow(SharedContextInvariantError);
     expect(() =>
-      buildSharedContext(events, projection(1), { commonSystem }),
+      buildSharedContext(events, projection(1), {
+        commonSystem,
+        sharedEventContextFormat: SHARED_EVENT_CONTEXT_FULL_V1,
+      }),
     ).toThrow(/exceeds sharedHead/);
   });
 
@@ -387,7 +508,11 @@ describe('shared context serialization', () => {
     },
   ])('rejects non-JSON-safe event payloads', ({ payload, message }) => {
     expect(() =>
-      serializeSharedEvents([event(1, { payload: payload as never })], 1),
+      serializeSharedEvents(
+        [event(1, { payload: payload as never })],
+        1,
+        SHARED_EVENT_CONTEXT_FULL_V1,
+      ),
     ).toThrow(message);
   });
 });

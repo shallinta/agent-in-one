@@ -53,7 +53,16 @@ export interface CommonSystemDefinition {
 
 export interface BuildSharedContextOptions {
   commonSystem: CommonSystemDefinition;
+  sharedEventContextFormat: SharedEventContextFormat;
 }
+
+export const SHARED_EVENT_CONTEXT_FULL_V1 = 'pair-event-context/full-v1';
+export const SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1 =
+  'pair-event-context/text-dedup-v1';
+
+export type SharedEventContextFormat =
+  | typeof SHARED_EVENT_CONTEXT_FULL_V1
+  | typeof SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1;
 
 export interface SharedProjection {
   readonly schemaVersion: 1;
@@ -248,9 +257,15 @@ function positiveSafeInteger(value: number, label: string): void {
 export function serializeSharedEvents(
   events: readonly PairEvent[],
   sharedHead: number,
+  format: SharedEventContextFormat,
 ): string {
   positiveSafeInteger(sharedHead, 'sharedHead');
   invariant(events.length > 0, 'shared events must not be empty');
+  invariant(
+    format === SHARED_EVENT_CONTEXT_FULL_V1 ||
+      format === SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
+    `unsupported shared event context format ${String(format)}`,
+  );
 
   let previousSeq = 0;
   let pairId: string | undefined;
@@ -272,7 +287,27 @@ export function serializeSharedEvents(
     if (pairId === undefined) pairId = event.pairId;
     invariant(event.pairId === pairId, 'all shared events must have the same pairId');
     previousSeq = event.seq;
-    return canonicalJsonStringify(event);
+    if (format === SHARED_EVENT_CONTEXT_FULL_V1) {
+      return canonicalJsonStringify(event);
+    }
+    const projected = JSON.parse(canonicalJsonStringify(event)) as JsonObject;
+    const payload = projected.payload;
+    if (
+      typeof payload === 'object' &&
+      payload !== null &&
+      !Array.isArray(payload)
+    ) {
+      const payloadObject = payload as Record<string, JsonValue>;
+      if (
+        typeof payloadObject.text === 'string' &&
+        Array.isArray(payloadObject.content) &&
+        canonicalJsonStringify(payloadObject.content) ===
+          canonicalJsonStringify([{ type: 'text', text: payloadObject.text }])
+      ) {
+        delete payloadObject.content;
+      }
+    }
+    return canonicalJsonStringify(projected);
   });
 
   invariant(
@@ -280,8 +315,12 @@ export function serializeSharedEvents(
     `shared events must end at sharedHead ${sharedHead}; found ${previousSeq}`,
   );
   const eventBytes = lines.join('\n');
+  const schema =
+    format === SHARED_EVENT_CONTEXT_FULL_V1
+      ? 'pair-events/v1'
+      : SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1;
   return [
-    `<pair-session-events schema="pair-events/v1" pair-id="${pairId}" from-seq="${events[0]?.seq}">`,
+    `<pair-session-events schema="${schema}" pair-id="${pairId}" from-seq="${events[0]?.seq}">`,
     eventBytes,
     `<pair-events-watermark shared-head="${sharedHead}" digest="${sha256(eventBytes)}" />`,
     '</pair-session-events>',
@@ -345,6 +384,7 @@ export function buildSharedContext(
   const serializedEvents = serializeSharedEvents(
     events,
     projection.header.sharedHead,
+    options.sharedEventContextFormat,
   );
   invariant(
     events[0]?.pairId === projection.header.pairId,

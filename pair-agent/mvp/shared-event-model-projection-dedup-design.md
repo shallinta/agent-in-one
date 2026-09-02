@@ -1,5 +1,7 @@
 # Shared Event 模型投影去重设计
 
+> 实施状态：已在 MVP 中实现并通过完整测试。新的活动请求默认使用 `pair-event-context/text-dedup-v1`；`pair-event-context/full-v1` 保留用于精确重建采用旧格式生成的请求。
+
 ## 1. 目标
 
 消除模型请求中 `PairMessagePayload.text` 与单一纯文本 `content` block 的正文重复，同时保持 canonical Pair Ledger、Events API、Events UI、Pair Event 校验与 Agent-local Session 不变。
@@ -68,3 +70,5 @@ Shared Event 模型投影格式是 immutable request material 的一部分，不
 ## 6. 验收标准
 
 在保持当前 Ledger 内容和事件数量不变的前提下，真实 Pair 数据的模型投影不再同时携带等价的 `payload.text` 与 `payload.content[0].text`；非等价 content 信息零损失；历史格式不会被新 projector 静默重解释。
+
+实现没有加入 turn-end completion handoff；当前 MVP 继续依靠已补强的委派完成回报协议闭环。若后续真实使用仍频繁出现 Pilot 完成但未回报，再单独评估 Harness 在 `turn/end` 自动生成 completion handoff 的成本与副作用。

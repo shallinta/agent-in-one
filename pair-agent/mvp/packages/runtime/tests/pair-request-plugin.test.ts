@@ -9,6 +9,7 @@ import {
   type PairEvent,
 } from '@pair-agent/contracts';
 import { JsonlPairLedgerStore } from '@pair-agent/ledger';
+import { SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1 } from '@pair-agent/context';
 import { vi, describe, expect, test } from 'vitest';
 
 import {
@@ -20,6 +21,7 @@ import { ImmutablePairRequestMaterialRegistry } from '../src/request-material-re
 
 function materialRegistry(): ImmutablePairRequestMaterialRegistry {
   return new ImmutablePairRequestMaterialRegistry({
+    sharedEventContextFormat: SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
     promptVersion: 'pair-prompt/v1',
     commonSystem: { version: 'pair-prompt/v1', content: 'complete prompt' },
     roleToolGuidance: { navigator: 'govern', pilot: 'execute' },
@@ -243,6 +245,7 @@ describe('PairRequestPlugin request-layout ownership', () => {
         sessionId: 'pair:pair-plugin-exclusive:navigator',
       },
       materialRegistry: new ImmutablePairRequestMaterialRegistry({
+        sharedEventContextFormat: SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
         promptVersion: 'pair-prompt/v1',
         commonSystem: { version: 'pair-prompt/v1', content: 'complete prompt' },
         roleToolGuidance: { navigator: 'govern', pilot: 'execute' },
@@ -278,6 +281,7 @@ describe('PairRequestPlugin request-layout ownership', () => {
 
   test('shares one live attempt and removes it after settlement', async () => {
     const materialRegistry = new ImmutablePairRequestMaterialRegistry({
+      sharedEventContextFormat: SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
       promptVersion: 'pair-prompt/v1',
       commonSystem: { version: 'pair-prompt/v1', content: 'complete prompt' },
       roleToolGuidance: { navigator: 'govern', pilot: 'execute' },
@@ -351,6 +355,7 @@ describe('PairRequestPlugin request-layout ownership', () => {
         0,
       );
       const materialRegistry = new ImmutablePairRequestMaterialRegistry({
+        sharedEventContextFormat: SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
         promptVersion: 'pair-prompt/v1',
         commonSystem: { version: 'pair-prompt/v1', content: 'complete prompt' },
         roleToolGuidance: { navigator: 'govern', pilot: 'execute' },
@@ -399,6 +404,29 @@ describe('PairRequestPlugin request-layout ownership', () => {
 });
 
 describe('PairRequestPlugin exactly-once request projection', () => {
+  test('uses the immutable material-selected shared-event projection format', () => {
+    const pairId = 'pair-model-projection-format';
+    const sessionId = createPairSessionIds(pairId).navigatorSessionId;
+    const text = 'Keep this text once in the model projection.';
+
+    const result = rebuild(
+      pairId,
+      [pairCreated(pairId), sharedUserMessage(pairId, sessionId, 'message-1', text)],
+      requestPayload(sessionId, dshUserMessage('message-1', text, { kind: 'user' })),
+    );
+
+    const sharedEvents = String(result.messages[0]?.content[0]?.text);
+    expect(sharedEvents).toContain('schema="pair-event-context/text-dedup-v1"');
+    expect(sharedEvents).toContain(`"text":"${text}"`);
+    expect(sharedEvents).not.toContain(`"content":[{"text":"${text}","type":"text"}]`);
+    expect(result.snapshot).toMatchObject({
+      sharedEventContextFormat: SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
+    });
+    expect(result.manifest).toMatchObject({
+      sharedEventContextFormat: SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
+    });
+  });
+
   test('accepts a canonical directed peer delivery as request-local proof', () => {
     const pairId = 'pair-peer-delivery-proof';
     const sessionId = createPairSessionIds(pairId).pilotSessionId;

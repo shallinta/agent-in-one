@@ -8,6 +8,7 @@ import {
 
 const entry: PairRequestMaterialEntry = {
   promptVersion: 'prompt/v1',
+  sharedEventContextFormat: 'pair-event-context/text-dedup-v1',
   commonSystem: { version: 'prompt/v1', content: 'common' },
   roleToolGuidance: { navigator: 'govern', pilot: 'execute' },
   toolSetVersion: 'tools/v1',
@@ -34,6 +35,32 @@ describe('ImmutablePairRequestMaterialRegistry', () => {
     expect(
       registry.resolve({
         promptVersion: 'prompt/v1',
+        sharedEventContextFormat: 'pair-event-context/text-dedup-v1',
+        toolSetVersion: 'tools/v1',
+        requestConfigVersion: 'config/v1',
+      }),
+    ).toEqual(entry);
+  });
+
+  test('addresses otherwise identical materials by shared event context format', () => {
+    const legacy: PairRequestMaterialEntry = {
+      ...entry,
+      sharedEventContextFormat: 'pair-event-context/full-v1',
+    };
+    const registry = new ImmutablePairRequestMaterialRegistry(entry, [legacy]);
+
+    expect(
+      registry.resolve({
+        promptVersion: 'prompt/v1',
+        sharedEventContextFormat: 'pair-event-context/full-v1',
+        toolSetVersion: 'tools/v1',
+        requestConfigVersion: 'config/v1',
+      }),
+    ).toEqual(legacy);
+    expect(
+      registry.resolve({
+        promptVersion: 'prompt/v1',
+        sharedEventContextFormat: 'pair-event-context/text-dedup-v1',
         toolSetVersion: 'tools/v1',
         requestConfigVersion: 'config/v1',
       }),

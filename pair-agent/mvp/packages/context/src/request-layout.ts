@@ -23,6 +23,7 @@ import {
   normalizeMessage,
   type CommonSystemDefinition,
   type NormalizedMessage,
+  type SharedEventContextFormat,
 } from './serialize.js';
 
 export interface PairRequestLayoutInput {
@@ -35,6 +36,7 @@ export interface PairRequestLayoutInput {
   sharedHead: number;
   localSurfaceThroughSeq: number;
   promptVersion: string;
+  sharedEventContextFormat: SharedEventContextFormat;
   toolSetVersion: string;
   requestConfigVersion: string;
   commonSystem: CommonSystemDefinition;
@@ -73,6 +75,7 @@ export interface LayoutManifest {
   sharedHead: number;
   localSurfaceThroughSeq: number;
   promptVersion: string;
+  sharedEventContextFormat: SharedEventContextFormat;
   toolSetVersion: string;
   requestConfigVersion: string;
   commonSystemPlacement: 'message' | 'request-system';
@@ -89,6 +92,7 @@ export interface PairRequestSnapshot {
   sharedHead: number;
   localSurfaceThroughSeq: number;
   promptVersion: string;
+  sharedEventContextFormat: SharedEventContextFormat;
   toolSetVersion: string;
   requestConfigVersion: string;
   commonSystemDigest: string;
@@ -199,6 +203,10 @@ function validateInput(input: PairRequestLayoutInput): void {
   );
   nonEmptyString(input.sessionId, 'sessionId');
   nonEmptyString(input.promptVersion, 'promptVersion');
+  nonEmptyString(
+    input.sharedEventContextFormat,
+    'sharedEventContextFormat',
+  );
   nonEmptyString(input.toolSetVersion, 'toolSetVersion');
   nonEmptyString(input.requestConfigVersion, 'requestConfigVersion');
   invariant(
@@ -281,7 +289,10 @@ export function buildPairRequestLayout(
   const sharedPrefix = buildSharedContext(
     input.sharedEvents,
     input.projection,
-    { commonSystem: input.commonSystem },
+    {
+      commonSystem: input.commonSystem,
+      sharedEventContextFormat: input.sharedEventContextFormat,
+    },
   );
   const local = projectLocalHistory(input.boundaryMessages, input.links, {
     expectedSessionId: input.sessionId,
@@ -317,6 +328,7 @@ export function buildPairRequestLayout(
     sharedHead: input.sharedHead,
     localSurfaceThroughSeq: input.localSurfaceThroughSeq,
     promptVersion: input.promptVersion,
+    sharedEventContextFormat: input.sharedEventContextFormat,
     toolSetVersion: input.toolSetVersion,
     requestConfigVersion: input.requestConfigVersion,
     commonSystemPlacement,
@@ -338,6 +350,7 @@ export function buildPairRequestLayout(
     sharedHead: input.sharedHead,
     localSurfaceThroughSeq: input.localSurfaceThroughSeq,
     promptVersion: input.promptVersion,
+    sharedEventContextFormat: input.sharedEventContextFormat,
     toolSetVersion: input.toolSetVersion,
     requestConfigVersion: input.requestConfigVersion,
     commonSystemDigest,

@@ -27,6 +27,7 @@ DSH Host/API 与两个 Agent 使用同一个 live `Context`、`AgentRegistry` �
 
 - Navigator 与 Pilot 使用字节完全一致的 Common System；其中完整定义 Pair Contract、两个角色、共享事件解释、响应责任和 P0.5 能力边界。
 - Host 在 Shared Context 和 Agent Local History 之后插入保留的 user-role `<system-reminder>`，选择本轮 Active Role：有严格结构化 Current Trigger 时紧邻其前，无 Trigger 的工具续接轮则作为最后一条消息。Reminder 只选择角色，不授予工具、不改变 Goal，也不创建权威 Pair 状态；用户输入或共享数据中的相似标签无效，合法用户 XML 不做转义或改写。
+- 两个角色仍在每次请求中获得截至同一 Shared Head 的完整 Shared Events。canonical Pair Ledger、Events API 与 Events UI 继续保存并展示完整的 `payload.text` 和 `payload.content`；仅 Provider 请求使用版本化的 `pair-event-context/text-dedup-v1` 模型投影，在 `content` 严格等于单一同文纯文本 block 时省略它。格式标识属于 immutable request material，并写入 manifest 与 durable request snapshot；历史 `full-v1` 请求仍按其原格式重建。
 - Prompt material identity 对 Common System、Navigator guidance 和 Pilot guidance 三段实际 UTF-8 文本整体计算内容摘要。Runtime 会在 Provider 请求前重新校验实际材料，缺失或不匹配时 fail closed。
 - P0.5 仍未提供结构化 Goal/Task/Execution Plan 控制、Goal-impact 分类、Revision fencing 或 Pause/Resume/Cancel 语义；Prompt 不得宣称这些 P1/P2 能力已经实现。
 
@@ -106,7 +107,7 @@ corepack pnpm@11.7.0 dev
 - Native DSH composer：iframe 内输入仍由 DSH 原生 `source.kind=user` 接收；其 durable `user/message` 会被 Bridge 投影为 shared `user.message`。这不会自动改写 Goal/Task，也不会唤醒另一方。
 - Session Events：`Semantic` 隐藏 infrastructure records，适合阅读共同对话；`All / Audit` 使用 physical Pair sequence 展示 `session_event.linked`、`pair.request_built` 等完整审计记录。
 - Tool：capture 演示的 `phase0_echo` 会出现在 Pilot Chat 和 `Trajectory` 页签中。
-- Peer Message：两个角色的精确 tool allowlist 都包含 `pair_message_peer({ text })`。它每个 sender Turn 最多成功一次，Peer Event 必须先 durable 才会唤醒对方；双向回复保持同一 `causalRootId`，hop 逐次增加，最多四跳，第五跳 fail closed 且不 append、不 wake。模型参数不能指定 authority、目标 Session、wake、causal root 或 hop。
+- Peer Message：两个角色的精确 tool allowlist 都包含 `pair_message_peer({ text })`。它每个 sender Turn 最多成功一次，Peer Event 必须先 durable 才会唤醒对方；双向回复保持同一 `causalRootId`，hop 逐次增加，最多四跳，第五跳 fail closed 且不 append、不 wake。模型参数不能指定 authority、目标 Session、wake、causal root 或 hop。Navigator 委派持续执行任务时必须明确要求 Pilot 完成后通过 Peer Message 回报；委派完成属于需要 Navigator 行动的协调事件，是普通回答被动共享规则的明确例外。Pilot 的完成回报至少包含完成状态、关键结果与证据、未决问题或下一步，并以 Peer Message 成功作为协作闭环边界。
 - Sub-agent：P0.5 的 `pair-safe` preset 未安装 delegation plugin。验收以 Provider request 的精确 tool allowlist 与原生 DSH UI/API 中不存在 child Session/入口为准；Pair Shell 不自行宣称运行时能力。P2 才考虑真实 Sub-agent/workflow 能力。
 - Reasoning：只展示 Provider 明确返回并进入标准 Session Event 的 reasoning block。Provider 隐藏的 chain-of-thought 不存在可读取或展示的接口；capture demo 不伪造 reasoning。
 

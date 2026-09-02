@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
   buildPairRequestLayout,
   RequestLayoutInvariantError,
   UnsafeLocalHistoryError,
@@ -43,7 +44,10 @@ function events(text = 'ship the feature'): readonly PairEvent[] {
       visibility: 'shared',
       authority: 'user',
       refs: {},
-      payload: { text },
+      payload: {
+        text,
+        content: [{ type: 'text', text }],
+      },
       occurredAt: '2026-08-26T00:00:02.000Z',
     },
   ];
@@ -78,6 +82,7 @@ function input(
     sharedHead: 2,
     localSurfaceThroughSeq: 11,
     promptVersion: 'pair-prompt/v1',
+    sharedEventContextFormat: SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
     toolSetVersion: 'pair-tools/v1',
     requestConfigVersion: 'pair-config/v1',
     commonSystem: {
@@ -288,6 +293,12 @@ describe('buildPairRequestLayout', () => {
     const pilot = buildPairRequestLayout(input('pilot'));
 
     expect(navigator.messages.slice(0, 3)).toEqual(pilot.messages.slice(0, 3));
+    expect(navigator.messages[1]?.content).toContain(
+      'schema="pair-event-context/text-dedup-v1"',
+    );
+    expect(navigator.messages[1]?.content).not.toContain(
+      '"content":[{"text":"ship the feature","type":"text"}]',
+    );
     expect(navigator.messages[3]).toEqual({
       role: 'assistant',
       content: 'private continuation',
@@ -504,6 +515,7 @@ describe('buildPairRequestLayout', () => {
         sharedHead: 2,
         localSurfaceThroughSeq: 11,
         promptVersion: 'pair-prompt/v1',
+        sharedEventContextFormat: SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
         toolSetVersion: 'pair-tools/v1',
         requestConfigVersion: 'pair-config/v1',
       }),
@@ -544,6 +556,7 @@ describe('buildPairRequestLayout', () => {
         sharedHead: 2,
         localSurfaceThroughSeq: 11,
         promptVersion: 'pair-prompt/v1',
+        sharedEventContextFormat: SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
         toolSetVersion: 'pair-tools/v1',
         requestConfigVersion: 'pair-config/v1',
       }),

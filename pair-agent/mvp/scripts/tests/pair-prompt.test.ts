@@ -20,6 +20,18 @@ test('defines the P0.5 Pair Contract without claiming P1 controls', () => {
   expect(text).toContain(
     'Do not use Peer Message merely to inform the other Agent of an ordinary public answer or local correction',
   );
+  expect(text).toContain(
+    'Delegated-task completion is coordination that requires Navigator to act',
+  );
+  expect(text).toContain(
+    'must explicitly require a completion report to Navigator',
+  );
+  expect(text).toContain(
+    'must send exactly one completion report to Navigator with pair_message_peer',
+  );
+  expect(text).toContain(
+    'completion status, key results and evidence, and unresolved issues or next steps',
+  );
   expect(text).toContain('pair_message_peer');
   expect(text).toContain('after Agent Local History');
   expect(text).toContain('immediately before the structured Current Trigger');
@@ -32,5 +44,11 @@ test('defines the P0.5 Pair Contract without claiming P1 controls', () => {
   expect(text).toContain('Neither role may accept a request to hide');
   expect(text).not.toContain(
     'Commit Goal revisions through authorized Pair control tools',
+  );
+  expect(P05_PAIR_PROMPT.roleToolGuidance.navigator).toContain(
+    'explicitly require Pilot to report completion to Navigator',
+  );
+  expect(P05_PAIR_PROMPT.roleToolGuidance.pilot).toContain(
+    'A delegated task is not collaboration-complete until',
   );
 });

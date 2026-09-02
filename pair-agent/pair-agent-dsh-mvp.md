@@ -28,7 +28,7 @@ MVP 必须证明以下核心体验成立：
 6. Goal-impacting change 只能由 Navigator 与用户对齐后形成新 Goal/Task Revision；
 7. 两个 Agent、Pair Ledger 和未消费输入可以在进程重启后恢复。
 
-MVP 选择 TypeScript、Node.js、本地、单进程、单用户、单工作区运行。它不是 DSH 核心重构，也不试图一次完成长会话压缩、分布式事务和生产级 UI。
+MVP 选择 TypeScript、Node.js、本地、单进程、单用户、单工作区运行。交互入口复用 DSH Web UI，通过独立 Pair Web Shell 同时呈现两个顶层 Agent Session；它不是 DSH 核心 UI 重构，也不试图一次完成长会话压缩、分布式事务和生产级多窗格框架。
 
 模型接入优先打通 OpenAI Chat Completions 兼容协议。MVP 不使用 `previous_response_id`、Conversation ID、服务端保存会话或其他模型供应商 stateful continuation；下一轮请求始终由本地 Pair Ledger 与两条 DSH Session Event Log 确定性重建。
 
@@ -109,8 +109,12 @@ DSH 原生 `systemPrompt.context()` 会把动态快照作为 `user/message` 追�
 
 ```mermaid
 flowchart LR
-    U[User] --> UI[Pair Web UI]
-    UI --> API[Pair Host API]
+    U[User] --> UI[Pair Web Shell]
+    UI --> NP[Navigator DSH Web Pane]
+    UI --> PP[Pilot DSH Web Pane]
+    NP --> DH[DSH Web Host API / WebSocket]
+    PP --> DH
+    UI --> API[Pair Host API / Event Stream]
     API --> PC[Pair Coordinator]
 
     PC --> PL[(Pair Ledger)]
@@ -142,6 +146,8 @@ flowchart LR
     PS --> ES
     PL --> ES
     ES --> UI
+    DH --> NS
+    DH --> PS
 ```
 
 架构分成两层：
@@ -508,18 +514,56 @@ DSH `tools.guard()` 是同步单调拒绝层，因此它只读取 Pair Coordinat
 
 MVP 不能阻止已经离开进程的外部副作用。不可逆工具超时后必须记为 `unknown`，不得自动重试。
 
-### 5.8 Pair Host 与 UI
+### 5.8 Pair Host 与 Web UI
 
-MVP UI 只要求验证交互，不追求完整产品化：
+MVP 不重新开发消息、流式输出和 Agent 执行浏览器，而是在 DSH Web 之上增加独立 `Pair Web Shell`：
 
-- Navigator 对话区域和输入框；
-- Pilot 执行区域和输入框；
-- Pilot 当前 Task、Execution Plan、状态和工具过程；
-- Pair Goal/Task Revision 与 Pause 状态；
-- Goal-impacting change 的升级提示；
-- Pause、Resume 和 Cancel 控件。
+```text
+/pair.html?pairId=<pair-id>
+┌─────────────────────────────────────────────────────────────────┐
+│ Pair Goal / Task / Revision / Attention / Pause                 │
+├───────────────────────────────┬─────────────────────────────────┤
+│ Navigator Agent               │ Pilot Agent                     │
+│ fixed Navigator DSH Session   │ fixed Pilot DSH Session         │
+│ Chat / Reasoning / Composer   │ Chat / Tools / Trajectory       │
+│                               │ Plan / Workflow / Sub-agents    │
+└───────────────────────────────┴─────────────────────────────────┘
+```
 
-Pair Host 将三类事件合并为一个客户端流：
+两个 Pane 各自加载完整且隔离的原生 DSH Web composition，并固定到 Pair Session Header 中记录的 Agent Session ID。Phase 0 优先使用两个 iframe：
+
+```text
+/?embedded=1&pairId=<pair-id>&pane=navigator&session=<navigator-session-id>&expectedSession=<navigator-session-id>
+/?embedded=1&pairId=<pair-id>&pane=pilot&session=<pilot-session-id>&expectedSession=<pilot-session-id>
+```
+
+Pair Shell 只从已经校验的 Pair Header 及其确定性 `pairId → navigatorSessionId + pilotSessionId` 映射取得 Pane Session ID，并把同一个值同时写入 `session` 与 `expectedSession`。`expectedSession` 只用于发现 URL 载体的意外错配，Session 是否存在以及 Sub-agent lineage 仍以 DSH Host 返回的数据为权威；`pairId` 与 `pane` 只承担展示和诊断，不授予 Session、工具或角色权限。
+
+DSH Web 启动扩展必须在 `SessionRuntime` 构造和首个 Session projection 之前解析 addressed-session boot option，不能等 Session list ready 后再补调用 `open()`。embedded Pane 禁用全局 `dsh.sessions.current` 恢复，或使用包含 Pair/Pane identity 的独立持久键；显式 Session 不存在或 `session` 与 `expectedSession` 不相符时 fail closed，并在校验完成前不挂载 Composer。这样可以避免两个同源 iframe 竞争同一个 current selection，或短暂向错误 Session 开放输入。
+
+每个 iframe 独立持有 Cordis/React Runtime、current Session、输入草稿、滚动、弹层和快捷键状态。embedded navigation 只允许角色根 Session 及其合法 Sub-agent lineage，因此 Navigator 保持自己的对话，Pilot 可以进入 Sub-agent Session 或 Trajectory 后返回而不影响 Navigator。Pane 标签本身不是授权来源；角色工具权限始终绑定 DSH Session 和 Harness scope。
+
+Phase 0 全复用以下 DSH Web 能力：
+
+- Session 历史窗口、实时事件续接、sequence 去重和断线重连；
+- 普通消息、流式 assistant 输出和模型供应商实际返回的 reasoning block；
+- Tool Call tree、终端输出、文件 diff、工具结果和详情面板；
+- 已安装 UI plugin 的 Plan、Workflow、Trajectory、token/cache usage 展示框架；
+- 已安装 UI plugin 的 Sub-agent lineage、运行状态、只读子会话及逐级导航；
+- 每条 Session 独立的 Composer、queue、steer 和 pending interaction。
+
+Reasoning UI 只展示 Provider 明确返回的 reasoning block，不声称展示模型未输出的隐藏 Chain of Thought。
+
+Pair Web Shell 只新增 DSH 单 Session UI 不具备的共同语义：
+
+- `pairId → navigatorSessionId + pilotSessionId` 映射和 Pane 启动；
+- Pair Goal、Task、Revision、attention 和控制状态栏；
+- Pair Ledger 中权威的 Execution Plan 与 Task delivery 状态；
+- Pair Pause、Resume、Cancel 等确定性控制；
+- Pair Ledger 事件和 Pair Request Snapshot 的专属 Trace；
+- Navigator/Pilot Pane 标签、输入目标和来源提示。
+
+Pair Host 将三类事件合并为一个 Pair 客户端流：
 
 ```text
 Pair Ledger events
@@ -527,7 +571,9 @@ Navigator DSH Session events
 Pilot DSH Session events
 ```
 
-事件必须保留 `source = pair | navigator-session | pilot-session`，UI 不得将两条 DSH Session 重写成一条伪造的模型 transcript。
+原生 DSH Pane 各自消费对应 Session 流；Pair Web Shell 消费 Pair 客户端流并显示共同状态。所有事件必须保留 `source = pair | navigator-session | pilot-session`，UI 不得将两条 DSH Session 重写成一条伪造的模型 transcript。
+
+Phase 0 不把 DSH 的单 Session `SessionProvider` 改造成多 Session Provider，也不复制 DSH 私有 JSX。DSH fork 增加两个通用 Web seam：Runtime 构造前的 addressed-session boot option，以及隐藏全局 chrome、限制根 Session 导航的 embedded presentation option；默认关闭时保持原 Web 行为。iframe 会带来两个完整前端 Runtime、重复 WebSocket 和资源加载，但这是验证阶段可接受的隔离成本。Pair 模型成立后再单独设计通用 `provideInfoFor(sessionId)`、`AddressedSessionProvider` 和 pane-scoped UI slot，使双 Pane 迁移到单 React 树；该 seam 独立评估是否提交 DSH 上游。
 
 ### 5.9 Session-to-Pair Bridge
 
@@ -1349,6 +1395,13 @@ MVP 借鉴而不直接复用以下实现思想：
 | 通用 Request Layout 插件 seam | 复用并拓展 | DSH `buildRequest()` 新增 `agent/request-layout` waterfall；默认 identity，不包含 Pair 语义 |
 | Cache-first Pair Request Builder | 全新增 | Pair 插件注册 request-layout seam，输出 Chat Completions messages 并记录 Request Snapshot |
 | 两个用户输入 Channel 与 Response Owner | 全新增 | Pair Host / Pair UI |
+| Pair Web Shell 与双 Pane 编排 | 全新增 | Pair Web app；按 Pair Session Header 固定 Navigator/Pilot Session |
+| 消息、流式输出和 Session 恢复展示 | 全复用 | DSH Web connection/runtime/conversation composition |
+| Tool 与 Trajectory 展示 | 全复用 | DSH Web `ui-tool`、`ui-trajectory` |
+| Agent-local Plan、Workflow 与 Sub-agent 展示 | 全复用 | DSH Web 对应 UI plugin；P0 验证装载与空态，P2 接入真实运行能力 |
+| embedded 页面固定初始 Session | 复用并拓展 | DSH Web pre-runtime addressed-session boot option；禁用或命名空间化 persisted current selection |
+| embedded chrome 与导航范围 | 复用并拓展 | DSH Web presentation option；只允许角色根 Session 及合法 Sub-agent lineage |
+| Pair Execution Plan 与 delivery 展示 | 全新增 | Pair Header 读取 Pair Projection，不以 DSH Agent-local Plan 代替 |
 | 带用户来源和版本的 Pair Goal | 全新增 | Pair Goal Domain；只借鉴 DSH Goal 的 CAS 思路 |
 | Navigator Task 与 Pilot Execution Plan | 全新增 | Pair Task/Plan Domain |
 | 完整共享上下文和 unread cursor | 全新增 | Pair Context Builder + Pair Request Snapshot + Agent Cursor |
@@ -1357,7 +1410,7 @@ MVP 借鉴而不直接复用以下实现思想：
 | Goal-impacting change 升级 | 全新增 | Pair attention/control events |
 | Pause、Resume、Cancel | 复用并拓展 | DSH `cancel`/inbox + Pair control projection |
 | 角色工具隔离与 Revision fencing | 复用并拓展 | `tools.restrict()`、`tools.guard()`、`tools/pre-execute` |
-| Pilot 进度和工具过程展示 | 复用并拓展 | DSH events + Pair UI projection |
+| Pilot 进度和工具过程展示 | 复用并拓展 | 原生 Conversation/Tool/Trajectory + Pair Header 的权威 Task/Execution Plan/delivery Projection |
 | Pilot Plan Mode | 全复用 | `@deepseek-ai/dsh-plan-mode` |
 | Pilot workflow | 全复用 | `@deepseek-ai/dsh-workflow`、`@deepseek-ai/dsh-tool-workflow` |
 | Pilot continuable Sub-agent | 全复用 | `@deepseek-ai/dsh-subagent-spawn-in-process` + `@deepseek-ai/dsh-tool-subagent(backgroundMode=continuable)` |
@@ -1377,7 +1430,8 @@ MVP 借鉴而不直接复用以下实现思想：
 | 任何 Provider stateful continuation | 复用并拓展 | MVP 不使用 `previous_response_id`、Conversation ID、服务端会话或 opaque continuation |
 | Responses API 接入 | 复用并拓展 | LLM 调通优先 Chat Completions，Responses 留到后续 Provider 实验 |
 | 直接以 DSH Agent Teams 作为 Pair 协议 | 复用并拓展 | 角色、Goal Authority 和 Channel 语义不同 |
-| 生产级双栏 UI、移动端和完整可访问性 | 全新增 | MVP 只验证双 Channel 和进度呈现 |
+| 单 React 树原生多 Session Pane | 复用并拓展 | MVP 使用 Pair Web Shell + 隔离 iframe；正式形态需要 addressed-session/multi-pane seam |
+| 产品级响应式布局与完整可访问性 | 全新增 | 不由 addressed-session seam 自动获得，Phase 0 只覆盖桌面验证路径 |
 | 多进程、跨机器和分布式调度 | 全新增 | 当前限定单进程 |
 | Pair Ledger 与 DSH Session 的跨存储原子事务 | 全新增 | MVP 使用投递对账和 fencing 缓解 |
 | 外部副作用 exactly-once | 全新增 | 通用外部系统无法由 DSH 单方面保证 |
@@ -1428,7 +1482,10 @@ MVP 至少通过以下端到端场景：
 - TypeScript / Node.js 运行骨架与 Chat Completions route；
 - Common System、Pair Context Builder 和 Active Role Reminder；
 - Local History Projector 与 cache-first Pair Request Builder；
-- 两个 Channel 的基本输入与事件展示；
+- Pair Web Shell、Pair Header 和 `pairId → 两条 Agent Session` 启动映射；
+- 两个隔离的原生 DSH Web Pane，并复用流式消息、工具和 Trajectory 展示；
+- embedded DSH Web 页面在 Runtime 构造前固定 Session、隔离 current selection、隐藏全局 chrome 并约束 Session 导航的通用扩展；
+- Plan、Workflow 与 Sub-agent UI plugin 的装载和空态验证；真实运行与会话浏览留到 P2；
 - Navigator 创建 Task 并唤醒 Pilot。
 
 ### 14.2 P0.5：共享对话与 Agent 通信
@@ -1462,7 +1519,7 @@ P0.5 的详细设计见 [`mvp/p0.5-shared-conversation-design.md`](./mvp/p0.5-sh
 - ArtifactRef 与重要证据回写；
 - 故障注入和端到端验收场景。
 
-P2 完成代表 MVP 语义闭环完成，不代表生产就绪。Shared Checkpoint、多进程和生产级 UI 继续留在非能力清单中。
+P2 完成代表 MVP 语义闭环完成，不代表生产就绪。Shared Checkpoint、多进程和原生单 React 树多 Session UI 继续留在非能力清单中。
 
 ## 15. 主要风险
 
@@ -1486,15 +1543,25 @@ Bash、编辑器等通用工具不携带 Pair Task Ref。MVP guard 绑定 Pilot 
 
 ### 15.5 UI 与真实权威混淆
 
-UI 会同时展示三条事件源。任何合并视图都必须保留来源和 Agent Session 边界，否则用户会误以为两个模型共享了一条 transcript，恢复和调试也会失真。
+Pair Web Shell 会同时关联三条事件源，但两个 DSH Pane 始终保留各自 Agent Session 边界，Pair Header 只显示共同 Projection。任何合并视图都必须保留来源，否则用户会误以为两个模型共享了一条 transcript，恢复和调试也会失真。
 
-### 15.6 Cache-first 请求投影
+### 15.6 Phase 0 iframe 隔离成本
+
+两个原生 DSH Web Pane 会分别创建前端 Runtime、Host/Session WebSocket、缓存和弹层上下文。Phase 0 接受该成本以换取快速验证和状态隔离，并通过通用 `embedded` presentation seam 隐藏重复的全局导航。若实测资源占用、焦点管理或跨 Pane 操作显著影响验证，再提前设计 multi-pane seam；不得通过复制私有组件或共享一个全局 current Session 临时绕过。
+
+### 15.7 Cache-first 请求投影
 
 把 Shared Context 放在 Local Request Tail 之前可以扩大跨 Agent 公共前缀，但 Shared Head 更新后也可能使后续本地 tail 失去同 Agent 缓存。role-specific tools 还可能让 Provider 在 messages 之前就产生差异。MVP 必须用真实 usage 指标和行为 eval 判断收益，不得仅凭排列推测。
 
-### 15.7 User-role Active Role Reminder
+### 15.8 User-role Active Role Reminder
 
 Chat Completions 协议不会携带 DSH `Message.source`，模型只能看到 user role 与文本。Common System、固定 request boundary、保留标签编码和 Tool Guard 可以把风险限制为模型行为混淆，但不能把 user-role reminder 提升为真正授权来源。任何安全或状态变更都必须由 Harness 确定性拒绝层决定。
+
+### 15.9 Phase 0 构建产物完整性边界
+
+Phase 0 会在加载 DSH 官方导出前校验父项目锁定的 runtime artifact manifest，并对遍历条目数、目录深度、选中文件数、单文件大小和总字节数设置上限；模块完成加载后再执行一次相同校验，以缩小意外构建漂移发生在 hash 与 import 之间的窗口。
+
+这项机制只用于发现静态篡改、陈旧构建或意外产物漂移，不是针对具有同机文件写权限攻击者的安全锁。能够在两次校验和模块加载之间持续竞争的恶意本地进程仍可制造 TOCTOU；Phase 0 不声明防御该威胁。若未来需要对抗此类攻击，应使用只读、内容寻址且由受信发布链签名的构建目录，并由操作系统隔离加载过程。
 
 ## 16. 最终判断
 
@@ -1506,7 +1573,7 @@ Pair Agent 必须新增的是“共同协作语义”和公共请求投影：Pai
 
 因此 MVP 的合理定位是：
 
-> 不修改 DSH 的 Agent/Session 持久化内核，也不复制 Agent Loop；只在 DSH `buildRequest()` 中增加一个通用、默认 identity 的 `agent/request-layout` 插件 seam。Pair Runtime 以插件方式使用该 seam，在两套独立 DSH Runtime 之上维护 Pair Ledger、各自 DSH Session 和本地 Chat Completions Request Builder，不依赖模型供应商保存会话状态。
+> 不修改 DSH 的 Agent/Session 持久化内核，也不复制 Agent Loop；只在 DSH `buildRequest()` 中增加一个通用、默认 identity 的 `agent/request-layout` 插件 seam，并为 Web 启动增加按 URL 固定 Session 的窄扩展。Pair Runtime 以插件方式使用 request-layout seam，在两套独立 DSH Runtime 之上维护 Pair Ledger、各自 DSH Session 和本地 Chat Completions Request Builder；Pair Web Shell 则并排复用两个隔离的原生 DSH Web composition，不依赖模型供应商保存会话状态。
 
 ## 17. 源码参考
 
@@ -1522,6 +1589,11 @@ Pair Agent 必须新增的是“共同协作语义”和公共请求投影：Pai
 - [DSH LLM GenerateOptions](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/llm/llm/src/types.ts)
 - [pi-ai LLM Adapter：OpenAI Completions-compatible route](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/llm/llm-pi-ai/README.md)
 - [Tools：restrict、guard 与 pre-execute pipeline](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/tools/src/index.ts)
+- [DSH Web bundle：Conversation、Tool、Plan、Workflow、Trajectory 与 Sub-agent plugin 组合](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/bundle/web-app/cordis.patch.yml)
+- [Web API Client：HTTP RPC、Session 与 Host WebSocket](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/client/connection/src/client/web-api-client.ts)
+- [Session Runtime：单 current Session 与持久选择](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/client/runtime/src/client/sessions/service.ts)
+- [Session Manager：按 Session ID 路由实时事件](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/client/runtime/src/client/sessions/manager.ts)
+- [Sub-agent UI：lineage 与子 Session 导航](https://github.com/deepseek-ai/deepseek-harness/tree/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/client/ui-subagent)
 - [Session Known Event Types](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/src/known-event-types.ts)
 - [Session Persistence：未知必需事件拒绝恢复](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/session/session-persistence/src/coordinator.ts)
 - [JSONL Session Persistence：配置、flush 与 lazy materialization](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/session/session-persistence-jsonl/README.md)

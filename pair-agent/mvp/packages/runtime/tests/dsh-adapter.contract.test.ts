@@ -4,7 +4,12 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 import { createPairSessionIds, type DshBuildRef } from '@pair-agent/contracts';
-import { createContentAddressedPairPrompt } from '@pair-agent/context';
+import {
+  createContentAddressedPairPrompt,
+  SHARED_EVENT_CONTEXT_FULL_V1,
+  SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
+  type SharedEventContextFormat,
+} from '@pair-agent/context';
 import { JsonlPairLedgerStore, LedgerConflictError } from '@pair-agent/ledger';
 import { afterEach, describe, expect, test } from 'vitest';
 
@@ -76,6 +81,7 @@ async function createRuntime(
     tools?: readonly DshPairToolDefinition[];
     maxTokens?: number;
     reasoningEffort?: string;
+    sharedEventContextFormat?: SharedEventContextFormat;
     historicalRequestMaterials?: readonly PairRequestMaterialEntry[];
     commonSystem?: { readonly version: string; readonly content: string };
     lifecycleFaults?: {
@@ -132,6 +138,9 @@ async function createRuntime(
     ...(options.historicalRequestMaterials === undefined
       ? {}
       : { historicalRequestMaterials: options.historicalRequestMaterials }),
+    ...(options.sharedEventContextFormat === undefined
+      ? {}
+      : { sharedEventContextFormat: options.sharedEventContextFormat }),
     ...(options.lifecycleFaults === undefined
       ? {}
       : { lifecycleFaults: options.lifecycleFaults }),
@@ -1015,6 +1024,7 @@ describe('DshPairAgentAdapter real-runtime contract', () => {
       ],
       echoTool: true,
       maxTokens: 321,
+      sharedEventContextFormat: SHARED_EVENT_CONTEXT_FULL_V1,
     });
     const ids = createPairSessionIds(pairId);
     await runtime.coordinator.createPair({ pairId, dshBuild, expectedLedgerHead: 0 });
@@ -1080,6 +1090,17 @@ describe('DshPairAgentAdapter real-runtime contract', () => {
     expect(configSnapshots[0]?.requestConfigVersion).toBe(
       `pair-config/v1:${configSnapshots[0]?.configDigest}`,
     );
+    expect(
+      snapshots.map(
+        (event) =>
+          (event.payload as {
+            snapshot: { sharedEventContextFormat: SharedEventContextFormat };
+          }).snapshot.sharedEventContextFormat,
+      ),
+    ).toEqual([
+      SHARED_EVENT_CONTEXT_FULL_V1,
+      SHARED_EVENT_CONTEXT_FULL_V1,
+    ]);
     const historical = snapshots.map((event) => ({
       requestId: (event.payload as { requestId: string }).requestId,
       digest: (event.payload as { snapshot: { fullRequestDigest: string } })
@@ -1095,6 +1116,9 @@ describe('DshPairAgentAdapter real-runtime contract', () => {
     const currentConfigEntry = resumed.adapter
       .exportRequestMaterials()
       .find((entry) => entry.config.maxTokens === 999);
+    expect(currentConfigEntry?.sharedEventContextFormat).toBe(
+      SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
+    );
     expect(currentConfigEntry?.requestConfigVersion).not.toBe(
       configSnapshots[0]?.requestConfigVersion,
     );

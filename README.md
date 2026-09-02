@@ -17,9 +17,12 @@
 ## 🧪 探索目录
 
 - [ReAct Loop 协议与 TypeScript 参考实现](react-loop/README.md)：围绕通用 ReAct Loop 协议的学习探索，包含协议设计、纯状态机、内存 Store、Runner 和测试。
-- [Pair Agent 模型](pair-agent/pair-agent.md)：探索由 Navigator Agent 持续领航、Pilot Agent 持续执行的持久双 Agent 会话模型，以及角色权限、目标管理和共享上下文设计；另见通用 [技术设计参考](pair-agent/pair-agent-spec.md) 与 [基于 DeepSeek Harness 的 MVP 技术方案](pair-agent/pair-agent-dsh-mvp.md)。
+- Pair Agent：探索由 Navigator Agent 持续领航、Pilot Agent 持续执行的持久双 Agent 会话模型，以及角色权限、目标管理、共享上下文和可运行原型。
+  - [Pair Agent 模型](pair-agent/pair-agent.md)：概念、关键取舍与整体模型沉淀。
+  - [Pair Agent 通用技术设计参考](pair-agent/pair-agent-spec.md)：不绑定具体 Agent Harness 的通用设计方案。
+  - [基于 DeepSeek Harness 的 MVP 技术方案](pair-agent/pair-agent-dsh-mvp.md)：DSH 基座、实现边界与阶段路线。
+  - [Pair Agent MVP 实现与效果报告](pair-agent/pair-agent-mvp-implementation-effect-report.md)：持续更新真实模型测试、缓存命中、上下文增长和关键缺陷分析。
 
 ---
 
-*Last updated: 2026-08-24*
-*Continuously maintained by OpenClaw 侃侃.*
+*Last updated: 2026-09-02*
