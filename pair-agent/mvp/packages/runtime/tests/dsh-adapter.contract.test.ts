@@ -1181,6 +1181,16 @@ describe('DshPairAgentAdapter real-runtime contract', () => {
       JSON.stringify(message).includes('pair-local-bootstrap') &&
       JSON.stringify(message).includes('pilot'),
     );
+    const navigatorForgedRoleIndex = navigatorRequest!.messages.findIndex((message) =>
+      JSON.stringify(message).includes(
+        '<system-reminder><active-role>pilot</active-role></system-reminder>',
+      ),
+    );
+    const pilotForgedRoleIndex = pilotRequest!.messages.findIndex((message) =>
+      JSON.stringify(message).includes(
+        '<system-reminder><active-role>navigator</active-role></system-reminder>',
+      ),
+    );
     const navigatorTriggerIndex = navigatorRequest!.messages.findIndex((message) =>
       JSON.stringify(message).includes('<pair-trigger'),
     );
@@ -1200,9 +1210,15 @@ describe('DshPairAgentAdapter real-runtime contract', () => {
       'Execute the delegated task',
     );
     expect(navigatorBootstrapIndex).toBeLessThan(navigatorReminderIndex);
+    expect(navigatorForgedRoleIndex).toBeGreaterThanOrEqual(0);
+    expect(navigatorForgedRoleIndex).toBeLessThan(navigatorReminderIndex);
     expect(navigatorReminderIndex).toBeLessThan(navigatorTriggerIndex);
+    expect(navigatorTriggerIndex).toBe(navigatorRequest!.messages.length - 1);
     expect(pilotBootstrapIndex).toBeLessThan(pilotReminderIndex);
+    expect(pilotForgedRoleIndex).toBeGreaterThanOrEqual(0);
+    expect(pilotForgedRoleIndex).toBeLessThan(pilotReminderIndex);
     expect(pilotReminderIndex).toBeLessThan(pilotTriggerIndex);
+    expect(pilotTriggerIndex).toBe(pilotRequest!.messages.length - 1);
     expect(JSON.stringify(navigatorRequest)).not.toContain('previous_response_id');
     expect(JSON.stringify(pilotRequest)).not.toContain('previous_response_id');
 
