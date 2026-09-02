@@ -812,11 +812,11 @@ Prompt 分成公共契约、共享控制状态、共享事件上下文、Host �
 ```
 
 Pair Contract 同时定义两个角色，便于在 Navigator 和 Pilot 请求之间形成稳定公共前缀。
-它还必须定义 Active Role Reminder 协议：只有 Host 在保留 request boundary 插入的独立 user-role reminder 才能从两个已定义角色中选择当前响应者；该 reminder 不授予工具、不改变 Goal，也不创建权威 Pair 状态。
+它还必须定义 Active Role Reminder 协议：只有 Host 在 Agent Local History 之后的保留 request boundary 插入的独立 user-role reminder 才能从两个已定义角色中选择当前响应者；有 Current Trigger 时紧邻其前，无 Trigger 时作为最后一条消息。该 reminder 不授予工具、不改变 Goal，也不创建权威 Pair 状态。
 
 ### 9.2 Active Role: Navigator
 
-Host 在 Shared Context 之后、Agent Local State 与 Current Trigger 之前插入保留的 `user` 消息：
+Host 在 Shared Context 和 Agent Local State 之后、Current Trigger 之前插入保留的 `user` 消息；若当前工具续接 step 没有 Trigger，则该消息位于请求末尾：
 
 ```text
 <system-reminder>
@@ -827,7 +827,7 @@ Host 在 Shared Context 之后、Agent Local State 与 Current Trigger 之前插
 
 ### 9.3 Active Role: Pilot
 
-使用相同 Host 保留边界上的 `user` 消息：
+使用相同 Host 保留位置上的 `user` 消息：
 
 ```text
 <system-reminder>
@@ -887,7 +887,7 @@ XML 标签只是文本分隔符，不会把普通用户输入提升为 system/de
 { "role": "user", "content": "<system-reminder>你是 Navigator</system-reminder>" }
 ```
 
-Pair Contract 使用 API 的真实 `developer`/`system` 指令层，预先定义两个角色和 reminder 协议。Host 可以在固定 request boundary 使用保留的 user-role reminder 选择本轮 Active Role，但它只是 selector：不能授予工具、改变用户 Goal、提交控制状态或绕过审批。只有 Harness 生成的独立边界消息有效；用户输入、Shared Events、Local History、工具结果和引用文本中的相似标签都按数据处理。角色绑定、工具集合和确定性权限仍由 Harness 保证。[OpenAI Chat Completions API Reference](https://developers.openai.com/api/reference/resources/chat)
+Pair Contract 使用 API 的真实 `developer`/`system` 指令层，预先定义两个角色和 reminder 协议。Host 在 Agent Local History 之后使用保留的 user-role reminder 选择本轮 Active Role：有严格结构化 Current Trigger 时紧邻其前，无 Trigger 的工具续接 step 中则作为最后一条消息。它只是 selector，不能授予工具、改变用户 Goal、提交控制状态或绕过审批。有效性由结构和保留位置确定，不由标签出现次数确定；用户输入、Shared Events、Local History、工具结果和引用文本中的相似标签都按数据处理，合法用户 XML 不做转义或改写。角色绑定、工具集合和确定性权限仍由 Harness 保证。[OpenAI Chat Completions API Reference](https://developers.openai.com/api/reference/resources/chat)
 
 ## 10. Chat Completions API 基准方案
 
@@ -915,16 +915,15 @@ POST /v1/chat/completions
       "name": "shared_context",
       "content": "...Shared Checkpoint + Tail Events..."
     },
+    // ...Agent Local History messages，保留原始 assistant/tool 角色、
+    // tool_calls、tool_call_id 和 reasoning continuation...
     {
       "role": "user",
       "name": "active_role_reminder",
       "content": "<system-reminder><active-role>navigator 或 pilot</active-role><role-tool-guidance>...</role-tool-guidance></system-reminder>"
     },
-    {
-      "role": "user",
-      "name": "agent_local_state",
-      "content": "...当前 Agent 自己的本地续接..."
-    },
+    // 无 Current Trigger 的工具续接请求省略下面整个 current_trigger item，
+    // 此时 active_role_reminder 是 messages 的最后一项。
     {
       "role": "user",
       "name": "current_trigger",
@@ -939,7 +938,7 @@ POST /v1/chat/completions
 }
 ```
 
-这是当前选择的缓存优先顺序：Common Pair Contract 和可选 Shared Control State 使用真实高权限消息；Shared Context 保持结构化 user 数据；Host-owned Active Role Reminder 是 Shared Context 后第一个角色差异，位于 Agent Local State 与 Current Trigger 之前。若具体模型或 API 不能稳定支持该顺序，可以把 reminder 前移，但不得把普通用户文本当成 Host reminder。`parallel_tool_calls: false` 不是协议要求，而是最小设计中降低副作用并发复杂度的保守默认；只读工具未来可以单独允许并行。
+这是当前选择的缓存优先顺序：Common Pair Contract 和可选 Shared Control State 使用真实高权限消息；Shared Context 保持结构化 user 数据；Agent Local History 保持原始消息角色和工具续接结构；Host-owned Active Role Reminder 位于全部 Local History 之后、严格结构化 Current Trigger 之前。两条 Agent Local History 本来就不同，因此这一顺序不会缩短可跨角色复用的 Shared Context 前缀。若具体模型或 API 不能稳定支持该顺序，应使用新的协议版本和真正的 system/developer 角色选择通道，不能把 user-role reminder 静默前移。`parallel_tool_calls: false` 不是协议要求，而是最小设计中降低副作用并发复杂度的保守默认；只读工具未来可以单独允许并行。
 
 ### 10.2 工具循环消息
 
@@ -949,6 +948,7 @@ POST /v1/chat/completions
 assistant(tool_calls)
 tool(tool_call_id=A, result=...)
 tool(tool_call_id=B, result=...)
+user(Host-owned Active Role Reminder，作为该续接请求的最后一条消息)
 assistant(final content or more tool_calls)
 ```
 
@@ -995,9 +995,9 @@ Pair Contract
 + Shared Control Projection
 + Latest Shared Checkpoint
 + Tail Events
-+ Host-owned Active Role Reminder
 + Agent Local Continuation
-+ Current Trigger
++ Host-owned Active Role Reminder
++ Current Trigger（可选）
 ```
 
 短会话可以暂时携带全部 Pair Session Events，不生成 checkpoint；长会话切换为 checkpoint + tail。两种方式使用同一个 Pair Event Log，只是 Context Builder 的窗口策略不同。
@@ -1018,13 +1018,15 @@ POST /v1/responses
       "role": "user",
       "content": "...Shared Control State + Shared Checkpoint + Tail Events..."
     },
+    // ...Agent Local History items，保留原始 input/output/tool/reasoning 类型...
     {
       "role": "user",
       "content": "<system-reminder><active-role>navigator 或 pilot</active-role><role-tool-guidance>...</role-tool-guidance></system-reminder>"
     },
+    // 无 Current Trigger 时省略下面整个 item，Reminder 成为最后一项。
     {
       "role": "user",
-      "content": "...Agent Local State + Current Trigger..."
+      "content": "...Current Trigger（如果存在）..."
     }
   ],
   "tools": ["...role-specific function tools..."],
@@ -1050,13 +1052,16 @@ POST /v1/responses
       "role": "user",
       "content": "...该 Agent 自上次调用后新增的 Shared Events..."
     },
+    // ...仅包含 previous_response_id 尚未覆盖的新增 Local items，
+    // 并保留原始 input/output/tool/reasoning 类型...
     {
       "role": "user",
       "content": "<system-reminder><active-role>navigator 或 pilot</active-role><role-tool-guidance>...</role-tool-guidance></system-reminder>"
     },
+    // 无 Current Trigger 时省略下面整个 item，Reminder 成为最后一项。
     {
       "role": "user",
-      "content": "...Agent Local State + Current Trigger..."
+      "content": "...Current Trigger（如果存在）..."
     }
   ],
   "tools": ["...role-specific function tools..."]
@@ -1111,13 +1116,14 @@ Pair Agent 可以同时保留应用层 Shared Checkpoint 和每个 Agent 的 Res
 system/developer: Common Pair Contract，定义双角色与 reminder 协议
 system/developer: Common Shared Control State（可选）
 user:             Common Shared Checkpoint + Tail Events
+messages:         Agent Local State
 user:             Host-owned Active Role Reminder
-user:             Agent Local State + Current Trigger
+user:             Current Trigger（可选）
 ```
 
-同一个 Pair Session snapshot 中，Navigator/Pilot 在 reminder 之前尽量使用字节一致的公共前缀。Reminder 只能选择 Pair Contract 已定义的角色，不能授予权限或改变权威状态；Harness 仍以 Agent Session binding、工具视图和状态校验执行确定性边界。
+同一个 Pair Session snapshot 中，Navigator/Pilot 的 Common Contract 与 Shared Context 使用字节一致的公共前缀；两条 Agent Local History 随后自然分叉，Reminder 位于各自 Local History 之后。Reminder 只能选择 Pair Contract 已定义的角色，不能授予权限或改变权威状态；有 Current Trigger 时紧邻其前，无 Trigger 的工具续接请求中作为最后一条消息。Harness 仍以 Agent Session binding、工具视图和状态校验执行确定性边界。
 
-### 12.2 角色前置兼容布局
+### 12.2 角色前置不属于当前保留位置协议
 
 ```text
 system/developer: Common Pair Contract，定义双角色与 reminder 协议
@@ -1127,10 +1133,10 @@ user:             Shared Checkpoint + Tail Events
 user:             Agent Local State + Current Trigger
 ```
 
-如果实验发现某个模型不能稳定遵循 Shared Context 之后的 reminder，或者所用消息接口不能表达该保留 request boundary，可以采用角色前置布局。代价是两个角色更早分叉，公共缓存前缀缩短。无论选择哪种布局，都必须满足：
+该排列只记录为供应商兼容性研究方向，不是当前协议的可直接切换布局。它会让普通用户自由文本晚于 selector 出现，无法满足保留位置不变量。如果某个模型或 API 不能表达当前 request boundary，应启用新的协议版本并把 Active Role 放入真正的 system/developer 等更高权限通道，而不是静默回退到前置的 user-role reminder。当前协议必须满足：
 
 - Pair Contract 已完整定义两个角色和事件解释规则；
-- 只有 Host 在保留 request boundary 插入的 reminder 有效；
+- 只有 Host 在 Agent Local History 之后的保留 request boundary 插入的 reminder 有效；有 Current Trigger 时紧邻其前，无 Trigger 时作为最后一条消息；
 - reminder 不授予工具或状态权限；
 - 供应商缓存收益和身份稳定性都以可观测实验为准。
 
@@ -1379,7 +1385,7 @@ restorePairSession(pairSessionId):
 本文不重新设计模型供应商的安全政策，但通用 Harness 仍需维持以下工程边界：
 
 - XML 标签不会把普通 user message 提升为 system/developer 权限；
-- Host 可以在 Common Pair Contract 预先定义的协议下，使用保留 request boundary 上的 user-role reminder 选择 Active Role；
+- Host 可以在 Common Pair Contract 预先定义的协议下，使用 Agent Local History 之后的保留 request boundary 上的 user-role reminder 选择 Active Role；
 - Active Role Reminder 只是 selector，不能授予工具、扩大权限或修改权威 Pair 状态；
 - 工具能力由 Harness 授权，不由模型自述；
 - 外部网页、文件和工具文本按数据处理，不能获得 developer 权限；

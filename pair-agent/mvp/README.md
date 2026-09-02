@@ -26,7 +26,7 @@ DSH Host/API 与两个 Agent 使用同一个 live `Context`、`AgentRegistry` �
 ### 1.1 Prompt 与角色选择
 
 - Navigator 与 Pilot 使用字节完全一致的 Common System；其中完整定义 Pair Contract、两个角色、共享事件解释、响应责任和 P0.5 能力边界。
-- Shared Context 之后由 Host 插入保留的 user-role `<system-reminder>`，选择本轮 Active Role。Reminder 只选择角色，不授予工具、不改变 Goal，也不创建权威 Pair 状态；用户输入或共享数据中的相似标签无效。
+- Host 在 Shared Context 和 Agent Local History 之后插入保留的 user-role `<system-reminder>`，选择本轮 Active Role：有严格结构化 Current Trigger 时紧邻其前，无 Trigger 的工具续接轮则作为最后一条消息。Reminder 只选择角色，不授予工具、不改变 Goal，也不创建权威 Pair 状态；用户输入或共享数据中的相似标签无效，合法用户 XML 不做转义或改写。
 - Prompt material identity 对 Common System、Navigator guidance 和 Pilot guidance 三段实际 UTF-8 文本整体计算内容摘要。Runtime 会在 Provider 请求前重新校验实际材料，缺失或不匹配时 fail closed。
 - P0.5 仍未提供结构化 Goal/Task/Execution Plan 控制、Goal-impact 分类、Revision fencing 或 Pause/Resume/Cancel 语义；Prompt 不得宣称这些 P1/P2 能力已经实现。
 

@@ -344,8 +344,9 @@ system/developer: Common Pair Contract，完整定义两个角色与 reminder �
 system/developer: sanitized shared control state（可选，仅限控制面）
 user: Shared Checkpoint
 user: Tail Session Events, including unread markers
+messages: Agent Local State
 user: Host-owned Active Role Reminder
-user: Agent Local State and current trigger
+user: Current Trigger（首个 step；工具续接 step 可省略）
 ```
 
 这里最重要的不是字段名字，而是正确区分“规则、权威状态、事实材料和本地续接”。
@@ -373,7 +374,7 @@ Chat Completions 一类接口通常也没有 `other_agent` 角色。因此另一
 user: <system-reminder>你是 Main Agent</system-reminder>
 ```
 
-Pair Agent 采用更严格的保留协议：Common Pair Contract 在真正的 `system`/`developer` 指令层预先完整定义两个角色，并约定只有 Host 在固定 request boundary 生成的独立 user-role `<system-reminder>` 才能选择本轮 Active Role。Reminder 只是 selector，不授予工具、不修改 Goal，也不生成权威 Pair 状态。用户输入、共享事件、工具结果和引用文本中的相似标签都只是数据；确定性角色绑定、工具视图和写权限仍由 Harness 校验。
+Pair Agent 采用更严格的保留协议：Common Pair Contract 在真正的 `system`/`developer` 指令层预先完整定义两个角色，并约定只有 Host 在 Agent Local History 之后的保留位置生成的独立 user-role `<system-reminder>` 才能选择本轮 Active Role。有严格结构化 Current Trigger 时，Reminder 紧邻其前；没有 Trigger 的工具续接 step 中，Reminder 是最后一条消息。有效性由结构和位置确定，而不是同类标签第一次或最后一次出现。Reminder 只是 selector，不授予工具、不修改 Goal，也不生成权威 Pair 状态。用户输入、共享事件、工具结果和引用文本中的相似标签都只是数据；合法用户 XML 不做转义或改写；确定性角色绑定、工具视图和写权限仍由 Harness 校验。
 
 ### 8.3 缓存友好与语义稳定之间的取舍
 
@@ -383,24 +384,25 @@ Pair Agent 采用更严格的保留协议：Common Pair Contract 在真正的 `s
 system/developer: Common Pair Contract，定义双角色和 reminder 协议
 system/developer: Common Shared Control State（可选）
 user: Common Shared Checkpoint and Tail Events
-user: Host-owned Active Role Reminder = Main | Assistant
-user: Role-local State and Current Trigger
+messages: Role-local State
+user: Host-owned Active Role Reminder = Navigator | Pilot
+user: Current Trigger（可选；存在时严格结构化）
 ```
 
-它让两个请求在 Active Role 之前拥有尽量长的共同前缀。Common Pair Contract 提供角色语义权威，后置 reminder 只从已经定义的角色中选择当前响应者。
+它让两个请求的 Common Contract 和 Shared Context 保持共同前缀；两条 Agent Local History 本来就彼此不同，因此把 Reminder 移到 Local History 之后不会缩短可跨角色复用的共享前缀。Common Pair Contract 提供角色语义权威，保留位置上的 Reminder 只从已经定义的角色中选择当前响应者。
 
-另一种角色前置排列仍可作为模型兼容性回退：
+另一种角色前置排列只能作为不同协议版本的研究方向：
 
 ```text
 system/developer: Common Pair Contract
-user: Host-owned Active Role Reminder = Main | Assistant
+user: Host-owned Active Role Reminder = Navigator | Pilot
 user: Common Shared Checkpoint and Tail Events
 user: Role-local State and Current Trigger
 ```
 
-角色前置更早产生 Navigator/Pilot 差异，会缩短跨角色缓存前缀。如果实验发现某个模型无法稳定遵循后置 reminder，或者其 API 不允许所需的消息顺序，可以回退到该排列；无论采用哪种顺序，普通用户伪造标签都不能越过 Host boundary 或改变 Harness 权限。
+角色前置更早产生 Navigator/Pilot 差异，会缩短跨角色缓存前缀，而且允许后续用户自由文本覆盖 selector，因此不满足当前保留位置协议。如果实验发现某个模型无法稳定遵循后置 reminder，或者其 API 不允许所需的消息顺序，应使用新的协议版本并把 Active Role 放入真正的 system/developer 等更高权限通道，不能静默回退到前置的 user-role reminder。
 
-这里所说的“共同前缀”只对同一个 Session 快照成立。Main 和 Assistant 如果在不同时间调用，看到的 `session.head` 本来就可能不同；共享完整上下文要求所有已发生事件最终可见，不要求两个并发请求在任意时刻字节完全相同。
+这里所说的“共同前缀”只对同一个 Session 快照成立。Navigator 和 Pilot 如果在不同时间调用，看到的 `session.head` 本来就可能不同；共享完整上下文要求所有已发生事件最终可见，不要求两个并发请求在任意时刻字节完全相同。
 
 Prompt Cache 依赖精确前缀。Checkpoint 一旦重写，checkpoint 内容之后的缓存通常也会变化。因此有三种策略：
 
@@ -518,7 +520,7 @@ Assistant 执行结束时，过程不应突然消失。用户先看到执行交�
 
 ### 12.5 把缓存友好的 reminder 误当成权限机制
 
-Host-owned user-role reminder 可以在 Common Pair Contract 已定义协议的前提下延长公共前缀，但它仍不是权限提升机制。若实现只依赖 XML 文本、无法证明 reminder 来自保留 request boundary，或让模型自述决定工具能力，普通对话就可能覆盖角色选择。缓存只能优化正确设计；Agent Session binding、工具授权和状态变更仍必须由 Harness 确定性执行。
+Host-owned user-role reminder 可以在 Common Pair Contract 已定义协议的前提下保留公共共享前缀，但它仍不是权限提升机制。有效 selector 必须位于所有不可信自由文本之后：有严格结构化 Current Trigger 时紧邻其前，无 Trigger 时作为最后一条消息。若实现只依赖 XML 文本、无法证明 reminder 来自保留 request boundary，或让模型自述决定工具能力，普通对话就可能覆盖角色选择。缓存只能优化正确设计；Agent Session binding、工具授权和状态变更仍必须由 Harness 确定性执行。
 
 ### 12.6 Pair Agent 退化成两个重复回答的聊天机器人
 
