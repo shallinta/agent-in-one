@@ -8,11 +8,12 @@
 
 ## 1. 报告目标
 
-本文回答三个问题：
+本文回答四个问题：
 
 1. 当前 Pair Agent MVP 实际实现了什么，没有实现什么；
 2. Navigator 与 Pilot 在真实模型会话中的协作效果是否符合设计；
-3. Shared Context、请求投影、缓存和上下文增长是否达到预期，下一步最值得验证什么。
+3. Shared Context、请求投影、缓存和上下文增长是否达到预期，下一步最值得验证什么；
+4. 当前实现距离 [`pair-agent-dsh-mvp.md`](pair-agent-dsh-mvp.md) 规划的 MVP 语义闭环还缺少什么。
 
 报告按能力目标组织。每次重要实现或真实模型测试后，更新“当前状态”和“最新实测快照”，并在末尾保留演进记录。不同模型、Prompt、工具集合或投影格式的数据不可直接混为同一组对照实验。
 
@@ -161,6 +162,30 @@ Navigator 的交付核对机制成功发现了问题，但代价是多次 Peer M
 
 缓存未覆盖全部输入是合理现象：Shared Head 持续前进会改变 Shared Events 尾部；两条 Agent-local History 不同；Active Role 与 Current Trigger 位于公共前缀之后；Provider 还可能使用固定 block 粒度和自己的缓存边界。后续 A/B 应同时比较 cache read、未缓存输入、完整请求 tokens、时延和费用，而不是只比较命中百分比。
 
+### 7.3 与上次归档对比及缓存 TODO
+
+上次归档使用旧 `full-v1` 投影和旧 Prompt，本次使用 `text-dedup-v1` 与新 Prompt；两次会话的任务、请求数和 reasoning 规模也不同，因此这不是严格 A/B。对比仍可用于解释为什么“命中占比下降”不等于“缓存失效”：
+
+| 指标 | 上次归档 | 本次 | 变化 |
+| --- | ---: | ---: | ---: |
+| Provider 请求数 | 24 | 33 | +37.5% |
+| Cache read | 292,864 | 331,264 | +13.1% |
+| 未缓存输入 | 239,706 | 561,862 | +134.4% |
+| 总输入 | 532,570 | 893,126 | +67.7% |
+| 综合命中率 | 54.99% | 37.09% | -17.90pp |
+| 模型输出 tokens | 30,641 | 74,650 | +143.6% |
+
+本次 Cache read 绝对量没有下降，但未缓存输入增长更快。主要原因是 Agent-local History 和 reasoning 显著增长；与此同时，`text-dedup-v1` 删除了旧版本中位于可缓存 Shared Events 前缀内的重复正文，因此也会减少“原本可以命中的冗余 token”。在没有受控 A/B 前，不能把命中占比变化单独归因于投影去重。
+
+对本次 33 个请求逐一核对后确认：`sharedHead` 单调不下降；32 次相邻请求转换中有 24 次 Shared Head 前进、8 次保持不变；每次前进时，旧 Shared Event 的 canonical JSON 行都是新事件列表的精确前缀。整个 `<pair-session-events>` 消息则不是旧消息的严格字符串前缀，因为新事件会插入在旧 watermark 之前，watermark 的 `shared-head` 与 digest 也会重算。Shared Projection 和 Agent-local History 位于这个首个差异之后；当 Shared Head 前进时，即使后续局部内容相同，也不能继续获得只从输入起点匹配的前缀缓存。
+
+> **TODO-CACHE-01：降低 Shared Head 前进对 Agent-local History 缓存复用的影响。**
+>
+> - **状态：**Open；属于 MVP 性能研究项，不阻塞短会话语义闭环。
+> - **问题：**当前 Shared-first 排列最大化两个 Agent 的公共前缀，但 Shared Head 前进会使越来越大的 Local History 落在首个缓存差异之后。
+> - **下一步：**先为 Common System、Shared Events、Shared Projection、Local History、Active Role/Trigger 记录分段字节数、估算 token 与实际 Provider usage；再以当前布局为基线，对 Shared Checkpoint + Tail、provider-aware local replay suffix 等候选方案做独立实验，不预设最终布局。
+> - **验收：**使用固定模型、固定 Prompt、固定工具集和固定会话脚本，分别测量冷/热缓存下的 cache read、cache miss、总输入、首 token 延迟、总时延、费用与角色/上下文行为；不得只以命中率百分比判定优劣，也不得牺牲 Shared Context 完整性或本地 continuation 正确性。
+
 ## 8. 上下文增长分析
 
 最新请求的 context pressure 已达到：
@@ -197,13 +222,61 @@ Shared Event 内部 `text/content` 去重已经完成，但它不会解决 Share
 建议后续验证按以下优先级推进：
 
 1. **Completion handoff 实验：**解决完成回报先于最终回答 durable 的确定性竞态，并测量减少的重复 turn 和 token；
-2. **请求分段观测：**为 Common System、Shared Events、Shared Projection、Local History、Reminder/Trigger 分别记录字节数或估算 token，定位增长来源；
+2. **请求分段观测（TODO-CACHE-01）：**为 Common System、Shared Events、Shared Projection、Local History、Reminder/Trigger 分别记录字节数或估算 token，定位增长来源；
 3. **Reasoning retention 探索：**区分工具续接所需 reasoning、已结束 turn reasoning 和可压缩 reasoning，不能直接全删；
 4. **`full-v1` / `text-dedup-v1` A/B：**在固定脚本、固定模型和冷/热缓存条件下比较输入、缓存、时延与费用；
 5. **Shared Checkpoint：**在短会话原型验证完成后，为长会话设计可审计压缩和恢复方案；
 6. **能力感知：**Navigator 委派前根据 Pilot 实际工具集合判断“调研、写文件、执行代码”等任务是否可完成，缺失能力时及时向用户说明。
 
-## 10. 演进记录
+## 10. MVP 技术方案完成度
+
+### 10.1 完成口径
+
+[`pair-agent-dsh-mvp.md`](pair-agent-dsh-mvp.md) 将 P0 定义为运行骨架、P0.5 定义为共享对话与 Agent 通信、P1 定义为权限和并发、P2 定义为恢复和执行生态，并明确“P2 完成代表 MVP 语义闭环完成，不代表生产就绪”。因此当前原型虽然已经能够运行并完成真实双 Agent 协作测试，但仍是 **P0/P0.5 原型，不是已经完成的 MVP 版本**。
+
+下表不使用单一完成百分比。各阶段工作量和正确性风险差异很大，按能力状态判断更准确：
+
+| 阶段 | 当前状态 | 已完成 | 距离阶段完成仍缺少 |
+| --- | --- | --- | --- |
+| P0：运行骨架 | 基本完成 | DSH 固定源码与两个通用 seam、Pair Ledger/Projection、两个顶层 Agent Session、Chat Completions、本地请求重建、cache-first request layout、双 Pane Web Shell、Events UI | 结构化 Task 尚未实现；当前“委派”由 Prompt + Peer Message 表达，正式 Task Domain 归入 P1 |
+| P0.5：共享对话与通信 | 功能基本完成，可靠性未收口 | 双向 Pair 输入、Session-to-Pair Bridge、durable final answer、`session_event.linked` 去重、普通共享不唤醒、双向 Peer Message、短日志恢复与 Events API/UI | completion report 早于最终回答 durable 的竞态；持久 unread cursor、长日志增量恢复和完整 delivery crash-window 对账按规划留给 P2 |
+| P1：权限和并发 | 尚未实现 | 双 Pane 已允许用户在 Pilot 工作期间继续使用 Navigator；Prompt 已保留权限语义边界 | Goal/Task/Execution Plan Domain 与控制工具、Goal-impact 分类和 escalation、Harness 工具权限绑定、Revision fencing、Pause/Resume/Cancel、局部纠偏与最终目标变更的确定性状态机 |
+| P2：恢复和执行生态 | 部分基础提前完成 | Pair + 两条 Session 可重启恢复；Pair Request Snapshot、immutable request material 与无 Provider 状态的 continuation 已实现；Bridge 有部分崩溃恢复测试 | Delivery 全窗口对账、持久 per-Agent unread cursor、长会话增量恢复、真实 Plan Mode/workflow/continuable Sub-agent、ArtifactRef 与重要证据回写、跨组件故障注入和完整恢复验收 |
+
+### 10.2 完成 MVP 前必须补齐
+
+| 缺口 | 性质 | 完成标准 |
+| --- | --- | --- |
+| Completion-specific turn-end handoff | P0.5 实测发现的正确性债务 | 完成回报只能在最终 `agent.message` durable 后唤醒 Navigator，并引用已经存在的交付事件；普通 Peer Message 仍可即时投递 |
+| P1 Goal/Task/Plan 权威模型 | 原技术方案核心能力 | 用户只能与 Navigator 确认或修改最终 Goal；Pilot 可接受不改变 Goal 的局部纠偏；Goal-impacting 输入必须确定性升级 |
+| P1 权限、Revision 与控制 | 原技术方案核心能力 | 工具执行绑定当前 Task Revision；旧 Revision 调用 fail closed；Pause/Resume/Cancel 与 pending inbox 行为可恢复、可审计 |
+| P2 Delivery 与恢复闭环 | 原技术方案核心能力 | 覆盖 Ledger/Session 写入、flush、ack、wake 各 crash window；恢复后不丢输入、不重复唤醒、不恢复已失效 Revision |
+| P2 执行生态 | 原技术方案核心能力 | Pilot 可以真实使用 Plan Mode、workflow、continuable Sub-agent；重要输出通过 ArtifactRef/digest 回写 Pair Ledger |
+| 能力感知与诚实委派 | 实测新增的协作质量缺口 | Navigator 在委派前读取 Pilot 实际工具能力；缺少搜索、写文件或执行能力时明确降级或向用户说明，不把知识内回答表述为已完成实时调研 |
+| 完整验收矩阵 | MVP 发布门禁 | 将技术方案第 13 节 24 个场景映射为自动测试或明确的真实模型 eval；P1/P2 场景全部有可重复证据 |
+
+### 10.3 不阻塞 MVP 语义闭环的后续项
+
+以下事项重要，但原技术方案已明确不作为 P0–P2 MVP 完成条件，不能与“尚未完成的 MVP 核心能力”混为一谈：
+
+- TODO-CACHE-01 与更进一步的缓存布局优化；
+- Shared Checkpoint、双 Agent 压缩水位和长会话重放等价 eval；
+- Responses API 或其他 Provider stateful continuation；
+- 单 React 树原生多 Session Pane、产品级响应式布局与完整可访问性；
+- 多进程、跨机器、第三方 Harness Adapter、多租户、计费和生产级安全审计。
+
+其中 Shared Checkpoint 虽不阻塞短会话 MVP，但当前 24 个 Agent turn 已使用约四至五成上下文窗口，若要把原型用于持续长会话，应在 MVP 语义闭环后优先推进，而不是无限扩大全量 Shared Events 与 Local History。
+
+### 10.4 推荐完成路线
+
+1. 先解决 completion handoff 竞态，避免继续用额外 Agent turn 为错误时序兜底；
+2. 实现 P1 的 Goal/Task/Execution Plan、权限分类、Revision fencing 与 Pause/Resume/Cancel；
+3. 补齐 P2 delivery crash-window 对账、持久 cursor 和恢复故障注入；
+4. 接入真实 Plan Mode、workflow、continuable Sub-agent 与 ArtifactRef；
+5. 用技术方案第 13 节场景完成自动测试和真实模型 eval，对 MVP 语义闭环给出最终判断；
+6. 在上述阶段同步采集 TODO-CACHE-01 的分段观测数据，但将布局优化作为独立实验，避免与正确性功能同时改动而失去可比较基线。
+
+## 11. 演进记录
 
 ### 2026-09-02
 
@@ -212,4 +285,6 @@ Shared Event 内部 `text/content` 去重已经完成，但它不会解决 Share
 - 确认 33 个请求全部采用 `text-dedup-v1`，Shared Event JSON 体积减少约 40.65%；
 - 记录累计 cache read 331,264 tokens，按本文口径命中占比 37.09%；
 - 发现完成回报早于最终交付 durable 的竞态，并将 completion handoff 提升为下一轮优先实验；
-- 记录 reasoning retention 与 Shared/Local 跨层重复是上下文增长的主要后续研究方向。
+- 记录 reasoning retention 与 Shared/Local 跨层重复是上下文增长的主要后续研究方向；
+- 登记 TODO-CACHE-01，确认 Shared Event 行保持 append-only，但 Shared Head 前进会使 Agent-local History 位于缓存差异之后；
+- 按 P0/P0.5/P1/P2 对照技术方案，明确当前仍是 P0/P0.5 原型，P1、P2 与新增正确性债务完成后才达到 MVP 语义闭环。
