@@ -31,6 +31,7 @@ const MAX_TEXT_BYTES = 64 * 1024;
 const SEMANTIC_PAIR_EVENT_TYPES: ReadonlySet<PairEventType> = new Set([
   'user.message',
   'agent.message',
+  'agent.turn_failed',
   'goal.committed',
   'goal.revised',
   'task.assigned',
@@ -97,6 +98,8 @@ export interface SendPeerMessageCommand {
   readonly text: string;
   readonly causalRootId: string;
   readonly hop: number;
+  readonly expectsReply?: true;
+  readonly replyTo?: string;
 }
 
 export interface DeliveryResult extends SendPairMessageResponse {
@@ -271,6 +274,19 @@ export class PairCoordinator {
     ) {
       throw new InvalidCommandError(`Peer hop must be between 1 and ${MAX_PEER_HOPS}`);
     }
+    if (
+      command.replyTo !== undefined &&
+      (typeof command.replyTo !== 'string' ||
+        command.replyTo.trim().length === 0 ||
+        command.replyTo.length > 160)
+    ) {
+      throw new InvalidCommandError(
+        'Peer replyTo must be a non-empty Pair Event ID of at most 160 characters',
+      );
+    }
+    if (command.expectsReply === true && command.replyTo !== undefined) {
+      throw new InvalidCommandError('A Peer Message reply cannot request another reply');
+    }
 
     const receiverRole: PairRole =
       command.senderRole === 'navigator' ? 'pilot' : 'navigator';
@@ -305,6 +321,8 @@ export class PairCoordinator {
           content: [{ type: 'text', text }],
           causalRootId: command.causalRootId,
           hop: command.hop,
+          ...(command.expectsReply === true ? { expectsReply: true } : {}),
+          ...(command.replyTo === undefined ? {} : { replyTo: command.replyTo }),
         },
       });
       if (
@@ -322,7 +340,9 @@ export class PairCoordinator {
         canonicalJsonStringify(event.payload.content) !==
           canonicalJsonStringify([{ type: 'text', text }]) ||
         event.payload.causalRootId !== command.causalRootId ||
-        event.payload.hop !== command.hop
+        event.payload.hop !== command.hop ||
+        event.payload.expectsReply !== command.expectsReply ||
+        event.payload.replyTo !== command.replyTo
       ) {
         throw new InvalidCommandError(
           'Peer sender Turn already owns a different durable semantic message',
@@ -335,6 +355,8 @@ export class PairCoordinator {
         pairEventId: pairEventId(event),
         causalRootId: command.causalRootId,
         hop: command.hop,
+        ...(command.expectsReply === true ? { expectsReply: true } : {}),
+        ...(command.replyTo === undefined ? {} : { replyTo: command.replyTo }),
       });
     });
   }

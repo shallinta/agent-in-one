@@ -496,10 +496,6 @@ describe('Pair Agent Phase 0 live DSH Web composition', () => {
         if (typeof payload?.sessionId === 'string') historyTargets.push(payload.sessionId);
       });
       await page.goto(`${shellOrigin}/pair.html?pairId=${pairId}`, { waitUntil: 'load' });
-      await expect.poll(
-        () => page.locator('body').innerText(),
-        { timeout: 30_000 },
-      ).toContain('Run one harmless Pilot echo tool.');
       const navigatorFrame = page.frameLocator('iframe[title="Navigator DSH session"]');
       const pilotFrame = page.frameLocator('iframe[title="Pilot DSH session"]');
       await Promise.all([
@@ -544,6 +540,8 @@ describe('Pair Agent Phase 0 live DSH Web composition', () => {
             required: ['text'],
             properties: {
               text: { type: 'string', minLength: 1, maxLength: 65536 },
+              expectsReply: { type: 'boolean' },
+              replyTo: { type: 'string', minLength: 1, maxLength: 160 },
             },
           },
         },

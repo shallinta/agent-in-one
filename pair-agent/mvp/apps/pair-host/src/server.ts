@@ -19,6 +19,7 @@ import {
   type ListPairSessionEventsQuery,
   type ListPairSessionEventsResponse,
   type PairProjection,
+  type PairRuntimeCapabilities,
   type SendPairMessageRequest,
   type SendPairMessageResponse,
 } from '@pair-agent/contracts';
@@ -67,6 +68,7 @@ export interface CreatePairHostServerOptions {
   registry: PairRegistry;
   coordinator: PairCoordinator;
   dshBuild: DshBuildRef;
+  capabilities?: PairRuntimeCapabilities;
   host?: string;
   port?: number;
   sse?: {
@@ -74,6 +76,22 @@ export interface CreatePairHostServerOptions {
     backpressureTimeoutMs?: number;
   };
 }
+
+const DEFAULT_RUNTIME_CAPABILITIES: PairRuntimeCapabilities = {
+  schemaVersion: 1,
+  stage: 'P0.5',
+  sharedConversation: true,
+  peerMessaging: true,
+  completionHandoff: true,
+  requestAudit: true,
+  pilotWebSearch: false,
+  goalControl: false,
+  taskControl: false,
+  executionPlanControl: false,
+  attentionControl: false,
+  pauseControl: false,
+  subagents: false,
+};
 
 export interface PairHostServer {
   readonly server: Server;
@@ -247,9 +265,13 @@ async function routeRequest(
       methodNotAllowed(response, 'GET');
       return;
     }
-    const getResponse: GetPairResponse = await options.coordinator.getPair(
+    const pair = await options.coordinator.getPair(
       decodePairId(getPairMatch[1]!),
     );
+    const getResponse: GetPairResponse = {
+      ...pair,
+      capabilities: options.capabilities ?? DEFAULT_RUNTIME_CAPABILITIES,
+    };
     writeJson(response, 200, getResponse);
     return;
   }

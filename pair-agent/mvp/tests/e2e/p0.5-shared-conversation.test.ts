@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 
@@ -17,6 +17,8 @@ import {
 } from '../../packages/ledger/src/index.js';
 import {
   PairCoordinator,
+  CompletionHandoffRouter,
+  CompletionHandoffService,
   PeerMessageRouter,
   PeerMessageService,
   PairRegistry,
@@ -63,6 +65,7 @@ interface LivePairHarness {
   readonly registry: PairRegistry;
   readonly coordinator: PairCoordinator;
   readonly router: PeerMessageRouter;
+  readonly completionRouter?: CompletionHandoffRouter;
 }
 
 async function launchPair(
@@ -72,14 +75,19 @@ async function launchPair(
     | readonly CaptureProviderResponse[]
     | Readonly<Record<string, readonly CaptureProviderResponse[]>>,
   options: {
+    readonly completion?: boolean;
+    readonly dataRoot?: string;
     readonly extraTools?: readonly DshPairToolDefinition[];
     readonly lifecycleFaults?: DshPairAgentAdapterOptions['lifecycleFaults'];
   } = {},
 ): Promise<LivePairHarness> {
-  const dataRoot = await tempRoot(label);
+  const dataRoot = options.dataRoot ?? await tempRoot(label);
   const pairRoot = join(dataRoot, 'pairs');
   const store = new JsonlPairLedgerStore(pairRoot);
   const router = new PeerMessageRouter();
+  const completionRouter = options.completion === true
+    ? new CompletionHandoffRouter()
+    : undefined;
   let registry!: PairRegistry;
   const runtime = await launchDshPairWebRuntime({
     source: { derivedRoot: dshRoot, lockPath: dshLockPath },
@@ -95,7 +103,11 @@ async function launchPair(
             Record<string, readonly CaptureProviderResponse[]>
           >,
         },
-    tools: [router.toolDefinition(), ...(options.extraTools ?? [])],
+    tools: [
+      router.toolDefinition(),
+      ...(completionRouter === undefined ? [] : [completionRouter.toolDefinition()]),
+      ...(options.extraTools ?? []),
+    ],
     ...(options.lifecycleFaults === undefined
       ? {}
       : { lifecycleFaults: options.lifecycleFaults }),
@@ -107,7 +119,11 @@ async function launchPair(
   registry = new PairRegistry(store, runtime.adapter);
   const coordinator = new PairCoordinator(registry, store, runtime.adapter);
   router.bind(new PeerMessageService(coordinator, runtime.adapter));
-  return { dataRoot, pairRoot, pairId, store, runtime, registry, coordinator, router };
+  completionRouter?.bind(new CompletionHandoffService(runtime.adapter));
+  return {
+    dataRoot, pairRoot, pairId, store, runtime, registry, coordinator, router,
+    ...(completionRouter === undefined ? {} : { completionRouter }),
+  };
 }
 
 async function createPair(harness: LivePairHarness): Promise<void> {
@@ -870,6 +886,244 @@ describe('Pair Agent P0.5 shared conversation E2E', () => {
     }
   }, 120_000);
 
+  test('hands Pilot completion to Navigator only after turn/end as a durable reference and preserves directed causality', async () => {
+    const pairId = 'pair-p05-completion-handoff';
+    const ids = createPairSessionIds(pairId);
+    const report = 'Pilot completed the delegated implementation with verified results.';
+    const peerReply = 'Navigator accepted completion and requests one focused follow-up.';
+    let releaseHold!: () => void;
+    let announceHold!: () => void;
+    const holdStarted = new Promise<void>((resolve) => { announceHold = resolve; });
+    const holdReleased = new Promise<void>((resolve) => { releaseHold = resolve; });
+    const holdTool: DshPairToolDefinition = {
+      name: 'p05_hold_after_completion',
+      description: 'Pause after completion succeeds so the E2E can inspect pre-final state.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      async execute() {
+        announceHold();
+        await holdReleased;
+        return [{ type: 'text', text: 'released' }];
+      },
+    };
+    const harness = await launchPair('completion-handoff', pairId, {
+      [ids.pilotSessionId]: [
+        { toolCall: { id: 'call-completion', name: 'pair_report_completion', arguments: {} } },
+        { toolCall: { id: 'call-hold', name: holdTool.name, arguments: {} } },
+        report,
+        'Pilot received the Navigator follow-up.',
+      ],
+      [ids.navigatorSessionId]: [
+        { toolCall: { id: 'call-peer-after-completion', name: 'pair_message_peer', arguments: { text: peerReply } } },
+        'Navigator integrated the completion reference.',
+      ],
+    }, { completion: true, extraTools: [holdTool] });
+    let recovered: LivePairHarness | undefined;
+    let firstClosed = false;
+    try {
+      await createPair(harness);
+      await harness.coordinator.sendPilot({
+        pairId,
+        text: 'Implement and report completion.',
+        expectedLedgerHead: (await harness.store.heads(pairId)).ledgerHead,
+      });
+      await holdStarted;
+
+      expect(harness.runtime.adapter.sessionEvents(ids.pilotSessionId).some(
+        (event) => event.type === 'tool/result' && JSON.stringify(event).includes('Completion handoff registered'),
+      )).toBe(true);
+      expect(harness.runtime.adapter.sessionEvents(ids.navigatorSessionId).filter(
+        (event) => event.type === 'turn/start',
+      )).toHaveLength(0);
+      expect((await harness.store.read(pairId)).filter(
+        (event) => event.payload.kind === 'completion-handoff',
+      )).toHaveLength(0);
+
+      releaseHold();
+      await expect.poll(() => harness.runtime.adapter.captureRequests().length, {
+        timeout: 45_000,
+      }).toBe(6);
+      await Promise.all([
+        harness.runtime.adapter.whenIdle(ids.pilotSessionId),
+        harness.runtime.adapter.whenIdle(ids.navigatorSessionId),
+      ]);
+
+      const events = await harness.store.read(pairId);
+      const completionEvents = events.filter(
+        (event) => event.type === 'agent.message' && event.payload.kind === 'completion-handoff',
+      );
+      expect(completionEvents).toHaveLength(1);
+      const completion = completionEvents[0]!;
+      const completionId = pairEventId(completion);
+      expect(harness.runtime.adapter.sessionEvents(ids.pilotSessionId).some(
+        (event) => event.type === 'turn/end' &&
+          (event.data as { turn?: number }).turn === 1 &&
+          (event.data as { reason?: { kind?: string } }).reason?.kind === 'completed',
+      )).toBe(true);
+      expect(events.filter(
+        (event) => event.payload.kind === 'turn-output' && event.payload.text === report,
+      )).toHaveLength(0);
+
+      const deliveryMessages = harness.runtime.adapter.sessionEvents(ids.navigatorSessionId).filter(
+        (event) => event.type === 'user/message' &&
+          (event.data as { source?: { deliveryId?: string } }).source?.deliveryId === completionId,
+      );
+      expect(deliveryMessages).toHaveLength(1);
+      expect((deliveryMessages[0]!.data as { source: { trigger: JsonObject } }).source.trigger).toEqual({
+        kind: 'completion-handoff', pairEventId: completionId, senderRole: 'pilot', senderTurn: 1,
+      });
+      expect(JSON.stringify(deliveryMessages[0])).not.toContain(report);
+
+      const navigatorRequest = harness.runtime.adapter.captureRequests().find(
+        (request) => request.sessionId === ids.navigatorSessionId && requestContains(request, completionId),
+      )!;
+      expect(sharedEvents(navigatorRequest).filter((event) => event.seq === completion.seq)).toHaveLength(1);
+      expect(JSON.stringify(navigatorRequest.messages).split(report)).toHaveLength(2);
+      const snapshotEvent = events.find((event) => event.seq === navigatorRequest.snapshotLedgerSeq)!;
+      expect((snapshotEvent.payload.snapshot as { sourceLedgerHead: number }).sourceLedgerHead)
+        .toBeGreaterThanOrEqual(completion.seq);
+
+      const peer = events.find(
+        (event) => event.type === 'agent.message' && event.payload.kind === 'peer-message' && event.payload.text === peerReply,
+      )!;
+      expect(harness.runtime.adapter.sessionEvents(ids.navigatorSessionId).filter(
+        (event) => event.type === 'turn/start',
+      )).toHaveLength(1);
+      expect(peer.payload.causalRootId).toBe(completion.payload.causalRootId);
+      expect(peer.payload.hop).toBe((completion.payload.hop as number) + 1);
+
+      const navigatorTurns = harness.runtime.adapter.sessionEvents(ids.navigatorSessionId)
+        .filter((event) => event.type === 'turn/start').length;
+      const requestCount = events.filter((event) => event.type === 'pair.request_built').length;
+      await closeBestEffort('P0.5 completion handoff pre-recovery close', [
+        async () => harness.coordinator.close(),
+        async () => harness.runtime.close(),
+      ]);
+      firstClosed = true;
+
+      recovered = await launchPair('completion-handoff-recovery', pairId, {
+        [ids.navigatorSessionId]: [],
+        [ids.pilotSessionId]: [],
+      }, {
+        completion: true,
+        dataRoot: harness.dataRoot,
+        extraTools: [holdTool],
+      });
+      await recovered.registry.recoverPair(pairId);
+      await recovered.registry.recoverPair(pairId);
+      expect(recovered.runtime.adapter.captureRequests()).toEqual([]);
+      expect(recovered.runtime.adapter.sessionEvents(ids.navigatorSessionId).filter(
+        (event) => event.type === 'turn/start',
+      )).toHaveLength(navigatorTurns);
+      expect(recovered.runtime.adapter.sessionEvents(ids.navigatorSessionId).filter(
+        (event) => event.type === 'user/message' &&
+          (event.data as { source?: { deliveryId?: string } }).source?.deliveryId === completionId,
+      )).toHaveLength(1);
+      const recoveredEvents = await recovered.store.read(pairId);
+      expect(recoveredEvents.filter(
+        (event) => event.type === 'pair.request_built',
+      )).toHaveLength(requestCount);
+      expect(recoveredEvents.filter(
+        (event) => event.type === 'agent.message' && event.payload.kind === 'completion-handoff',
+      )).toHaveLength(1);
+    } finally {
+      releaseHold?.();
+      await closeBestEffort('P0.5 completion handoff cleanup', [
+        ...(firstClosed ? [] : [
+          async () => harness.coordinator.close(),
+          async () => harness.runtime.close(),
+        ]),
+        ...(recovered === undefined ? [] : [
+          async () => recovered!.coordinator.close(),
+          async () => recovered!.runtime.close(),
+        ]),
+      ]);
+    }
+  }, 120_000);
+
+  test('recovers exactly once after a hard crash between durable completion link and Navigator delivery', async () => {
+    const pairId = 'pair-p05-completion-delivery-crash';
+    const ids = createPairSessionIds(pairId);
+    const dataRoot = await tempRoot('completion-delivery-crash');
+    await runCompletionDeliveryCrashChild(dataRoot, pairId);
+
+    const store = new JsonlPairLedgerStore(join(dataRoot, 'pairs'));
+    const crashedEvents = await store.read(pairId);
+    const completion = crashedEvents.find(
+      (event) => event.type === 'agent.message' && event.payload.kind === 'completion-handoff',
+    )!;
+    const completionId = pairEventId(completion);
+    expect(crashedEvents.filter(
+      (event) => event.type === 'agent.message' && event.payload.kind === 'completion-handoff',
+    )).toHaveLength(1);
+    expect(crashedEvents.filter(
+      (event) => event.type === 'session_event.linked' &&
+        event.payload.pairEventId === completionId &&
+        event.payload.sessionId === ids.pilotSessionId,
+    )).toHaveLength(1);
+    const crashedNavigatorEvents = await persistedSessionEvents(dataRoot, ids.navigatorSessionId);
+    expect(crashedNavigatorEvents.filter((event) => event.type === 'user/message' &&
+      (event.data as { source?: { deliveryId?: string } }).source?.deliveryId === completionId,
+    )).toHaveLength(0);
+    expect(crashedNavigatorEvents.filter((event) => event.type === 'turn/start')).toHaveLength(0);
+
+    const first = await launchPair('completion-crash-first-recovery', pairId, {
+      [ids.navigatorSessionId]: ['Navigator processed recovered completion.'],
+      [ids.pilotSessionId]: [],
+    }, { completion: true, dataRoot });
+    let firstTurns = 0;
+    let firstRequests = 0;
+    try {
+      await first.registry.recoverPair(pairId);
+      await first.runtime.adapter.whenIdle(ids.navigatorSessionId);
+      const navigatorEvents = first.runtime.adapter.sessionEvents(ids.navigatorSessionId);
+      expect(navigatorEvents.filter((event) => event.type === 'user/message' &&
+        (event.data as { source?: { deliveryId?: string } }).source?.deliveryId === completionId,
+      )).toHaveLength(1);
+      firstTurns = navigatorEvents.filter((event) => event.type === 'turn/start').length;
+      expect(firstTurns).toBe(1);
+      firstRequests = (await first.store.read(pairId)).filter(
+        (event) => event.type === 'pair.request_built',
+      ).length;
+    } finally {
+      await closeBestEffort('P0.5 completion crash first recovery cleanup', [
+        async () => first.coordinator.close(), async () => first.runtime.close(),
+      ]);
+    }
+
+    const second = await launchPair('completion-crash-second-recovery', pairId, {
+      [ids.navigatorSessionId]: [], [ids.pilotSessionId]: [],
+    }, { completion: true, dataRoot });
+    try {
+      await second.registry.recoverPair(pairId);
+      await second.runtime.adapter.whenIdle(ids.navigatorSessionId);
+      expect(second.runtime.adapter.captureRequests()).toEqual([]);
+      const secondNavigatorEvents = second.runtime.adapter.sessionEvents(ids.navigatorSessionId);
+      expect(secondNavigatorEvents.filter(
+        (event) => event.type === 'user/message' &&
+          (event.data as { source?: { deliveryId?: string } }).source?.deliveryId === completionId,
+      )).toHaveLength(1);
+      expect(secondNavigatorEvents.filter(
+        (event) => event.type === 'turn/start',
+      )).toHaveLength(firstTurns);
+      const secondPairEvents = await second.store.read(pairId);
+      expect(secondPairEvents.filter(
+        (event) => event.type === 'pair.request_built',
+      )).toHaveLength(firstRequests);
+      expect(secondPairEvents.filter(
+        (event) => event.type === 'agent.message' && event.payload.kind === 'completion-handoff',
+      )).toHaveLength(1);
+      expect(secondPairEvents.filter(
+        (event) => event.type === 'session_event.linked' &&
+          event.payload.pairEventId === completionId &&
+          event.payload.sessionId === ids.pilotSessionId,
+      )).toHaveLength(1);
+    } finally {
+      await closeBestEffort('P0.5 completion crash second recovery cleanup', [
+        async () => second.coordinator.close(), async () => second.runtime.close(),
+      ]);
+    }
+  }, 180_000);
+
   test('round-trips Peer Messages symmetrically, preserves causality, and rejects a fifth hop without wake', async () => {
     const pairId = 'pair-p05-peer-chain';
     const ids = createPairSessionIds(pairId);
@@ -991,7 +1245,7 @@ describe('Pair Agent P0.5 shared conversation E2E', () => {
         expect(request.tools).toEqual([expectedPeerTool]);
         expect(Object.keys(
           ((request.tools?.[0]?.parameters as JsonObject).properties as JsonObject),
-        )).toEqual(['text']);
+        )).toEqual(['text', 'expectsReply', 'replyTo']);
       }
       expect(
         harness.runtime.adapter
@@ -1134,6 +1388,104 @@ async function launchRecoveryRuntime(
   const coordinator = new PairCoordinator(registry, store, runtime.adapter);
   router.bind(new PeerMessageService(coordinator, runtime.adapter));
   return { dataRoot, pairRoot, pairId, store, runtime, registry, coordinator, router };
+}
+
+async function persistedSessionEvents(
+  dataRoot: string,
+  sessionId: string,
+): Promise<JsonObject[]> {
+  const sessionRoot = join(dataRoot, 'dsh-sessions');
+  const entries = await readdir(sessionRoot, { recursive: true });
+  for (const entry of entries) {
+    if (!entry.endsWith('.jsonl')) continue;
+    const path = join(sessionRoot, entry);
+    const rows = (await readFile(path, 'utf8')).trimEnd().split('\n').filter(Boolean)
+      .map((line) => JSON.parse(line) as JsonObject);
+    if (rows[0]?.type === 'session' && rows[0]?.id === sessionId) return rows;
+  }
+  throw new Error(`Persisted Session ${sessionId} was not found`);
+}
+
+async function runCompletionDeliveryCrashChild(
+  dataRoot: string,
+  pairId: string,
+): Promise<void> {
+  const requireFromMvp = createRequire(join(mvpRoot, 'package.json'));
+  const viteNodeCli = resolve(
+    dirname(requireFromMvp.resolve('vitest/node')),
+    '../../vite-node/vite-node.mjs',
+  );
+  const scriptPath = join(mvpRoot, 'tests/e2e', `.p05-completion-crash-${basename(dataRoot)}.ts`);
+  generatedCrashScripts.push(scriptPath);
+  await writeFile(scriptPath, `
+import { join } from 'node:path';
+import { JsonlPairLedgerStore } from '../../packages/ledger/src/index.ts';
+import {
+  CompletionHandoffRouter, CompletionHandoffService, PairCoordinator,
+  PeerMessageRouter, PeerMessageService, PairRegistry, launchDshPairWebRuntime,
+} from '../../packages/runtime/src/index.ts';
+const dataRoot = ${JSON.stringify(dataRoot)};
+const pairId = ${JSON.stringify(pairId)};
+const mvpRoot = ${JSON.stringify(mvpRoot)};
+const store = new JsonlPairLedgerStore(join(dataRoot, 'pairs'));
+const peer = new PeerMessageRouter();
+const completion = new CompletionHandoffRouter();
+let registry;
+const runtime = await launchDshPairWebRuntime({
+  source: { derivedRoot: join(mvpRoot, '.runtime/deepseek-harness'), lockPath: join(mvpRoot, 'dsh.lock.json') },
+  dataRoot, store, commonSystem: ${JSON.stringify(commonSystem)},
+  provider: 'openai-completions', model: 'capture-model',
+  capture: { responsesBySession: {
+    ['pair:' + pairId + ':pilot']: [
+      { toolCall: { id: 'completion-crash-call', name: 'pair_report_completion', arguments: {} } },
+      'Durable report before delivery crash.',
+    ],
+    ['pair:' + pairId + ':navigator']: [],
+  } },
+  tools: [peer.toolDefinition(), completion.toolDefinition()],
+  lifecycleFaults: {
+    beforeCompletionHandoffDelivery() {
+      process.stdout.write('P05_COMPLETION_DELIVERY_CRASH\\n', () => process.exit(86));
+      return new Promise(() => {});
+    },
+  },
+  onLedgerAdvanced: async (advancedPairId) => { await registry.publish(advancedPairId); },
+  web: { host: '127.0.0.1', port: 0 },
+});
+registry = new PairRegistry(store, runtime.adapter);
+const coordinator = new PairCoordinator(registry, store, runtime.adapter);
+peer.bind(new PeerMessageService(coordinator, runtime.adapter));
+completion.bind(new CompletionHandoffService(runtime.adapter));
+const created = await coordinator.createPair({
+  pairId, dshBuild: runtime.adapter.getDshRuntimeAttestation().dshBuild, expectedLedgerHead: 0,
+});
+if (created.status !== 'ready') throw new Error(created.reason);
+await coordinator.sendPilot({
+  pairId, text: 'Crash after durable completion.',
+  expectedLedgerHead: (await store.heads(pairId)).ledgerHead,
+});
+await new Promise(() => {});
+`, 'utf8');
+  const { OPENAI_API_KEY: _openAi, DEEPSEEK_API_KEY: _deepSeek, ...safeEnv } = process.env;
+  await new Promise<void>((resolveChild, rejectChild) => {
+    const child = spawn(process.execPath, [viteNodeCli, scriptPath], {
+      cwd: mvpRoot, env: safeEnv, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      rejectChild(new Error(`Completion-delivery crash child timed out\n${stderr}`));
+    }, 60_000);
+    child.stdout.on('data', (chunk) => { stdout += String(chunk); });
+    child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+    child.once('error', rejectChild);
+    child.once('exit', (code) => {
+      clearTimeout(timer);
+      if (code === 86 && stdout.includes('P05_COMPLETION_DELIVERY_CRASH')) resolveChild();
+      else rejectChild(new Error(`Completion crash child failed (${String(code)})\n${stdout}\n${stderr}`));
+    });
+  });
 }
 
 async function runCrashWindowChild(dataRoot: string, pairId: string): Promise<void> {

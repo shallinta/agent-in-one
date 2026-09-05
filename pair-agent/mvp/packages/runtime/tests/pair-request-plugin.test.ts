@@ -9,13 +9,18 @@ import {
   type PairEvent,
 } from '@pair-agent/contracts';
 import { JsonlPairLedgerStore } from '@pair-agent/ledger';
-import { SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1 } from '@pair-agent/context';
+import {
+  createRepresentedContentDigest,
+  SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
+} from '@pair-agent/context';
 import { vi, describe, expect, test } from 'vitest';
 
 import {
   createPairDeliveryMessageInput,
   PairRequestBindingError,
   PairRequestPlugin,
+  persistentSessionLinks,
+  rebuildAcceptedPairDeliveryIds,
 } from '../src/pair-request-plugin.js';
 import { ImmutablePairRequestMaterialRegistry } from '../src/request-material-registry.js';
 
@@ -126,6 +131,104 @@ function directedPeerTrigger(pairId: string): JsonObject {
     pairEventId: `${pairId}:2`,
     causalRootId: `${pairId}:root`,
     hop: 2,
+  };
+}
+
+function completionHandoff(
+  pairId: string,
+  overrides: Partial<PairEvent> = {},
+): PairEvent {
+  const sessionId = createPairSessionIds(pairId).pilotSessionId;
+  const sessionEventSeq = 42;
+  return {
+    pairId: parsePairId(pairId),
+    seq: 2,
+    type: 'agent.message',
+    actor: { kind: 'agent', role: 'pilot' },
+    source: 'pilot-session',
+    channel: 'navigator',
+    visibility: 'shared',
+    authority: 'pilot',
+    refs: {
+      sourceEventIds: [
+        `dsh:${sessionId}:${String(sessionEventSeq)}:agent.message`,
+      ],
+    },
+    payload: {
+      schemaVersion: 1,
+      kind: 'completion-handoff',
+      text: 'complete delegated report',
+      content: [{ type: 'text', text: 'complete delegated report' }],
+      completion: 'complete',
+      causalRootId: `${pairId}:root`,
+      hop: 2,
+      origin: {
+        schemaVersion: 1,
+        sessionId,
+        sessionEventSeq,
+        turn: 7,
+        messageId: 'completion-message-42',
+      },
+    },
+    occurredAt: '2026-09-03T00:00:02.000Z',
+    ...overrides,
+  };
+}
+
+function completionTrigger(pairId: string): JsonObject {
+  return {
+    kind: 'completion-handoff',
+    pairEventId: `${pairId}:2`,
+    senderRole: 'pilot',
+    senderTurn: 7,
+  };
+}
+
+function pilotTurnFailure(pairId: string): PairEvent {
+  const sessionId = createPairSessionIds(pairId).pilotSessionId;
+  return {
+    pairId: parsePairId(pairId),
+    seq: 2,
+    type: 'agent.turn_failed',
+    actor: { kind: 'host' },
+    source: 'pilot-session',
+    channel: 'navigator',
+    visibility: 'shared',
+    authority: 'host',
+    refs: {},
+    payload: {
+      schemaVersion: 1,
+      failedRole: 'pilot',
+      failedTurn: 4,
+      code: 'UNKNOWN',
+      message: 'request layout rejected',
+      origin: {
+        schemaVersion: 1,
+        sessionId,
+        sessionEventSeq: 42,
+      },
+    },
+    occurredAt: '2026-09-03T00:00:02.000Z',
+  };
+}
+
+function pilotTurnFailureTrigger(pairId: string): JsonObject {
+  return {
+    kind: 'agent.turn_failed',
+    pairEventId: `${pairId}:2`,
+    failedRole: 'pilot',
+    failedTurn: 4,
+    code: 'UNKNOWN',
+  };
+}
+
+function deliveryMessage(deliveryId: string, trigger: JsonObject) {
+  const input = createPairDeliveryMessageInput(deliveryId, trigger);
+  return {
+    id: `delivery-${deliveryId}`,
+    role: 'user' as const,
+    content: input.content,
+    source: input.source,
   };
 }
 
@@ -404,6 +507,292 @@ describe('PairRequestPlugin request-layout ownership', () => {
 });
 
 describe('PairRequestPlugin exactly-once request projection', () => {
+  test('materializes a digest-proven summary link across trailing non-message events', () => {
+    const pairId = 'pair-summary-materialization';
+    const sessionId = createPairSessionIds(pairId).navigatorSessionId;
+    const text = 'shared visible result';
+    const assistant = {
+      id: 'assistant-summary',
+      role: 'assistant' as const,
+      content: [
+        { type: 'reasoning', text: 'retain local reasoning' },
+        { type: 'text', text },
+        { type: 'image', attachment: { attachmentId: 'image-1' } },
+      ],
+      source: { kind: 'model', provider: 'capture', model: 'capture' },
+    };
+    const current = dshUserMessage('current-user', 'continue', { kind: 'user' });
+    const represented: PairEvent = {
+      ...sharedUserMessage(pairId, sessionId, assistant.id, text),
+      type: 'agent.message',
+      actor: { kind: 'agent', role: 'navigator' },
+      authority: 'navigator',
+      payload: {
+        schemaVersion: 1,
+        kind: 'turn-output',
+        text,
+        content: [{ type: 'text', text }],
+        completion: 'complete',
+        origin: {
+          schemaVersion: 1,
+          sessionId,
+          sessionEventSeq: 1,
+          turn: 1,
+          messageId: assistant.id,
+        },
+      },
+    };
+    const base = persistedLink(pairId, sessionId, assistant.id);
+    const summaryLink: PairEvent = {
+      ...base,
+      payload: {
+        ...(base.payload as JsonObject),
+        fromSessionSeq: 1,
+        throughSessionSeq: 3,
+        representation: 'summary',
+        representedContentDigest: createRepresentedContentDigest(
+          represented.payload.content as readonly JsonObject[],
+        ),
+      },
+    };
+    const events = [
+      { type: 'ignored', seq: 0, data: null },
+      { type: 'assistant/message', seq: 1, data: { turn: 1, step: 1, message: assistant } },
+      { type: 'step/end', seq: 2, data: { turn: 1, step: 1 } },
+      { type: 'turn/end', seq: 3, data: { turn: 1, reason: { kind: 'completed' } } },
+      { type: 'user/message', seq: 4, data: current },
+    ] as const;
+    const payload = {
+      ...requestPayload(sessionId, current),
+      agent: {
+        id: sessionId,
+        session: { id: sessionId, events, surface: { nodes: [1, 4] } },
+      },
+      messages: [assistant, current],
+      turn: 2,
+    } as const;
+
+    const result = rebuild(
+      pairId,
+      [pairCreated(pairId), represented, summaryLink],
+      payload as never,
+    );
+
+    expect(result.messages.find(({ id }) => id === assistant.id)?.content).toEqual([
+      { type: 'reasoning', text: 'retain local reasoning' },
+      { type: 'image', attachment: { attachmentId: 'image-1' } },
+    ]);
+    expect(result.manifest.spans).toContainEqual(
+      expect.objectContaining({
+        messageIds: [assistant.id],
+        reason: 'summary-text-deduplicated',
+      }),
+    );
+  });
+
+  test('retains a summary link without dedup proof when its digest disagrees with the Pair Event', () => {
+    const pairId = 'pair-summary-wrong-digest';
+    const sessionId = createPairSessionIds(pairId).navigatorSessionId;
+    const represented = sharedUserMessage(
+      pairId,
+      sessionId,
+      'message-1',
+      'canonical shared text',
+    );
+    const base = persistedLink(pairId, sessionId, 'message-1');
+    const summaryLink: PairEvent = {
+      ...base,
+      payload: {
+        ...(base.payload as JsonObject),
+        representation: 'summary',
+        representedContentDigest: createRepresentedContentDigest([
+          { type: 'text', text: 'different text' },
+        ]),
+      },
+    };
+
+    const links = persistentSessionLinks(
+      [pairCreated(pairId), represented, summaryLink],
+      sessionId,
+    );
+    expect(links).toEqual([
+      expect.objectContaining({
+        representation: 'summary',
+        pairEventId: `${pairId}:2`,
+      }),
+    ]);
+    expect(links[0]).not.toHaveProperty('representedContentDigest');
+  });
+
+  test('retains a legacy summary link without a content digest as non-deduplicating proof', () => {
+    const pairId = 'pair-summary-legacy-no-digest';
+    const sessionId = createPairSessionIds(pairId).navigatorSessionId;
+    const represented = sharedUserMessage(
+      pairId,
+      sessionId,
+      'message-1',
+      'canonical shared text',
+    );
+    const base = persistedLink(pairId, sessionId, 'message-1');
+    const legacySummaryLink: PairEvent = {
+      ...base,
+      payload: {
+        ...(base.payload as JsonObject),
+        representation: 'summary',
+      },
+    };
+
+    const links = persistentSessionLinks(
+      [pairCreated(pairId), represented, legacySummaryLink],
+      sessionId,
+    );
+    expect(links).toEqual([
+      expect.objectContaining({
+        representation: 'summary',
+      }),
+    ]);
+    expect(links[0]).not.toHaveProperty('representedContentDigest');
+  });
+
+  test('rejects a summary link whose message identity disagrees with represented origin', () => {
+    const pairId = 'pair-summary-wrong-message';
+    const sessionId = createPairSessionIds(pairId).navigatorSessionId;
+    const represented = sharedUserMessage(
+      pairId,
+      sessionId,
+      'represented-message',
+      'canonical shared text',
+    );
+    const base = persistedLink(pairId, sessionId, 'different-message');
+    const summaryLink: PairEvent = {
+      ...base,
+      payload: {
+        ...(base.payload as JsonObject),
+        representation: 'summary',
+        representedContentDigest: createRepresentedContentDigest(
+          represented.payload.content as readonly JsonObject[],
+        ),
+      },
+    };
+
+    expect(() =>
+      persistentSessionLinks(
+        [pairCreated(pairId), represented, summaryLink],
+        sessionId,
+      ),
+    ).toThrow(/origin/i);
+  });
+
+  test('rejects a summary link backed by a Pair-origin message instead of its own Session', () => {
+    const pairId = 'pair-summary-wrong-source';
+    const sessionId = createPairSessionIds(pairId).navigatorSessionId;
+    const text = 'canonical shared text';
+    const represented: PairEvent = {
+      ...sharedUserMessage(pairId, sessionId, 'message-1', text),
+      source: 'pair',
+      authority: 'user',
+    };
+    const base = persistedLink(pairId, sessionId, 'message-1');
+    const summaryLink: PairEvent = {
+      ...base,
+      payload: {
+        ...(base.payload as JsonObject),
+        representation: 'summary',
+        representedContentDigest: createRepresentedContentDigest(
+          represented.payload.content as readonly JsonObject[],
+        ),
+      },
+    };
+
+    expect(() =>
+      persistentSessionLinks(
+        [pairCreated(pairId), represented, summaryLink],
+        sessionId,
+      ),
+    ).toThrow(/summary source/i);
+  });
+
+  test('rejects a summary link whose represented origin is not the start of its range', () => {
+    const pairId = 'pair-summary-origin-not-start';
+    const sessionId = createPairSessionIds(pairId).navigatorSessionId;
+    const text = 'canonical shared text';
+    const baseRepresented = sharedUserMessage(
+      pairId,
+      sessionId,
+      'message-2',
+      text,
+    );
+    const represented: PairEvent = {
+      ...baseRepresented,
+      payload: {
+        ...(baseRepresented.payload as JsonObject),
+        origin: {
+          schemaVersion: 1,
+          sessionId,
+          sessionEventSeq: 2,
+          turn: 1,
+          messageId: 'message-2',
+        },
+      },
+    };
+    const base = persistedLink(pairId, sessionId, 'message-2');
+    const summaryLink: PairEvent = {
+      ...base,
+      payload: {
+        ...(base.payload as JsonObject),
+        fromSessionSeq: 1,
+        throughSessionSeq: 3,
+        representation: 'summary',
+        representedContentDigest: createRepresentedContentDigest(
+          represented.payload.content as readonly JsonObject[],
+        ),
+      },
+    };
+
+    expect(() =>
+      persistentSessionLinks(
+        [pairCreated(pairId), represented, summaryLink],
+        sessionId,
+      ),
+    ).toThrow(/origin/i);
+  });
+
+  test('rejects a summary link backed by a non-canonical visible-text payload', () => {
+    const pairId = 'pair-summary-wrong-visible-text';
+    const sessionId = createPairSessionIds(pairId).navigatorSessionId;
+    const baseRepresented = sharedUserMessage(
+      pairId,
+      sessionId,
+      'message-1',
+      'canonical content',
+    );
+    const represented: PairEvent = {
+      ...baseRepresented,
+      payload: {
+        ...(baseRepresented.payload as JsonObject),
+        text: 'different payload text',
+      },
+    };
+    const base = persistedLink(pairId, sessionId, 'message-1');
+    const summaryLink: PairEvent = {
+      ...base,
+      payload: {
+        ...(base.payload as JsonObject),
+        representation: 'summary',
+        representedContentDigest: createRepresentedContentDigest(
+          represented.payload.content as readonly JsonObject[],
+        ),
+      },
+    };
+
+    expect(() =>
+      persistentSessionLinks(
+        [pairCreated(pairId), represented, summaryLink],
+        sessionId,
+      ),
+    ).toThrow(/visible text/i);
+  });
+
   test('uses the immutable material-selected shared-event projection format', () => {
     const pairId = 'pair-model-projection-format';
     const sessionId = createPairSessionIds(pairId).navigatorSessionId;
@@ -461,6 +850,110 @@ describe('PairRequestPlugin exactly-once request projection', () => {
       `{"causalRootId":"${pairId}:root","deliveryId":"${durableId}","hop":2,"kind":"agent.message","pairEventId":"${durableId}"}\n` +
       '</pair-trigger>',
     );
+  });
+
+  test('accepts only a reference-only Pilot completion delivery with a covering snapshot', () => {
+    const pairId = 'pair-completion-delivery-proof';
+    const sessionId = createPairSessionIds(pairId).navigatorSessionId;
+    const durableId = `${pairId}:2`;
+    const hostTrigger = completionTrigger(pairId);
+    const delivery = createPairDeliveryMessageInput(durableId, hostTrigger);
+    const message = {
+      id: 'completion-delivery-message',
+      role: 'user' as const,
+      content: delivery.content,
+      source: delivery.source,
+    };
+
+    const result = rebuild(
+      pairId,
+      [pairCreated(pairId), completionHandoff(pairId)],
+      requestPayload(sessionId, message),
+    );
+
+    expect(delivery.source.trigger).toEqual(hostTrigger);
+    expect(Object.keys(delivery.source.trigger as JsonObject).sort()).toEqual([
+      'kind',
+      'pairEventId',
+      'senderRole',
+      'senderTurn',
+    ]);
+    expect(JSON.stringify(delivery.source.trigger)).not.toContain(
+      'complete delegated report',
+    );
+    expect(result.snapshot).toMatchObject({ sourceLedgerHead: 2 });
+    expect(result.messages.some(({ id }) => id === message.id)).toBe(false);
+    expect(result.messages.at(-1)?.content[0]?.text).toBe(
+      `<pair-trigger schema="pair-trigger/v1">\n` +
+      `{"kind":"completion-handoff","pairEventId":"${durableId}","senderRole":"pilot","senderTurn":7}\n` +
+      '</pair-trigger>',
+    );
+    expect(
+      JSON.stringify(result.messages).split('complete delegated report'),
+    ).toHaveLength(2);
+  });
+
+  test('accepts a reference-only Pilot Turn failure delivery for Navigator', () => {
+    const pairId = 'pair-pilot-turn-failure-delivery';
+    const sessionId = createPairSessionIds(pairId).navigatorSessionId;
+    const durableId = `${pairId}:2`;
+    const trigger = pilotTurnFailureTrigger(pairId);
+    const message = deliveryMessage(durableId, trigger);
+
+    const result = rebuild(
+      pairId,
+      [pairCreated(pairId), pilotTurnFailure(pairId)],
+      requestPayload(sessionId, message),
+    );
+
+    expect(result.messages.some(({ id }) => id === message.id)).toBe(false);
+    expect(result.messages.at(-1)?.content[0]?.text).toBe(
+      `<pair-trigger schema="pair-trigger/v1">\n` +
+      `{"code":"UNKNOWN","failedRole":"pilot","failedTurn":4,"kind":"agent.turn_failed","pairEventId":"${durableId}"}\n` +
+      '</pair-trigger>',
+    );
+    expect(JSON.stringify(result.messages)).toContain('request layout rejected');
+  });
+
+  test.each([
+    ['Navigator sender', { actor: { kind: 'agent', role: 'navigator' } }],
+    ['Pilot receiver', { channel: 'pilot' }],
+    ['missing canonical origin', {
+      payload: {
+        schemaVersion: 1,
+        kind: 'completion-handoff',
+        text: 'complete delegated report',
+        content: [{ type: 'text', text: 'complete delegated report' }],
+        completion: 'complete',
+        causalRootId: 'root',
+        hop: 2,
+      },
+    }],
+  ] as const)('rejects a completion delivery with %s', (_label, override) => {
+    const pairId = 'pair-completion-delivery-strict';
+    const sessionId = createPairSessionIds(pairId).navigatorSessionId;
+    const durableId = `${pairId}:2`;
+    const delivery = createPairDeliveryMessageInput(
+      durableId,
+      completionTrigger(pairId),
+    );
+    const message = {
+      id: 'completion-delivery-message',
+      role: 'user' as const,
+      content: delivery.content,
+      source: delivery.source,
+    };
+
+    expect(() =>
+      rebuild(
+        pairId,
+        [
+          pairCreated(pairId),
+          completionHandoff(pairId, override as Partial<PairEvent>),
+        ],
+        requestPayload(sessionId, message),
+      ),
+    ).toThrow(PairRequestBindingError);
   });
 
   test('accepts only a canonical directed peer event as persistent full-link proof', () => {
@@ -902,6 +1395,108 @@ describe('PairRequestPlugin exactly-once request projection', () => {
     );
     expect(triggerText).not.toContain(text);
     expect(triggerText).not.toContain('role');
+  });
+
+  test('rebuilds accepted delivery IDs only from messages proven against the current Pair ledger and role', () => {
+    const pairId = 'pair-recovery-admission';
+    const ids = createPairSessionIds(pairId);
+    const completion = completionHandoff(pairId);
+    const completionId = `${pairId}:2`;
+    const valid = deliveryMessage(completionId, completionTrigger(pairId));
+
+    expect(
+      rebuildAcceptedPairDeliveryIds(
+        [valid],
+        [pairCreated(pairId), completion],
+        'navigator',
+      ),
+    ).toEqual(new Set([completionId]));
+
+    expect(() =>
+      rebuildAcceptedPairDeliveryIds([valid], [pairCreated(pairId)], 'navigator'),
+    ).toThrow(PairRequestBindingError);
+    expect(() =>
+      rebuildAcceptedPairDeliveryIds(
+        [valid],
+        [pairCreated(pairId), completion],
+        'pilot',
+      ),
+    ).toThrow(PairRequestBindingError);
+
+    const verboseTrigger = {
+      ...completionTrigger(pairId),
+      text: 'complete delegated report',
+    };
+    expect(() =>
+      rebuildAcceptedPairDeliveryIds(
+        [deliveryMessage(completionId, verboseTrigger)],
+        [pairCreated(pairId), completion],
+        'navigator',
+      ),
+    ).toThrow(PairRequestBindingError);
+
+    const otherPairId = 'pair-recovery-admission-other';
+    expect(() =>
+      rebuildAcceptedPairDeliveryIds(
+        [deliveryMessage(`${otherPairId}:2`, completionTrigger(otherPairId))],
+        [pairCreated(pairId), completion],
+        'navigator',
+      ),
+    ).toThrow(PairRequestBindingError);
+
+    expect(ids.navigatorSessionId).toContain(pairId);
+  });
+
+  test('keeps canonical user, task, and peer deliveries compatible with recovery admission', () => {
+    const pairId = 'pair-recovery-compatible';
+    const ids = createPairSessionIds(pairId);
+    const user = {
+      ...sharedUserMessage(pairId, ids.navigatorSessionId, 'user-source', 'user input'),
+      source: 'pair' as const,
+      authority: 'user' as const,
+      payload: {
+        schemaVersion: 1,
+        kind: 'user-input',
+        text: 'user input',
+        content: [{ type: 'text', text: 'user input' }],
+      },
+    };
+    const task: PairEvent = {
+      pairId: parsePairId(pairId),
+      seq: 3,
+      type: 'task.assigned',
+      actor: { kind: 'agent', role: 'navigator' },
+      source: 'navigator-session',
+      channel: 'shared-control',
+      visibility: 'shared',
+      authority: 'navigator',
+      refs: {
+        sourceEventIds: ['task-source'],
+        task: { id: 'task-1', revision: 1 },
+      },
+      payload: {
+        schemaVersion: 1,
+        task: { id: 'task-1', revision: 1, summary: 'do work', state: 'queued' },
+      },
+      occurredAt: '2026-09-03T00:00:03.000Z',
+    };
+    const peer = { ...directedPeerMessage(pairId), seq: 4 };
+    const events = [pairCreated(pairId), user, task, peer];
+    const userId = `${pairId}:2`;
+    const taskId = `${pairId}:3`;
+    const peerId = `${pairId}:4`;
+
+    expect(rebuildAcceptedPairDeliveryIds([
+      deliveryMessage(userId, {
+        kind: 'user.message', role: 'navigator', text: 'user input', pairEventId: userId,
+      }),
+    ], events, 'navigator')).toEqual(new Set([userId]));
+    expect(rebuildAcceptedPairDeliveryIds([
+      deliveryMessage(taskId, {
+        kind: 'task.assigned', pairEventId: taskId, task: task.payload.task as JsonObject,
+      }),
+      deliveryMessage(peerId, { ...directedPeerTrigger(pairId), pairEventId: peerId }),
+    ], events, 'pilot')).toEqual(new Set([taskId, peerId]));
   });
 
   test('rejects a self-consistent task delivery backed by a non-canonical Task Event', () => {
@@ -1383,6 +1978,47 @@ describe('PairRequestPlugin exactly-once request projection', () => {
     ]);
   });
 
+  test('allows Pilot to rebuild after its Navigator-directed completion handoff', () => {
+    const pairId = 'pair-link-pilot-after-completion';
+    const sessionId = createPairSessionIds(pairId).pilotSessionId;
+    const message = dshUserMessage('next-pilot-input', 'start the next task', {
+      kind: 'user',
+    });
+    const base = persistedLink(
+      pairId,
+      sessionId,
+      'completion-message-42',
+    );
+    const completion = completionHandoff(pairId);
+    const completionLink = {
+      ...base,
+      payload: {
+        ...(base.payload as JsonObject),
+        fromSessionSeq: 42,
+        throughSessionSeq: 44,
+        representation: 'summary',
+        representedContentDigest: createRepresentedContentDigest(
+          completion.payload.content as readonly JsonObject[],
+        ),
+      },
+    };
+
+    const result = rebuild(
+      pairId,
+      [pairCreated(pairId), completion, completionLink],
+      requestPayload(sessionId, message),
+    );
+
+    expect(result.messages.some(({ id }) => id === message.id)).toBe(true);
+    expect(result.manifest.spans).toEqual([
+      expect.objectContaining({
+        messageIds: [message.id],
+        decision: 'retained',
+        reason: 'unlinked',
+      }),
+    ]);
+  });
+
   test('rejects a persisted link represented by an ordinary cross-channel agent.message', () => {
     const pairId = 'pair-link-cross-channel-agent';
     const ids = createPairSessionIds(pairId);
@@ -1426,16 +2062,32 @@ describe('PairRequestPlugin exactly-once request projection', () => {
         plugin: 'bootstrap',
       });
       const base = persistedLink(pairId, sessionId, message.id);
+      const represented = sharedUserMessage(
+        pairId,
+        sessionId,
+        message.id,
+        'summary only',
+      );
       const nonFull = {
         ...base,
-        payload: { ...(base.payload as JsonObject), representation },
+        payload: {
+          ...(base.payload as JsonObject),
+          representation,
+          ...(representation === 'summary'
+            ? {
+                representedContentDigest: createRepresentedContentDigest(
+                  represented.payload.content as readonly JsonObject[],
+                ),
+              }
+            : {}),
+        },
       };
 
       const result = rebuild(
         pairId,
         [
           pairCreated(pairId),
-          sharedUserMessage(pairId, sessionId, 'represented', 'summary only'),
+          represented,
           nonFull,
         ],
         requestPayload(sessionId, message),
@@ -1452,7 +2104,7 @@ describe('PairRequestPlugin exactly-once request projection', () => {
     },
   );
 
-  test.each(['summary', 'artifact-ref'] as const)(
+  test.each(['artifact-ref'] as const)(
     'still request-locally deduplicates a current Pair delivery with a persisted %s link',
     (representation) => {
       const pairId = `pair-delivery-${representation.replace('-', '')}`;
@@ -1505,7 +2157,7 @@ describe('PairRequestPlugin exactly-once request projection', () => {
     },
   );
 
-  test.each(['summary', 'artifact-ref'] as const)(
+  test.each(['artifact-ref'] as const)(
     'still request-locally deduplicates current native composer input with a persisted %s link',
     (representation) => {
       const pairId = `pair-native-${representation.replace('-', '')}`;

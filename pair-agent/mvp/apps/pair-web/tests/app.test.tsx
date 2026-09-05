@@ -26,6 +26,22 @@ const baseProjection: PairProjection = {
   pause: { paused: false, changedAtSeq: 2 },
 };
 
+const runtimeCapabilities = {
+  schemaVersion: 1,
+  stage: 'P0.5',
+  sharedConversation: true,
+  peerMessaging: true,
+  completionHandoff: true,
+  requestAudit: true,
+  pilotWebSearch: true,
+  goalControl: false,
+  taskControl: false,
+  executionPlanControl: false,
+  attentionControl: false,
+  pauseControl: false,
+  subagents: false,
+} as const;
+
 function responseFor(
   projection: PairProjection = baseProjection,
   panes: GetPairResponse['panes'] = [
@@ -41,7 +57,7 @@ function responseFor(
     },
   ],
 ): GetPairResponse {
-  return { projection, panes };
+  return { projection, panes, capabilities: runtimeCapabilities } as GetPairResponse;
 }
 
 function okJson(body: unknown): Response {
@@ -131,12 +147,19 @@ describe('Pair Web App', () => {
     expect(pilot).toHaveAttribute('src');
     expect(navigator.getAttribute('src')).not.toBe(pilot.getAttribute('src'));
     expect(screen.getByText('pair-web')).toBeInTheDocument();
-    expect(screen.getByText('No committed goal')).toBeInTheDocument();
-    expect(screen.getByText('No assigned task')).toBeInTheDocument();
-    expect(screen.getByText('No execution plan')).toBeInTheDocument();
+    expect(screen.getByText('P0.5')).toBeInTheDocument();
+    expect(screen.getByText('Shared context')).toBeInTheDocument();
+    expect(screen.getByText('Peer messaging')).toBeInTheDocument();
+    expect(screen.getByText('Completion handoff')).toBeInTheDocument();
+    expect(screen.getByText('Request audit')).toBeInTheDocument();
+    expect(screen.getByText('Pilot web search')).toBeInTheDocument();
+    expect(screen.getByText(/Goal\/Task\/Plan control unavailable/i)).toBeInTheDocument();
+    expect(screen.queryByText('No committed goal')).not.toBeInTheDocument();
+    expect(screen.queryByText('No assigned task')).not.toBeInTheDocument();
+    expect(screen.queryByText('No execution plan')).not.toBeInTheDocument();
     expect(screen.getByText(/shared head 2/i)).toBeInTheDocument();
     expect(screen.getByText(/ledger head 2/i)).toBeInTheDocument();
-    expect(screen.getByText(/shared Pair Projection/i)).toBeInTheDocument();
+    expect(screen.getByText(/Runtime-reported capabilities/i)).toBeInTheDocument();
     expect(document.body.textContent?.toLowerCase()).not.toContain('merged transcript');
   });
 
@@ -365,11 +388,14 @@ describe('Pair Web App', () => {
     });
 
     expect(await screen.findByText(/ledger head 5/i)).toBeInTheDocument();
-    expect(screen.getByText(/Connect UI.*active.*r7/i)).toBeInTheDocument();
-    expect(screen.getByText(/Phase 0.*r4/i)).toBeInTheDocument();
-    expect(screen.getByText('Need user choice')).toBeInTheDocument();
-    expect(screen.getByText('Awaiting user')).toBeInTheDocument();
-    expect(screen.getByText('Ship <img src=x onerror=alert(1)> safely')).toBeInTheDocument();
+    expect(screen.getByRole('status', { name: /connection status/i })).toHaveTextContent(
+      'ready',
+    );
+    expect(screen.queryByText(/Connect UI.*active.*r7/i)).not.toBeInTheDocument();
+    expect(screen.queryByText('Need user choice')).not.toBeInTheDocument();
+    expect(screen.queryByText('Awaiting user')).not.toBeInTheDocument();
+    expect(screen.queryByText('Ship <img src=x onerror=alert(1)> safely'))
+      .not.toBeInTheDocument();
     expect(document.querySelector('img')).toBeNull();
   });
 
@@ -384,7 +410,7 @@ describe('Pair Web App', () => {
         goal: { id: 'goal-new', version: 2, summary: 'Newest goal' },
       });
     });
-    expect(await screen.findByText('Newest goal')).toBeInTheDocument();
+    expect(await screen.findByText(/ledger head 5/i)).toBeInTheDocument();
 
     act(() => {
       eventSource.emit({
@@ -409,7 +435,9 @@ describe('Pair Web App', () => {
       });
     });
 
-    expect(screen.getByText('Newest goal')).toBeInTheDocument();
+    expect(screen.getByRole('status', { name: /connection status/i })).toHaveTextContent(
+      'degraded',
+    );
     expect(screen.queryByText('Stale goal')).not.toBeInTheDocument();
     expect(screen.queryByText('Conflicting goal')).not.toBeInTheDocument();
     expect(screen.queryByText('Shared rollback')).not.toBeInTheDocument();
@@ -453,7 +481,7 @@ describe('Pair Web App', () => {
     const { eventSource } = renderApp({
       fetcher: vi.fn(async () => okJson(responseFor(versionedProjection))),
     });
-    await screen.findByText('Current goal');
+    await screen.findByText(/ledger head 10/i);
 
     act(() => {
       eventSource.emit({
@@ -470,18 +498,15 @@ describe('Pair Web App', () => {
     expect(screen.getByRole('status', { name: /connection status/i })).toHaveTextContent(
       'degraded',
     );
-    expect(screen.getByText('Current goal')).toBeInTheDocument();
-    expect(screen.getByText(/Current task.*r4/i)).toBeInTheDocument();
-    expect(screen.getByText(/Current plan.*r4/i)).toBeInTheDocument();
-    expect(screen.getByText('Current attention')).toBeInTheDocument();
-    expect(screen.getByText('Current pause')).toBeInTheDocument();
+    expect(screen.getByText(/ledger head 10/i)).toBeInTheDocument();
+    expect(screen.queryByText('Current goal')).not.toBeInTheDocument();
   });
 
   test('allows same-revision task state changes and attention clearing at a higher shared head', async () => {
     const { eventSource } = renderApp({
       fetcher: vi.fn(async () => okJson(responseFor(versionedProjection))),
     });
-    await screen.findByText('Current goal');
+    await screen.findByText(/ledger head 10/i);
 
     act(() => {
       eventSource.emit({
@@ -500,13 +525,11 @@ describe('Pair Web App', () => {
     expect(screen.getByRole('status', { name: /connection status/i })).toHaveTextContent(
       'ready',
     );
-    expect(screen.getByText(/Current task.*paused.*r4/i)).toBeInTheDocument();
-    expect(screen.getByRole('status', { name: /attention status/i })).toHaveTextContent(
-      'Clear',
-    );
-    expect(screen.getByRole('status', { name: /pause status/i })).toHaveTextContent(
-      'Running',
-    );
+    expect(screen.getByText(/ledger head 11/i)).toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: /attention status/i }))
+      .not.toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: /pause status/i }))
+      .not.toBeInTheDocument();
   });
 
   test('rejects an old attention request that tries to revive a cleared projection', async () => {
@@ -517,7 +540,7 @@ describe('Pair Web App', () => {
     const { eventSource } = renderApp({
       fetcher: vi.fn(async () => okJson(responseFor(clearedProjection))),
     });
-    await screen.findByText('Current goal');
+    await screen.findByText(/ledger head 10/i);
 
     act(() => {
       eventSource.emit({
@@ -536,9 +559,7 @@ describe('Pair Web App', () => {
     expect(screen.getByRole('status', { name: /connection status/i })).toHaveTextContent(
       'degraded',
     );
-    expect(screen.getByRole('status', { name: /attention status/i })).toHaveTextContent(
-      'Clear',
-    );
+    expect(screen.getByText(/ledger head 10/i)).toBeInTheDocument();
     expect(screen.queryByText('Old request replayed')).not.toBeInTheDocument();
   });
 
@@ -752,7 +773,7 @@ describe('Pair Web App', () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
-  test('exposes restrained live status regions for connection, attention and pause', async () => {
+  test('keeps unimplemented attention and pause controls out of the live status surface', async () => {
     const { eventSource } = renderApp();
 
     await screen.findByTitle('Navigator DSH session');
@@ -773,28 +794,23 @@ describe('Pair Web App', () => {
       'aria-live',
       'polite',
     );
-    expect(screen.getByRole('status', { name: /attention status/i })).toHaveAttribute(
-      'aria-live',
-      'polite',
-    );
-    expect(screen.getByRole('status', { name: /attention status/i })).toHaveAttribute(
-      'aria-atomic',
-      'true',
-    );
-    expect(screen.getByRole('status', { name: /attention status/i })).toHaveTextContent(
-      'Requested Review required',
-    );
-    expect(screen.getByRole('status', { name: /pause status/i })).toHaveAttribute(
-      'aria-live',
-      'polite',
-    );
-    expect(screen.getByRole('status', { name: /pause status/i })).toHaveAttribute(
-      'aria-atomic',
-      'true',
-    );
-    expect(screen.getByRole('status', { name: /pause status/i })).toHaveTextContent(
-      'Paused Awaiting approval',
-    );
+    expect(screen.queryByRole('status', { name: /attention status/i }))
+      .not.toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: /pause status/i }))
+      .not.toBeInTheDocument();
+    expect(screen.queryByText('Review required')).not.toBeInTheDocument();
+    expect(screen.queryByText('Awaiting approval')).not.toBeInTheDocument();
+  });
+
+  test('rejects a missing or malformed runtime capability contract', async () => {
+    const malformed = {
+      ...responseFor(),
+      capabilities: { ...runtimeCapabilities, schemaVersion: 2 },
+    };
+    renderApp({ fetcher: vi.fn(async () => okJson(malformed)) });
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Pair Host response');
+    expect(screen.queryByTitle(/DSH session/)).not.toBeInTheDocument();
   });
 
   test('uses an explicit same-origin API default', async () => {

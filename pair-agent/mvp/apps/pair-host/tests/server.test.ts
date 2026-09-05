@@ -20,6 +20,21 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { createPairHostServer, type PairHostServer } from '../src/server.js';
 
 const roots: string[] = [];
+const runtimeCapabilities = {
+  schemaVersion: 1,
+  stage: 'P0.5',
+  sharedConversation: true,
+  peerMessaging: true,
+  completionHandoff: true,
+  requestAudit: true,
+  pilotWebSearch: false,
+  goalControl: false,
+  taskControl: false,
+  executionPlanControl: false,
+  attentionControl: false,
+  pauseControl: false,
+  subagents: false,
+} as const;
 
 function deferred<T>(): {
   promise: Promise<T>;
@@ -151,6 +166,7 @@ describe('Pair Host HTTP API', () => {
       registry,
       coordinator,
       dshBuild,
+      capabilities: runtimeCapabilities,
       host: '127.0.0.1',
       port: 0,
     });
@@ -188,6 +204,7 @@ describe('Pair Host HTTP API', () => {
     expect(loaded.body).toMatchObject({
       projection: { header: { pairId: 'http-pair', ledgerHead: 2 } },
       panes: [{ role: 'navigator' }, { role: 'pilot' }],
+      capabilities: runtimeCapabilities,
     });
   });
 

@@ -6,6 +6,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createPairHostServer } from '../apps/pair-host/src/server.js';
 import { JsonlPairLedgerStore } from '../packages/ledger/src/index.js';
 import {
+  CompletionHandoffRouter,
+  CompletionHandoffService,
   launchDshPairWebRuntime,
   PairCoordinator,
   PeerMessageRouter,
@@ -42,6 +44,7 @@ export async function runPhase0Dev(environment: NodeJS.ProcessEnv = process.env)
   const pairRoot = join(config.dataRoot, 'pairs');
   const store = new JsonlPairLedgerStore(pairRoot);
   const peerRouter = new PeerMessageRouter();
+  const completionRouter = new CompletionHandoffRouter();
   let registry!: PairRegistry;
   let dshRuntime: DshPairWebRuntime | undefined;
   let pairHost: ReturnType<typeof createPairHostServer> | undefined;
@@ -102,8 +105,12 @@ export async function runPhase0Dev(environment: NodeJS.ProcessEnv = process.env)
               compatibility: config.provider.compatibility,
             },
           }),
+      ...(config.webSearch.enabled
+        ? { webSearch: { apiKeyEnv: config.webSearch.apiKeyEnv } }
+        : {}),
       tools: [
         peerRouter.toolDefinition(),
+        completionRouter.toolDefinition(),
         {
           name: 'phase0_echo',
           description: 'Echo text without side effects.',
@@ -121,6 +128,7 @@ export async function runPhase0Dev(environment: NodeJS.ProcessEnv = process.env)
     registry = new PairRegistry(store, dshRuntime.adapter);
     const coordinator = new PairCoordinator(registry, store, dshRuntime.adapter);
     peerRouter.bind(new PeerMessageService(coordinator, dshRuntime.adapter));
+    completionRouter.bind(new CompletionHandoffService(dshRuntime.adapter));
     const existingHead = (await store.heads(config.pairId)).ledgerHead;
     if (existingHead === 0) {
       await coordinator.createPair({
@@ -155,6 +163,21 @@ export async function runPhase0Dev(environment: NodeJS.ProcessEnv = process.env)
       registry,
       coordinator,
       dshBuild: dshRuntime.adapter.getDshRuntimeAttestation().dshBuild,
+      capabilities: {
+        schemaVersion: 1,
+        stage: 'P0.5',
+        sharedConversation: true,
+        peerMessaging: true,
+        completionHandoff: true,
+        requestAudit: true,
+        pilotWebSearch: config.webSearch.enabled,
+        goalControl: false,
+        taskControl: false,
+        executionPlanControl: false,
+        attentionControl: false,
+        pauseControl: false,
+        subagents: false,
+      },
       host: '127.0.0.1',
       port: config.ports.pairHost,
     });

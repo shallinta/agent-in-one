@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 
 import {
   SHARED_EVENT_CONTEXT_TEXT_DEDUP_V1,
@@ -8,6 +9,7 @@ import {
   type PairRequestLayoutInput,
 } from '../src/index.js';
 import {
+  canonicalJsonStringify,
   parsePairId,
   type JsonObject,
   type PairEvent,
@@ -135,6 +137,85 @@ function input(
 }
 
 describe('buildPairRequestLayout', () => {
+  it('records deterministic measurements for every stable request segment', () => {
+    const requestInput = input();
+    requestInput.commonSystemPlacement = 'request-system';
+
+    const layout = buildPairRequestLayout(requestInput);
+    const measurements = layout.snapshot.segmentMeasurements;
+
+    expect(measurements.schema).toBe('pair-request-segments/v1');
+    expect(measurements.tokenEstimateMethod).toBe('utf8-bytes-div-4/v1');
+    expect(measurements.segments.map(({ name }) => name)).toEqual([
+      'common-system',
+      'shared-events',
+      'shared-projection',
+      'local-history',
+      'active-role',
+      'current-trigger',
+      'tool-schemas',
+      'request-config',
+    ]);
+    expect(measurements.segments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'common-system', itemCount: 1 }),
+        expect.objectContaining({ name: 'shared-events', itemCount: 1 }),
+        expect.objectContaining({ name: 'shared-projection', itemCount: 1 }),
+        expect.objectContaining({ name: 'local-history', itemCount: 1 }),
+        expect.objectContaining({ name: 'active-role', itemCount: 1 }),
+        expect.objectContaining({ name: 'current-trigger', itemCount: 1 }),
+        expect.objectContaining({ name: 'tool-schemas', itemCount: 1 }),
+        expect.objectContaining({ name: 'request-config', itemCount: 1 }),
+      ]),
+    );
+    for (const segment of measurements.segments) {
+      expect(segment.utf8Bytes).toBeGreaterThan(0);
+      expect(segment.estimatedTokens).toBe(Math.ceil(segment.utf8Bytes / 4));
+      expect(segment.digest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    }
+    expect(measurements.categorizedUtf8Bytes).toBe(
+      measurements.segments.reduce((sum, segment) => sum + segment.utf8Bytes, 0),
+    );
+    expect(measurements.estimatedTokens).toBe(
+      measurements.segments.reduce(
+        (sum, segment) => sum + segment.estimatedTokens,
+        0,
+      ),
+    );
+    expect(measurements.sharedEventCount).toBe(2);
+    expect(measurements.localMessageCount).toBe(1);
+
+    const providerBoundary = {
+      system: layout.system,
+      messages: layout.messages,
+      tools: layout.tools,
+      config: layout.config,
+    };
+    expect(layout.snapshot.fullRequestDigest).toBe(
+      `sha256:${createHash('sha256')
+        .update(canonicalJsonStringify(providerBoundary), 'utf8')
+        .digest('hex')}`,
+    );
+  });
+
+  it('retains a zero-sized fixed segment when the current trigger is absent', () => {
+    const continuation = input();
+    continuation.currentTrigger = undefined;
+
+    const layout = buildPairRequestLayout(continuation);
+    const trigger = layout.snapshot.segmentMeasurements.segments.find(
+      ({ name }) => name === 'current-trigger',
+    );
+
+    expect(trigger).toEqual({
+      name: 'current-trigger',
+      utf8Bytes: 0,
+      estimatedTokens: 0,
+      itemCount: 0,
+      digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+    });
+  });
+
   it('places the common prompt in the request system slot without duplicating it in messages', () => {
     const requestInput = input();
     requestInput.commonSystemPlacement = 'request-system';

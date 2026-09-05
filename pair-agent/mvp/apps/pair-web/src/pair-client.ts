@@ -12,6 +12,7 @@ import {
   type PairPaneDescriptor,
   type PairProjection,
   type PairRole,
+  type PairRuntimeCapabilities,
   type SendPairMessageRequest,
   type SendPairMessageResponse,
 } from '@pair-agent/contracts';
@@ -31,6 +32,7 @@ export interface ValidatedPairPane extends PairPaneDescriptor {
 export interface ValidatedPairResponse {
   readonly projection: PairProjection;
   readonly panes: readonly [ValidatedPairPane, ValidatedPairPane];
+  readonly capabilities: PairRuntimeCapabilities;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -282,6 +284,36 @@ function descriptorFor(
     source: expectedSource,
     sessionId: expectedSessionId,
   };
+}
+
+const CAPABILITY_KEYS = [
+  'schemaVersion',
+  'stage',
+  'sharedConversation',
+  'peerMessaging',
+  'completionHandoff',
+  'requestAudit',
+  'pilotWebSearch',
+  'goalControl',
+  'taskControl',
+  'executionPlanControl',
+  'attentionControl',
+  'pauseControl',
+  'subagents',
+] as const;
+
+function validateRuntimeCapabilities(value: unknown): PairRuntimeCapabilities {
+  if (!isRecord(value)) invalidResponse('capabilities must be an object');
+  hasExactKeys(value, CAPABILITY_KEYS, 'capabilities');
+  if (value.schemaVersion !== 1 || value.stage !== 'P0.5') {
+    invalidResponse('capabilities schemaVersion or stage is unsupported');
+  }
+  for (const key of CAPABILITY_KEYS.slice(2)) {
+    if (typeof value[key] !== 'boolean') {
+      invalidResponse(`capabilities.${key} must be boolean`);
+    }
+  }
+  return value as unknown as PairRuntimeCapabilities;
 }
 
 export function parsePairIdFromSearch(search: string): string {
@@ -609,9 +641,11 @@ export function validateGetPairResponse(
     projection.header.navigatorSessionId,
   );
   const pilot = descriptorFor(pilotRaw, 'pilot', projection.header.pilotSessionId);
+  const capabilities = validateRuntimeCapabilities(value.capabilities);
 
   return {
     projection,
+    capabilities,
     panes: [
       { pairId: expectedPairId, ...navigator },
       { pairId: expectedPairId, ...pilot },

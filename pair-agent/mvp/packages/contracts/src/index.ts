@@ -74,6 +74,7 @@ export const PAIR_EVENT_TYPES = [
   'pair.agent_failed',
   'user.message',
   'agent.message',
+  'agent.turn_failed',
   'goal.committed',
   'goal.revised',
   'task.assigned',
@@ -268,6 +269,24 @@ export interface CreatePairResponse {
 export interface GetPairResponse {
   projection: PairProjection;
   panes: readonly PairPaneDescriptor[];
+  /** Pair Host adds this composition-owned contract at its HTTP boundary. */
+  capabilities?: PairRuntimeCapabilities;
+}
+
+export interface PairRuntimeCapabilities {
+  schemaVersion: 1;
+  stage: 'P0.5';
+  sharedConversation: boolean;
+  peerMessaging: boolean;
+  completionHandoff: boolean;
+  requestAudit: boolean;
+  pilotWebSearch: boolean;
+  goalControl: boolean;
+  taskControl: boolean;
+  executionPlanControl: boolean;
+  attentionControl: boolean;
+  pauseControl: boolean;
+  subagents: boolean;
 }
 
 export interface SendPairMessageRequest {

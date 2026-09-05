@@ -4,6 +4,10 @@ import { isAbsolute, join, resolve } from 'node:path';
 export interface Phase0DevConfig {
   readonly dataRoot: string;
   readonly pairId: string;
+  readonly webSearch: {
+    readonly enabled: boolean;
+    readonly apiKeyEnv: string;
+  };
   readonly ports: {
     readonly pairWeb: number;
     readonly dshWeb: number;
@@ -20,6 +24,30 @@ export interface Phase0DevConfig {
         readonly maxTokens: number;
         readonly compatibility: 'openai' | 'deepseek';
       };
+}
+
+function zeroOrOne(
+  environment: NodeJS.ProcessEnv,
+  name: string,
+  fallback: boolean,
+): boolean {
+  const raw = environment[name];
+  if (raw === undefined || raw === '') return fallback;
+  if (raw === '1') return true;
+  if (raw === '0') return false;
+  throw new TypeError(`${name} must be 0 or 1`);
+}
+
+function environmentVariableName(
+  environment: NodeJS.ProcessEnv,
+  name: string,
+  fallback: string,
+): string {
+  const value = environment[name] ?? fallback;
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
+    throw new TypeError(`${name} must name an environment variable`);
+  }
+  return value;
 }
 
 function port(environment: NodeJS.ProcessEnv, name: string, fallback: number): number {
@@ -82,6 +110,14 @@ export function readPhase0DevConfig(environment: NodeJS.ProcessEnv): Phase0DevCo
     environment.PAIR_OPENAI_MODEL,
     environment.PAIR_OPENAI_API_KEY_ENV,
   ];
+  const webSearch = {
+    enabled: zeroOrOne(environment, 'PAIR_WEB_SEARCH_ENABLED', true),
+    apiKeyEnv: environmentVariableName(
+      environment,
+      'PAIR_WEB_SEARCH_API_KEY_ENV',
+      'DEEPSEEK_API_KEY',
+    ),
+  };
   const configuredFields = providerFields.filter(
     (value) => value !== undefined && value !== '',
   ).length;
@@ -89,6 +125,7 @@ export function readPhase0DevConfig(environment: NodeJS.ProcessEnv): Phase0DevCo
     return {
       dataRoot: resolve(dataRoot),
       pairId,
+      webSearch,
       ports,
       provider: { kind: 'capture', model: 'capture-model' },
     };
@@ -110,6 +147,7 @@ export function readPhase0DevConfig(environment: NodeJS.ProcessEnv): Phase0DevCo
   return {
     dataRoot: resolve(dataRoot),
     pairId,
+    webSearch,
     ports,
     provider: {
       kind: 'openai',

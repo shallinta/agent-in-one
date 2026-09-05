@@ -30,6 +30,20 @@ function pairEventId(event: Pick<PairEvent, 'pairId' | 'seq'>): string {
   return `${event.pairId}:${event.seq}`;
 }
 
+export function requireCanonicalDerivedEvent(
+  events: readonly PairEvent[],
+  sourceId: string,
+): PairEvent {
+  const event = indexCanonicalSources(events).get(sourceId);
+  if (event === undefined) {
+    throw new DerivedEventConflictError(
+      sourceId,
+      'appendGroup did not return the canonical durable event',
+    );
+  }
+  return event;
+}
+
 function indexCanonicalSources(events: readonly PairEvent[]): Map<string, PairEvent> {
   const bySource = new Map<string, PairEvent>();
   for (const event of events) {
@@ -199,6 +213,7 @@ export class PairDerivedEventWriter {
           if (
             draft.type !== 'user.message' &&
             draft.type !== 'agent.message' &&
+            draft.type !== 'agent.turn_failed' &&
             draft.type !== 'session_event.linked'
           ) {
             throw new DerivedEventConflictError(

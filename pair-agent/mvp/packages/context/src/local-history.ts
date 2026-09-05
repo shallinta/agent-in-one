@@ -1,6 +1,9 @@
+import { createHash } from 'node:crypto';
+
 import {
   InvalidJsonValueError,
   canonicalJsonStringify,
+  type JsonObject,
   type JsonValue,
 } from '@pair-agent/contracts';
 
@@ -27,6 +30,7 @@ export interface SessionEventPairSpanLink {
   messageIds: readonly string[];
   representation: LinkRepresentation;
   pairEventId: string;
+  representedContentDigest?: string;
 }
 
 export type RequestLocalSessionLinkProof =
@@ -50,6 +54,7 @@ export type LocalHistoryDecision = 'retained' | 'excluded' | 'degraded';
 export type LocalHistoryReason =
   | 'fully-represented-in-pair'
   | 'summary-representation'
+  | 'summary-text-deduplicated'
   | 'artifact-ref-representation'
   | 'unknown-representation'
   | 'unlinked'
@@ -133,6 +138,19 @@ interface RuntimeLink {
   messageIds: readonly string[];
   representation: string;
   pairEventId: string;
+  representedContentDigest?: string;
+}
+
+const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/;
+
+export function createRepresentedContentDigest(
+  content: readonly JsonObject[],
+): string {
+  const material = canonicalJsonStringify({
+    schema: 'pair-represented-content/v1',
+    content,
+  });
+  return `sha256:${createHash('sha256').update(material, 'utf8').digest('hex')}`;
 }
 
 function nonEmptyString(value: unknown): value is string {
@@ -235,7 +253,10 @@ function runtimeLink(input: unknown): RuntimeLink | undefined {
     !Array.isArray(value.messageIds) ||
     !value.messageIds.every(nonEmptyString) ||
     !nonEmptyString(value.representation) ||
-    !nonEmptyString(value.pairEventId)
+    !nonEmptyString(value.pairEventId) ||
+    (value.representedContentDigest !== undefined &&
+      (typeof value.representedContentDigest !== 'string' ||
+        !SHA256_DIGEST.test(value.representedContentDigest)))
   ) {
     return undefined;
   }
@@ -383,7 +404,6 @@ function linkMatchesPersistedRange(
   );
   return (
     covered[0]?.sessionSeq === link.fromSessionSeq &&
-    covered.at(-1)?.sessionSeq === link.throughSessionSeq &&
     covered.length === link.messageIds.length &&
     covered.every(({ messageId }, index) => messageId === link.messageIds[index])
   );
@@ -448,6 +468,54 @@ function normalizedMessages(
   return boundaries.flatMap(({ normalizedMessage }) =>
     normalizedMessage === undefined ? [] : [normalizedMessage],
   );
+}
+
+function summaryTextDeduplicatedMessages(
+  span: HistorySpan,
+  coveringLinks: readonly RuntimeLink[],
+): readonly NormalizedMessage[] | undefined {
+  if (
+    span.malformed ||
+    span.protocol ||
+    span.items.length !== 1 ||
+    !coveringLinks.some(({ representation }) => representation === 'summary')
+  ) {
+    return undefined;
+  }
+  const message = span.items[0]?.normalizedMessage;
+  if (message === undefined || !Array.isArray(message.content)) return undefined;
+  const visibleTextContent = message.content.filter(
+    (block): block is JsonObject =>
+      typeof block === 'object' &&
+      block !== null &&
+      !Array.isArray(block) &&
+      block.type === 'text' &&
+      typeof block.text === 'string',
+  );
+  const digest = createRepresentedContentDigest(visibleTextContent);
+  if (
+    !coveringLinks.some(
+      (link) =>
+        link.representation === 'summary' &&
+        link.representedContentDigest === digest,
+    )
+  ) {
+    return undefined;
+  }
+  const retainedContent = message.content.filter((block) => {
+    if (typeof block !== 'object' || block === null || Array.isArray(block)) {
+      return true;
+    }
+    const value = block as Record<string, JsonValue>;
+    return !(value.type === 'text' && typeof value.text === 'string');
+  });
+  if (
+    retainedContent.length === 0 ||
+    retainedContent.length === message.content.length
+  ) {
+    return undefined;
+  }
+  return [{ ...message, content: retainedContent } as NormalizedMessage];
 }
 
 function malformedEntries(
@@ -591,8 +659,13 @@ export function projectLocalHistory(
       ({ representation }) => representation === 'full',
     );
     const excluded = !span.malformed && fullLink !== undefined;
+    const summaryDeduplicated = excluded
+      ? undefined
+      : summaryTextDeduplicatedMessages(span, coveringLinks);
     if (!excluded) {
-      outputMessages.push(...normalizedMessages(span.items));
+      outputMessages.push(
+        ...(summaryDeduplicated ?? normalizedMessages(span.items)),
+      );
     }
     const relevantLinks = coveringLinks.length > 0 ? coveringLinks : overlappingLinks;
     outputSpans.push({
@@ -607,6 +680,8 @@ export function projectLocalHistory(
           : 'retained',
       reason: excluded
         ? 'fully-represented-in-pair'
+        : summaryDeduplicated !== undefined
+          ? 'summary-text-deduplicated'
         : retainedReason(span, coveringLinks, overlappingLinks),
       linkedPairEventIds: [...new Set(relevantLinks.map(({ pairEventId }) => pairEventId))],
     });

@@ -909,6 +909,7 @@ export class PairRegistry {
             if (
               draft.type !== 'user.message' &&
               draft.type !== 'agent.message' &&
+              draft.type !== 'agent.turn_failed' &&
               draft.type !== 'session_event.linked'
             ) {
               throw new TypeError(

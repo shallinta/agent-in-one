@@ -12,6 +12,7 @@ import {
   assertP05PairEventPayload,
   canonicalJsonStringify,
   createPairSessionIds,
+  isCompletionHandoffAgentMessage,
   isPeerAgentMessage,
   isPairEventType,
   parsePairId,
@@ -193,6 +194,7 @@ describe('canonical JSON', () => {
 describe('PairEventType runtime contract', () => {
   test('has one closed runtime set shared by type guards and persistence', () => {
     expect(PAIR_EVENT_TYPES).toContain('pair.created');
+    expect(PAIR_EVENT_TYPES).toContain('agent.turn_failed');
     expect(PAIR_EVENT_TYPES).toContain('delivery.superseded');
     expect(PAIR_EVENT_TYPES.every(isPairEventType)).toBe(true);
     expect(isPairEventType('unknown.event')).toBe(false);
@@ -278,6 +280,133 @@ describe('P0.5 message payload contract', () => {
     };
 
     expect(assertP05PairEventPayload('agent.message', payload)).toBe(payload);
+  });
+
+  test('accepts correlated Peer request and reply metadata', () => {
+    const request = {
+      schemaVersion: 1,
+      kind: 'peer-message',
+      text: 'answer this for the user',
+      content: [{ type: 'text', text: 'answer this for the user' }],
+      causalRootId: 'pair-event-10',
+      hop: 1,
+      expectsReply: true,
+    };
+    const reply = {
+      schemaVersion: 1,
+      kind: 'peer-message',
+      text: 'the requested answer',
+      content: [{ type: 'text', text: 'the requested answer' }],
+      causalRootId: 'pair-event-10',
+      hop: 2,
+      replyTo: 'pair-01:10',
+    };
+
+    expect(assertP05PairEventPayload('agent.message', request)).toBe(request);
+    expect(assertP05PairEventPayload('agent.message', reply)).toBe(reply);
+    expect(() => assertP05PairEventPayload('agent.message', {
+      ...reply,
+      expectsReply: true,
+    })).toThrow(/cannot request another reply/);
+  });
+
+  test('accepts an authoritative Agent Turn failure payload', () => {
+    const payload = {
+      schemaVersion: 1,
+      failedRole: 'pilot',
+      failedTurn: 4,
+      code: 'UNKNOWN',
+      message: 'request layout rejected',
+      origin: {
+        schemaVersion: 1,
+        sessionId: 'pair:pair-01:pilot',
+        sessionEventSeq: 42,
+      },
+    };
+
+    expect(assertP05PairEventPayload('agent.turn_failed', payload)).toBe(payload);
+    expect(() => assertP05PairEventPayload('agent.turn_failed', {
+      ...payload,
+      failedTurn: 0,
+    })).toThrow(/positive/);
+  });
+
+  test('accepts a complete bounded completion handoff', () => {
+    const payload = {
+      schemaVersion: 1,
+      kind: 'completion-handoff',
+      text: 'implementation complete',
+      content: [{ type: 'text', text: 'implementation complete' }],
+      completion: 'complete',
+      origin,
+      causalRootId: 'pair-event-10',
+      hop: MAX_PEER_HOPS,
+    };
+
+    expect(assertP05PairEventPayload('agent.message', payload)).toBe(payload);
+  });
+
+  test.each([
+    [
+      'partial completion',
+      {
+        schemaVersion: 1,
+        kind: 'completion-handoff',
+        text: 'not done',
+        content: [{ type: 'text', text: 'not done' }],
+        completion: 'partial',
+        origin,
+        causalRootId: 'pair-event-10',
+        hop: 1,
+      },
+      /completion/,
+    ],
+    [
+      'missing causal root',
+      {
+        schemaVersion: 1,
+        kind: 'completion-handoff',
+        text: 'done',
+        content: [{ type: 'text', text: 'done' }],
+        completion: 'complete',
+        origin,
+        hop: 1,
+      },
+      /causalRootId/,
+    ],
+    [
+      'zero hop',
+      {
+        schemaVersion: 1,
+        kind: 'completion-handoff',
+        text: 'done',
+        content: [{ type: 'text', text: 'done' }],
+        completion: 'complete',
+        origin,
+        causalRootId: 'pair-event-10',
+        hop: 0,
+      },
+      /hop/,
+    ],
+  ])('rejects a completion handoff with %s', (_label, payload, expected) => {
+    expect(() => assertP05PairEventPayload('agent.message', payload)).toThrow(
+      expected,
+    );
+  });
+
+  test('rejects completion handoff payloads on user messages', () => {
+    expect(() =>
+      assertP05PairEventPayload('user.message', {
+        schemaVersion: 1,
+        kind: 'completion-handoff',
+        text: 'done',
+        content: [{ type: 'text', text: 'done' }],
+        completion: 'complete',
+        origin,
+        causalRootId: 'pair-event-10',
+        hop: 1,
+      }),
+    ).toThrow(/kind/);
   });
 
   test.each([
@@ -373,6 +502,39 @@ describe('P0.5 message payload contract', () => {
         extra: true,
       }),
     ).toThrow(/extra/);
+
+    const summary = {
+      ...payload,
+      representation: 'summary',
+      representedContentDigest: `sha256:${'a'.repeat(64)}`,
+    };
+    expect(assertP05PairEventPayload('session_event.linked', summary)).toBe(
+      summary,
+    );
+    expect(() =>
+      assertP05PairEventPayload('session_event.linked', {
+        ...summary,
+        representedContentDigest: 'sha256:not-a-digest',
+      }),
+    ).toThrow(/representedContentDigest/);
+    expect(() =>
+      assertP05PairEventPayload('session_event.linked', {
+        ...summary,
+        representedContentDigest: undefined,
+      }),
+    ).toThrow(/representedContentDigest/);
+    expect(() =>
+      assertP05PairEventPayload('session_event.linked', {
+        ...payload,
+        representedContentDigest: `sha256:${'a'.repeat(64)}`,
+      }),
+    ).toThrow(/representedContentDigest/);
+    expect(() =>
+      assertP05PairEventPayload('session_event.linked', {
+        ...summary,
+        messageIds: ['message-40', 'message-41'],
+      }),
+    ).toThrow(/one message/i);
   });
 });
 
@@ -409,5 +571,95 @@ describe('peer Agent message classification', () => {
         payload: { ...peerEvent.payload, kind: 'turn-output' },
       }),
     ).toBe(false);
+  });
+});
+
+describe('completion handoff Agent message classification', () => {
+  const completionEvent: PairEvent = {
+    pairId: parsePairId('pair-01'),
+    seq: 9,
+    type: 'agent.message',
+    actor: { kind: 'agent', role: 'pilot' },
+    source: 'pilot-session',
+    channel: 'navigator',
+    visibility: 'shared',
+    authority: 'pilot',
+    refs: { sourceEventIds: ['dsh:pair:pair-01:pilot:9:agent.message'] },
+    payload: {
+      schemaVersion: 1,
+      kind: 'completion-handoff',
+      text: 'done',
+      content: [{ type: 'text', text: 'done' }],
+      completion: 'complete',
+      origin: {
+        schemaVersion: 1,
+        sessionId: 'pair:pair-01:pilot',
+        sessionEventSeq: 9,
+        turn: 3,
+        messageId: 'assistant-9',
+      },
+      causalRootId: 'pair-01:2',
+      hop: 2,
+    },
+    occurredAt: '2026-09-03T00:00:00.000Z',
+  };
+
+  test('requires the canonical Pilot-to-Navigator completion envelope', () => {
+    expect(isCompletionHandoffAgentMessage(completionEvent)).toBe(true);
+    expect(
+      isCompletionHandoffAgentMessage({
+        ...completionEvent,
+        actor: { kind: 'agent', role: 'navigator' },
+      }),
+    ).toBe(false);
+    expect(
+      isCompletionHandoffAgentMessage({
+        ...completionEvent,
+        channel: 'pilot',
+      }),
+    ).toBe(false);
+    expect(
+      isCompletionHandoffAgentMessage({
+        ...completionEvent,
+        payload: { ...completionEvent.payload, kind: 'peer-message' },
+      }),
+    ).toBe(false);
+    expect(
+      isCompletionHandoffAgentMessage({
+        ...completionEvent,
+        source: 'navigator-session',
+      }),
+    ).toBe(false);
+    expect(
+      isCompletionHandoffAgentMessage({
+        ...completionEvent,
+        authority: 'navigator',
+      }),
+    ).toBe(false);
+    expect(
+      isCompletionHandoffAgentMessage({
+        ...completionEvent,
+        refs: { sourceEventIds: ['dsh:pair:pair-01:pilot:8:agent.message'] },
+      }),
+    ).toBe(false);
+  });
+
+  test('keeps payload validation broader than strict directed-handoff admission', () => {
+    const { origin: _origin, ...missingOrigin } = completionEvent.payload;
+    const variants = [
+      missingOrigin,
+      { ...completionEvent.payload, deliveryId: 'must-not-be-present' },
+      {
+        ...completionEvent.payload,
+        content: [{ type: 'text', text: 'different body' }],
+      },
+    ];
+
+    for (const payload of variants) {
+      expect(assertP05PairEventPayload('agent.message', payload)).toBe(payload);
+      expect(
+        isCompletionHandoffAgentMessage({ ...completionEvent, payload }),
+      ).toBe(false);
+    }
   });
 });

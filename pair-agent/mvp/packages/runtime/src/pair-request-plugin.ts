@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import {
   canonicalJsonStringify,
   createPairSessionIds,
+  isCompletionHandoffAgentMessage,
   type JsonObject,
   type JsonValue,
   type PairEvent,
@@ -11,6 +12,7 @@ import {
 } from '@pair-agent/contracts';
 import {
   buildPairRequestLayout,
+  createRepresentedContentDigest,
   type LocalBoundaryMessage,
   type NormalizedMessage,
   type PairCurrentTrigger,
@@ -263,6 +265,9 @@ function isRepresentableSharedEvent(event: PairEvent, activeRole: PairRole): boo
     );
   }
   if (event.type === 'agent.message' && event.actor.kind === 'agent') {
+    if (isCompletionHandoffAgentMessage(event)) {
+      return activeRole === 'navigator';
+    }
     if (isCanonicalDirectedPeerMessage(event)) return event.channel === activeRole;
     return (
       event.channel === activeRole &&
@@ -271,6 +276,102 @@ function isRepresentableSharedEvent(event: PairEvent, activeRole: PairRole): boo
     );
   }
   return false;
+}
+
+function isCanonicalCompletionSenderLink(
+  represented: PairEvent,
+  activeRole: PairRole,
+  activeSessionId: string,
+  payload: Record<string, unknown>,
+): boolean {
+  if (activeRole !== 'pilot' || !isCompletionHandoffAgentMessage(represented)) {
+    return false;
+  }
+  const origin = plainRecord(represented.payload.origin);
+  const messageIds = payload.messageIds;
+  const fromSessionSeq = payload.fromSessionSeq;
+  const throughSessionSeq = payload.throughSessionSeq;
+  return (
+    origin?.sessionId === activeSessionId &&
+    Number.isSafeInteger(origin.sessionEventSeq) &&
+    typeof origin.messageId === 'string' &&
+    Array.isArray(messageIds) &&
+    messageIds.includes(origin.messageId) &&
+    Number.isSafeInteger(fromSessionSeq) &&
+    Number.isSafeInteger(throughSessionSeq) &&
+    (fromSessionSeq as number) <= (origin.sessionEventSeq as number) &&
+    (throughSessionSeq as number) >= (origin.sessionEventSeq as number)
+  );
+}
+
+function hasCanonicalSelfOrigin(
+  represented: PairEvent,
+  activeSessionId: string,
+  fromSessionSeq: number,
+  throughSessionSeq: number,
+  messageIds: readonly string[],
+): boolean {
+  const origin = plainRecord(represented.payload.origin);
+  return (
+    origin?.sessionId === activeSessionId &&
+    Number.isSafeInteger(origin.sessionEventSeq) &&
+    (origin.sessionEventSeq as number) === fromSessionSeq &&
+    (origin.sessionEventSeq as number) <= throughSessionSeq &&
+    typeof origin.messageId === 'string' &&
+    messageIds.length === 1 &&
+    messageIds[0] === origin.messageId
+  );
+}
+
+function hasCanonicalSummarySource(
+  represented: PairEvent,
+  activeRole: PairRole,
+): boolean {
+  if (represented.source !== `${activeRole}-session`) return false;
+  if (represented.type === 'user.message') {
+    return (
+      represented.actor.kind === 'user' &&
+      represented.channel === activeRole &&
+      represented.authority === 'user-derived' &&
+      represented.payload.kind === 'user-input'
+    );
+  }
+  if (
+    represented.type !== 'agent.message' ||
+    represented.actor.kind !== 'agent' ||
+    represented.actor.role !== activeRole ||
+    represented.authority !== activeRole
+  ) {
+    return false;
+  }
+  return (
+    (represented.channel === activeRole &&
+      represented.payload.kind === 'turn-output') ||
+    (activeRole === 'pilot' && isCompletionHandoffAgentMessage(represented))
+  );
+}
+
+function canonicalSummaryContent(
+  event: PairEvent,
+): readonly JsonObject[] | undefined {
+  const content = event.payload.content;
+  if (!Array.isArray(content) || content.length === 0) return undefined;
+  const blocks: JsonObject[] = [];
+  for (const candidate of content) {
+    const block = plainRecord(candidate);
+    if (
+      block === undefined ||
+      block.type !== 'text' ||
+      typeof block.text !== 'string' ||
+      Object.keys(block).sort().join(',') !== 'text,type'
+    ) {
+      return undefined;
+    }
+    blocks.push(candidate as JsonObject);
+  }
+  return blocks.map((block) => block.text).join('') === event.payload.text
+    ? blocks
+    : undefined;
 }
 
 export function persistentSessionLinks(
@@ -291,6 +392,7 @@ export function persistentSessionLinks(
     const messageIds = payload.messageIds;
     const representedId = payload.pairEventId;
     const representation = payload.representation;
+    const representedContentDigest = payload.representedContentDigest;
     if (
       (representation !== 'full' &&
         representation !== 'summary' &&
@@ -303,7 +405,12 @@ export function persistentSessionLinks(
       messageIds.length === 0 ||
       !messageIds.every(nonEmptyString) ||
       new Set(messageIds).size !== messageIds.length ||
-      !nonEmptyString(representedId)
+      !nonEmptyString(representedId) ||
+      (representation === 'summary' &&
+        representedContentDigest !== undefined &&
+        (typeof representedContentDigest !== 'string' ||
+          !/^sha256:[0-9a-f]{64}$/.test(representedContentDigest))) ||
+      (representation !== 'summary' && representedContentDigest !== undefined)
     ) {
       throw new PairRequestBindingError(
         `Persisted Session link ${pairEventId(event)} is malformed`,
@@ -314,11 +421,55 @@ export function persistentSessionLinks(
       represented === undefined ||
       pairEventId(represented) !== representedId ||
       represented.seq >= event.seq ||
-      !isRepresentableSharedEvent(represented, activeRole)
+      (!isRepresentableSharedEvent(represented, activeRole) &&
+        !isCanonicalCompletionSenderLink(
+          represented,
+          activeRole,
+          activeSessionId,
+          payload,
+        ))
     ) {
       throw new PairRequestBindingError(
         `Persisted Session link ${pairEventId(event)} has no earlier canonical represented Pair message`,
       );
+    }
+    let verifiedRepresentedContentDigest: string | undefined;
+    if (representation === 'summary') {
+      const content = canonicalSummaryContent(represented);
+      if (
+        !hasCanonicalSummarySource(represented, activeRole)
+      ) {
+        throw new PairRequestBindingError(
+          `Persisted Session link ${pairEventId(event)} has no canonical summary source`,
+        );
+      }
+      if (
+        !hasCanonicalSelfOrigin(
+          represented,
+          activeSessionId,
+          fromSessionSeq as number,
+          throughSessionSeq as number,
+          messageIds as string[],
+        )
+      ) {
+        throw new PairRequestBindingError(
+          `Persisted Session link ${pairEventId(event)} has no matching represented origin`,
+        );
+      }
+      if (content === undefined) {
+        throw new PairRequestBindingError(
+          `Persisted Session link ${pairEventId(event)} has no canonical visible text`,
+        );
+      }
+      if (
+        typeof representedContentDigest === 'string' &&
+        createRepresentedContentDigest(content) !==
+        representedContentDigest
+      ) {
+        verifiedRepresentedContentDigest = undefined;
+      } else if (typeof representedContentDigest === 'string') {
+        verifiedRepresentedContentDigest = representedContentDigest;
+      }
     }
     return [
       {
@@ -328,6 +479,9 @@ export function persistentSessionLinks(
         messageIds: messageIds as string[],
         representation,
         pairEventId: representedId,
+        ...(verifiedRepresentedContentDigest === undefined
+          ? {}
+          : { representedContentDigest: verifiedRepresentedContentDigest }),
       },
     ];
   });
@@ -353,6 +507,34 @@ function hasExactPersistentFullLink(
 function expectedDeliveryTrigger(event: PairEvent): JsonObject | undefined {
   const payload = plainRecord(event.payload);
   if (payload === undefined) return undefined;
+  if (
+    event.type === 'agent.turn_failed' &&
+    event.actor.kind === 'host' &&
+    event.source === 'pilot-session' &&
+    event.channel === 'navigator' &&
+    event.visibility === 'shared' &&
+    event.authority === 'host' &&
+    payload.failedRole === 'pilot' &&
+    Number.isSafeInteger(payload.failedTurn) &&
+    nonEmptyString(payload.code)
+  ) {
+    return {
+      kind: 'agent.turn_failed',
+      pairEventId: pairEventId(event),
+      failedRole: 'pilot',
+      failedTurn: payload.failedTurn as number,
+      code: payload.code,
+    };
+  }
+  if (isCompletionHandoffAgentMessage(event)) {
+    const origin = plainRecord(payload.origin)!;
+    return {
+      kind: 'completion-handoff',
+      pairEventId: pairEventId(event),
+      senderRole: 'pilot',
+      senderTurn: origin.turn as number,
+    };
+  }
   if (
     event.type === 'user.message' &&
     (event.channel === 'navigator' || event.channel === 'pilot') &&
@@ -380,12 +562,17 @@ function expectedDeliveryTrigger(event: PairEvent): JsonObject | undefined {
       pairEventId: pairEventId(event),
       causalRootId: payload.causalRootId as string,
       hop: payload.hop as number,
+      ...(payload.expectsReply === true ? { expectsReply: true } : {}),
+      ...(nonEmptyString(payload.replyTo) ? { replyTo: payload.replyTo } : {}),
     };
   }
   return undefined;
 }
 
 function deliveryTargetRole(event: PairEvent): PairRole | undefined {
+  if (event.type === 'agent.turn_failed') {
+    return expectedDeliveryTrigger(event) === undefined ? undefined : 'navigator';
+  }
   if (
     event.type === 'user.message' &&
     (event.channel === 'navigator' || event.channel === 'pilot')
@@ -393,6 +580,7 @@ function deliveryTargetRole(event: PairEvent): PairRole | undefined {
     return event.channel;
   }
   if (isCanonicalTaskAssignment(event)) return 'pilot';
+  if (isCompletionHandoffAgentMessage(event)) return 'navigator';
   if (isCanonicalDirectedPeerMessage(event)) return event.channel as PairRole;
   return undefined;
 }
@@ -401,6 +589,18 @@ function compactCurrentTrigger(
   event: PairEvent,
   deliveryId: string,
 ): PairCurrentTrigger {
+  if (event.type === 'agent.turn_failed') {
+    return expectedDeliveryTrigger(event)! as unknown as PairCurrentTrigger;
+  }
+  if (isCompletionHandoffAgentMessage(event)) {
+    const origin = plainRecord(event.payload.origin)!;
+    return {
+      kind: 'completion-handoff',
+      pairEventId: pairEventId(event),
+      senderRole: 'pilot',
+      senderTurn: origin.turn as number,
+    };
+  }
   const payload = plainRecord(event.payload);
   return {
     kind: event.type,
@@ -410,6 +610,8 @@ function compactCurrentTrigger(
       ? { causalRootId: payload.causalRootId }
       : {}),
     ...(Number.isSafeInteger(payload?.hop) ? { hop: payload?.hop as number } : {}),
+    ...(payload?.expectsReply === true ? { expectsReply: true } : {}),
+    ...(nonEmptyString(payload?.replyTo) ? { replyTo: payload.replyTo } : {}),
   };
 }
 
@@ -467,6 +669,31 @@ function validateDeliveryProof(
     proof: { kind: 'pair-delivery', pairEventId: representedId, deliveryId },
     currentTrigger: compactCurrentTrigger(represented, deliveryId),
   };
+}
+
+export function rebuildAcceptedPairDeliveryIds(
+  persistedMessages: readonly JsonObject[],
+  pairEvents: readonly PairEvent[],
+  activeRole: PairRole,
+): Set<string> {
+  const eventsById = new Map(
+    pairEvents.map((event) => [pairEventId(event), event] as const),
+  );
+  const accepted = new Set<string>();
+  for (const candidate of persistedMessages) {
+    const source = plainRecord(candidate.source);
+    if (source?.kind !== 'plugin' || source.plugin !== DELIVERY_PLUGIN) continue;
+    const message = candidate as unknown as DshMessage;
+    const { pairEvent } = validateDeliveryProof(message, eventsById, activeRole);
+    const deliveryId = pairEventId(pairEvent);
+    if (accepted.has(deliveryId)) {
+      throw new PairRequestBindingError(
+        `Persisted Pair delivery ${deliveryId} is duplicated`,
+      );
+    }
+    accepted.add(deliveryId);
+  }
+  return accepted;
 }
 
 function validateNativeComposerProof(
@@ -654,20 +881,58 @@ function materializeMessages(
   originals: ReadonlyMap<string, DshMessage>,
   hasTrigger: boolean,
 ): readonly DshMessage[] {
-  const retainedIds = layout.manifest.spans.flatMap((span) =>
-    span.decision === 'retained' ? [...span.messageIds] : [],
+  const retainedSpans = layout.manifest.spans.filter(
+    ({ decision }) => decision === 'retained',
   );
-  const local = retainedIds.map((messageId) => {
+  const retainedIds = retainedSpans.flatMap(({ messageIds }) => [...messageIds]);
+  const reminderIndex = layout.messages.length - (hasTrigger ? 2 : 1);
+  const projectedLocal = layout.messages.slice(2, reminderIndex);
+  if (projectedLocal.length !== retainedIds.length) {
+    throw new PairRequestBindingError(
+      'Pair request layout local projection does not match its retained manifest',
+    );
+  }
+  const reasonByMessageId = new Map(
+    retainedSpans.flatMap((span) =>
+      span.messageIds.map((messageId) => [messageId, span.reason] as const),
+    ),
+  );
+  const local = retainedIds.map((messageId, index) => {
     const original = originals.get(messageId);
     if (original === undefined) {
       throw new PairRequestBindingError(
         `Retained DSH message ${messageId} is unavailable`,
       );
     }
-    return original;
+    const projected = projectedLocal[index];
+    if (projected === undefined) {
+      throw new PairRequestBindingError(
+        `Retained DSH message ${messageId} has no projected Local History message`,
+      );
+    }
+    if (
+      canonicalJsonStringify(dshToNormalized(original)) ===
+      canonicalJsonStringify(projected)
+    ) {
+      return original;
+    }
+    if (
+      reasonByMessageId.get(messageId) !== 'summary-text-deduplicated' ||
+      projected.role !== original.role ||
+      (projected.role !== 'user' && projected.role !== 'assistant') ||
+      !Array.isArray(projected.content) ||
+      !projected.content.every((block) => plainRecord(block) !== undefined)
+    ) {
+      throw new PairRequestBindingError(
+        `Retained DSH message ${messageId} differs from its Local History projection without summary proof`,
+      );
+    }
+    return {
+      ...original,
+      content: structuredClone(projected.content) as readonly JsonObject[],
+    };
   });
   const sharedPrefix = layout.messages.slice(0, 2).map(syntheticMessage);
-  const reminderIndex = layout.messages.length - (hasTrigger ? 2 : 1);
   const reminder = layout.messages[reminderIndex];
   if (reminder === undefined) {
     throw new PairRequestBindingError(

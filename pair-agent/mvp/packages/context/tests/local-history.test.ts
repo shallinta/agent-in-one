@@ -1,3 +1,6 @@
+import { createHash } from 'node:crypto';
+
+import { canonicalJsonStringify, type JsonObject } from '@pair-agent/contracts';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -38,6 +41,32 @@ function link(
     ),
     representation,
     pairEventId,
+  };
+}
+
+function representedContentDigest(content: readonly JsonObject[]): string {
+  const material = canonicalJsonStringify({
+    schema: 'pair-represented-content/v1',
+    content,
+  });
+  return `sha256:${createHash('sha256').update(material, 'utf8').digest('hex')}`;
+}
+
+function summaryLink(
+  fromSessionSeq: number,
+  throughSessionSeq: number,
+  messageIds: readonly string[],
+  content: readonly JsonObject[],
+  pairEventId = `pair-event-${fromSessionSeq}`,
+): SessionEventPairSpanLink {
+  return {
+    sessionId,
+    fromSessionSeq,
+    throughSessionSeq,
+    messageIds,
+    representation: 'summary',
+    pairEventId,
+    representedContentDigest: representedContentDigest(content),
   };
 }
 
@@ -304,6 +333,176 @@ describe('projectLocalHistory', () => {
         { decision: 'retained', reason: 'unlinked' },
         { decision: 'retained', reason: 'unknown-representation' },
       ]);
+  });
+
+  it('deduplicates summary text while preserving local reasoning and non-text content', () => {
+    const representedContent = [
+      { type: 'text', text: 'already represented in the Pair Event' },
+    ] as const;
+    const input = [
+      boundary(1, {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: 'private local reasoning' },
+          { type: 'text', text: 'already represented in the Pair Event' },
+          { type: 'image', attachment: { attachmentId: 'image-1' } },
+        ],
+      }),
+    ];
+
+    const projected = projectLocalHistory(
+      input,
+      [summaryLink(1, 1, ['message-1'], representedContent)],
+      { expectedSessionId: sessionId },
+    );
+
+    expect(projected.messages).toEqual([
+      {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: 'private local reasoning' },
+          { type: 'image', attachment: { attachmentId: 'image-1' } },
+        ],
+      },
+    ]);
+    expect(projected.spans).toEqual([
+      expect.objectContaining({
+        decision: 'retained',
+        reason: 'summary-text-deduplicated',
+      }),
+    ]);
+  });
+
+  it('accepts a summary link whose durable range ends after its only message boundary', () => {
+    const representedContent = [
+      { type: 'text', text: 'completed result' },
+    ] as const;
+    const input = [
+      boundary(7, {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: 'local reasoning' },
+          ...representedContent,
+        ],
+      }),
+    ];
+
+    const projected = projectLocalHistory(
+      input,
+      [summaryLink(7, 9, ['message-7'], representedContent)],
+      { expectedSessionId: sessionId },
+    );
+
+    expect(projected.messages).toEqual([
+      {
+        role: 'assistant',
+        content: [{ type: 'reasoning', text: 'local reasoning' }],
+      },
+    ]);
+    expect(projected.spans).toEqual([
+      expect.objectContaining({
+        messageIds: ['message-7'],
+        decision: 'retained',
+        reason: 'summary-text-deduplicated',
+      }),
+    ]);
+  });
+
+  it('retains summary text when its canonical content digest does not match', () => {
+    const input = [
+      boundary(1, {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: 'local reasoning' },
+          { type: 'text', text: 'actual local result' },
+        ],
+      }),
+    ];
+
+    const projected = projectLocalHistory(
+      input,
+      [
+        summaryLink(
+          1,
+          1,
+          ['message-1'],
+          [{ type: 'text', text: 'different shared result' }],
+        ),
+      ],
+      { expectedSessionId: sessionId },
+    );
+
+    expect(projected.messages).toEqual(input.map(({ message }) => message));
+    expect(projected.spans).toEqual([
+      expect.objectContaining({
+        decision: 'retained',
+        reason: 'summary-representation',
+      }),
+    ]);
+  });
+
+  it('does not deduplicate an unlinked message with identical visible text', () => {
+    const representedContent = [{ type: 'text', text: 'same result' }] as const;
+    const input = [
+      boundary(1, {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: 'first reasoning' },
+          ...representedContent,
+        ],
+      }),
+      boundary(2, {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: 'second reasoning' },
+          ...representedContent,
+        ],
+      }),
+    ];
+
+    const projected = projectLocalHistory(
+      input,
+      [summaryLink(1, 1, ['message-1'], representedContent)],
+      { expectedSessionId: sessionId },
+    );
+
+    expect(projected.messages).toEqual([
+      {
+        role: 'assistant',
+        content: [{ type: 'reasoning', text: 'first reasoning' }],
+      },
+      input[1]!.message,
+    ]);
+    expect(projected.spans.map(({ reason }) => reason)).toEqual([
+      'summary-text-deduplicated',
+      'unlinked',
+    ]);
+  });
+
+  it('retains every message when a summary range contains an unclaimed message boundary', () => {
+    const representedContent = [{ type: 'text', text: 'first result' }] as const;
+    const input = [
+      boundary(1, {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: 'first reasoning' },
+          ...representedContent,
+        ],
+      }),
+      boundary(2, { role: 'user', content: 'an additional message' }),
+    ];
+
+    const projected = projectLocalHistory(
+      input,
+      [summaryLink(1, 3, ['message-1'], representedContent)],
+      { expectedSessionId: sessionId },
+    );
+
+    expect(projected.messages).toEqual(input.map(({ message }) => message));
+    expect(projected.spans.map(({ reason }) => reason)).toEqual([
+      'unlinked',
+      'unlinked',
+    ]);
   });
 
   it('accepts a proven request-local full link only through the current request option', () => {

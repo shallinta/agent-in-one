@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import {
   type DshBuildRef,
   type JsonObject,
+  type PairEvent,
   type PairId,
   parsePairId,
 } from '@pair-agent/contracts';
@@ -114,6 +115,41 @@ class FakeBridgePort implements PairSessionBridgePort {
   }
 }
 
+interface CompletionDeliveryInput {
+  readonly pairId: string;
+  readonly pairEventId: string;
+  readonly senderRole: 'pilot';
+  readonly senderTurn: number;
+}
+
+interface TurnFailureDeliveryInput {
+  readonly pairId: string;
+  readonly pairEventId: string;
+  readonly failedRole: 'pilot';
+  readonly failedTurn: number;
+  readonly code: string;
+}
+
+class RecordingCompletionDeliveryPort {
+  readonly deliveries: CompletionDeliveryInput[] = [];
+  readonly failureDeliveries: TurnFailureDeliveryInput[] = [];
+  failuresRemaining = 0;
+  onDeliver?: (input: CompletionDeliveryInput) => Promise<void> | void;
+
+  async deliverCompletion(input: CompletionDeliveryInput): Promise<void> {
+    this.deliveries.push(structuredClone(input));
+    await this.onDeliver?.(input);
+    if (this.failuresRemaining > 0) {
+      this.failuresRemaining -= 1;
+      throw new Error('completion delivery unavailable');
+    }
+  }
+
+  async deliverTurnFailure(input: TurnFailureDeliveryInput): Promise<void> {
+    this.failureDeliveries.push(structuredClone(input));
+  }
+}
+
 function event(type: string, seq: number, data: JsonObject, time = 1_800_000_000_000 + seq): DshSessionEvent {
   return { type, seq, time, data };
 }
@@ -141,12 +177,66 @@ function completeTurn(turn: number, offset = 0, answer = 'done'): DshSessionEven
   ];
 }
 
-async function harness(name = 'pair-bridge'): Promise<{
+function completionTurn(turn: number, offset = 0): DshSessionEvent[] {
+  const callId = `completion-${String(turn)}`;
+  return [
+    event('turn/start', offset, { turn }),
+    event('user/message', offset + 1, {
+      id: `u-${turn}`,
+      role: 'user',
+      content: [{ type: 'text', text: `delegation ${turn}` }],
+      source: { kind: 'user' },
+    }),
+    event('tool/call', offset + 2, {
+      turn,
+      step: 1,
+      callId,
+      name: 'pair_report_completion',
+      arguments: '{}',
+    }),
+    {
+      ...event('tool/result', offset + 3, {
+        turn,
+        step: 1,
+        message: {
+          id: `tool-result-${String(turn)}`,
+          role: 'user',
+          content: [{
+            type: 'tool-result',
+            toolCallId: callId,
+            content: [{ type: 'text', text: 'registered' }],
+            isError: false,
+          }],
+          source: { kind: 'tool', callId },
+        },
+      }),
+      surfaceOp: 'append',
+      sourceEventSeqs: [offset + 2],
+    },
+    event('assistant/message', offset + 4, {
+      turn,
+      step: 2,
+      message: {
+        id: `a-${turn}`,
+        role: 'assistant',
+        content: [{ type: 'text', text: 'complete delegated result' }],
+        source: { kind: 'model', provider: 'capture', model: 'capture' },
+      },
+    }),
+    event('turn/end', offset + 5, { turn, reason: { kind: 'completed' } }),
+  ];
+}
+
+async function harness(
+  name = 'pair-bridge',
+  deliveryPort = new RecordingCompletionDeliveryPort(),
+): Promise<{
   pairId: PairId;
   registry: PairRegistry;
   adapter: RegistryAdapter;
   port: FakeBridgePort;
   bridge: SessionToPairBridge;
+  deliveryPort: RecordingCompletionDeliveryPort;
   sessions: { navigator: string; pilot: string };
 }> {
   const root = await mkdtemp(join(tmpdir(), 'pair-bridge-'));
@@ -159,7 +249,11 @@ async function harness(name = 'pair-bridge'): Promise<{
   const ready = await registry.createPair({ pairId, dshBuild, expectedLedgerHead: 0 });
   if (ready.status !== 'ready') throw new Error(ready.reason);
   const port = new FakeBridgePort();
-  const bridge = new SessionToPairBridge(port, new PairDerivedEventWriter(registry));
+  const bridge = new SessionToPairBridge(
+    port,
+    new PairDerivedEventWriter(registry),
+    deliveryPort,
+  );
   const sessions = {
     navigator: ready.panes[0].sessionId,
     pilot: ready.panes[1].sessionId,
@@ -167,7 +261,7 @@ async function harness(name = 'pair-bridge'): Promise<{
   bridge.bindSession(pairId, 'navigator', sessions.navigator);
   bridge.bindSession(pairId, 'pilot', sessions.pilot);
   await bridge.catchUpPair(pairId);
-  return { pairId, registry, adapter, port, bridge, sessions };
+  return { pairId, registry, adapter, port, bridge, deliveryPort, sessions };
 }
 
 afterEach(async () => {
@@ -191,7 +285,15 @@ describe('SessionToPairBridge', () => {
   });
 
   test('turn/end drains a final answer without waking the other Agent', async () => {
-    const { pairId, registry, adapter, port, bridge, sessions } = await harness();
+    const {
+      pairId,
+      registry,
+      adapter,
+      port,
+      bridge,
+      deliveryPort,
+      sessions,
+    } = await harness();
     for (const candidate of completeTurn(1)) {
       port.append(sessions.navigator, candidate, candidate.type === 'turn/end');
     }
@@ -203,6 +305,165 @@ describe('SessionToPairBridge', () => {
     expect(messages).toHaveLength(1);
     expect(messages[0]?.payload).toMatchObject({ text: 'done', completion: 'complete' });
     expect(adapter.followups).toEqual([]);
+    expect(deliveryPort.deliveries).toEqual([]);
+  });
+
+  test('records a failed Pilot Turn and immediately notifies Navigator', async () => {
+    const deliveryPort = new RecordingCompletionDeliveryPort();
+    const { pairId, registry, port, bridge, sessions } = await harness(
+      'pair-bridge-pilot-turn-failure',
+      deliveryPort,
+    );
+    const failedTurn = [
+      event('turn/start', 0, { turn: 2 }),
+      event('user/message', 1, {
+        id: 'u-failure',
+        role: 'user',
+        content: [{ type: 'text', text: 'run delegated work' }],
+        source: { kind: 'user' },
+      }),
+      event('turn/end', 2, {
+        turn: 2,
+        reason: {
+          kind: 'error',
+          error: { message: 'provider boundary rejected', code: 'UNKNOWN' },
+        },
+      }),
+    ];
+    for (const candidate of failedTurn) {
+      port.append(sessions.pilot, candidate, candidate.type === 'turn/end');
+    }
+
+    await bridge.whenCaughtUp([sessions.pilot]);
+
+    const failures = (await registry.readEvents(pairId)).filter(
+      (candidate) => candidate.type === 'agent.turn_failed',
+    );
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({
+      actor: { kind: 'host' },
+      channel: 'navigator',
+      visibility: 'shared',
+      payload: {
+        failedRole: 'pilot',
+        failedTurn: 2,
+        code: 'UNKNOWN',
+        message: 'provider boundary rejected',
+      },
+    });
+    expect(deliveryPort.failureDeliveries).toEqual([{
+      pairId,
+      pairEventId: `${pairId}:${String(failures[0]?.seq)}`,
+      failedRole: 'pilot',
+      failedTurn: 2,
+      code: 'UNKNOWN',
+    }]);
+  });
+
+  test('delivers a reference only after the completion event and its link are durable', async () => {
+    const deliveryPort = new RecordingCompletionDeliveryPort();
+    const { pairId, registry, port, bridge, sessions } = await harness(
+      'pair-bridge-completion-order',
+      deliveryPort,
+    );
+    const turn = completionTurn(7);
+    port.append(sessions.pilot, turn[0]!, false);
+    port.append(sessions.pilot, turn[1]!);
+    await bridge.whenCaughtUp([sessions.pilot]);
+
+    port.append(sessions.pilot, turn[2]!);
+    port.append(sessions.pilot, turn[3]!);
+    await bridge.whenCaughtUp([sessions.pilot]);
+    expect(deliveryPort.deliveries).toEqual([]);
+
+    deliveryPort.onDeliver = async (input) => {
+      expect(Object.keys(input).sort()).toEqual([
+        'pairEventId',
+        'pairId',
+        'senderRole',
+        'senderTurn',
+      ]);
+      expect(input).not.toHaveProperty('text');
+      const snapshot = await registry.readSnapshot(pairId, (value) => value);
+      const completion = snapshot.events.find(
+        (candidate) => `${candidate.pairId}:${String(candidate.seq)}` === input.pairEventId,
+      );
+      expect(completion).toMatchObject({
+        type: 'agent.message',
+        actor: { kind: 'agent', role: 'pilot' },
+        channel: 'navigator',
+        payload: {
+          kind: 'completion-handoff',
+          text: 'complete delegated result',
+          origin: { turn: 7 },
+        },
+      });
+      const link = snapshot.events.find(
+        (candidate) =>
+          candidate.type === 'session_event.linked' &&
+          candidate.payload.pairEventId === input.pairEventId,
+      );
+      expect(link?.seq).toBeGreaterThan(completion?.seq ?? Number.MAX_SAFE_INTEGER);
+      expect(snapshot.projection.header.ledgerHead).toBeGreaterThanOrEqual(link?.seq ?? 0);
+    };
+
+    port.append(sessions.pilot, turn[4]!, false);
+    port.append(sessions.pilot, turn[5]!);
+    await bridge.whenCaughtUp([sessions.pilot]);
+
+    expect(deliveryPort.deliveries).toEqual([{
+      pairId,
+      pairEventId: expect.stringMatching(new RegExp(`^${pairId}:[1-9][0-9]*$`)),
+      senderRole: 'pilot',
+      senderTurn: 7,
+    }]);
+    const semantic = (await registry.readEvents(pairId)).filter(
+      (candidate) => candidate.payload.kind === 'completion-handoff',
+    );
+    expect(semantic).toHaveLength(1);
+  });
+
+  test('reuses the durable completion event when delivery fails and retries without duplication', async () => {
+    const deliveryPort = new RecordingCompletionDeliveryPort();
+    deliveryPort.failuresRemaining = 1;
+    const { pairId, registry, port, bridge, sessions } = await harness(
+      'pair-bridge-completion-retry',
+      deliveryPort,
+    );
+    const turn = completionTurn(3);
+    port.append(sessions.pilot, turn[0]!, false);
+    port.append(sessions.pilot, turn[1]!);
+    await bridge.whenCaughtUp([sessions.pilot]);
+    for (const candidate of turn.slice(2)) {
+      port.append(sessions.pilot, candidate, candidate.type === 'turn/end');
+    }
+
+    await expect(bridge.whenCaughtUp([sessions.pilot])).rejects.toThrow(
+      /completion delivery unavailable/,
+    );
+    const afterFailure = await registry.readEvents(pairId);
+    expect(
+      afterFailure.filter((candidate) => candidate.payload.kind === 'completion-handoff'),
+    ).toHaveLength(1);
+    expect(
+      afterFailure.filter(
+        (candidate) =>
+          candidate.type === 'session_event.linked' &&
+          candidate.payload.pairEventId === deliveryPort.deliveries[0]?.pairEventId,
+      ),
+    ).toHaveLength(1);
+
+    bridge.markDirty(sessions.pilot);
+    await bridge.whenCaughtUp([sessions.pilot]);
+    await bridge.drainPair(pairId);
+
+    expect(deliveryPort.deliveries).toHaveLength(2);
+    expect(deliveryPort.deliveries[1]).toEqual(deliveryPort.deliveries[0]);
+    expect(
+      (await registry.readEvents(pairId)).filter(
+        (candidate) => candidate.payload.kind === 'completion-handoff',
+      ),
+    ).toHaveLength(1);
   });
 
   test('coalesces repeated notifications into one serial drain', async () => {

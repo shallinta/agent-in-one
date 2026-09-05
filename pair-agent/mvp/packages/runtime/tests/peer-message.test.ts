@@ -181,6 +181,48 @@ function peerInput(
   };
 }
 
+function completionInput(
+  pairId: string,
+  seq: number,
+  causalRootId: string,
+  hop: number,
+): PairEvent {
+  const sessionId = createPairSessionIds(pairId).pilotSessionId;
+  const sessionEventSeq = 42;
+  return {
+    pairId: pairId as PairEvent['pairId'],
+    seq,
+    type: 'agent.message',
+    actor: { kind: 'agent', role: 'pilot' },
+    source: 'pilot-session',
+    channel: 'navigator',
+    visibility: 'shared',
+    authority: 'pilot',
+    refs: {
+      sourceEventIds: [
+        `dsh:${sessionId}:${String(sessionEventSeq)}:agent.message`,
+      ],
+    },
+    payload: {
+      schemaVersion: 1,
+      kind: 'completion-handoff',
+      text: 'completed delegated work',
+      content: [{ type: 'text', text: 'completed delegated work' }],
+      completion: 'complete',
+      causalRootId,
+      hop,
+      origin: {
+        schemaVersion: 1,
+        sessionId,
+        sessionEventSeq,
+        turn: 7,
+        messageId: 'completion-message-42',
+      },
+    },
+    occurredAt: '2026-09-03T00:00:00.000Z',
+  };
+}
+
 function nativeComposerInput(pairId: string, seq: number): PairEvent {
   const sessionId = createPairSessionIds(pairId).navigatorSessionId;
   return {
@@ -261,7 +303,7 @@ describe('bounded bidirectional Peer Message communication', () => {
     router = new PeerMessageRouter();
   });
 
-  test('publishes only the exact bounded text tool contract and fails closed before binding', async () => {
+  test('publishes the bounded request-reply tool contract and fails closed before binding', async () => {
     const definition = router.toolDefinition();
     expect(definition).toMatchObject({
       name: 'pair_message_peer',
@@ -272,10 +314,16 @@ describe('bounded bidirectional Peer Message communication', () => {
         required: ['text'],
         properties: {
           text: { type: 'string', minLength: 1, maxLength: 65_536 },
+          expectsReply: { type: 'boolean' },
+          replyTo: { type: 'string', minLength: 1, maxLength: 160 },
         },
       },
     });
-    expect(Object.keys(definition.parameters.properties as JsonObject)).toEqual(['text']);
+    expect(Object.keys(definition.parameters.properties as JsonObject)).toEqual([
+      'text',
+      'expectsReply',
+      'replyTo',
+    ]);
     const head = (await store.heads(pairId)).ledgerHead;
 
     await expect(
@@ -347,6 +395,72 @@ describe('bounded bidirectional Peer Message communication', () => {
         hop: 1,
       },
     });
+  });
+
+  test('correlates a reply-required Navigator request with the Pilot reply that wakes Navigator', async () => {
+    const service = new PeerMessageService(coordinator, port);
+    router.bind(service);
+    const definition = router.toolDefinition();
+
+    await definition.execute(
+      { text: 'Pilot, answer this for the user.', expectsReply: true },
+      toolContext(port.context.agentId),
+    );
+    const request = (await store.read(pairId)).at(-1)!;
+    const requestId = pairEventId(request);
+    expect(request.payload).toMatchObject({ expectsReply: true });
+
+    const ids = createPairSessionIds(pairId);
+    port.context = {
+      agentId: ids.pilotSessionId,
+      sessionId: ids.pilotSessionId,
+      turn: 2,
+    };
+    port.provenance = {
+      pairId,
+      senderRole: 'pilot',
+      inputEvents: [request],
+    };
+    await definition.execute(
+      { text: 'The requested answer.', replyTo: requestId },
+      toolContext(ids.pilotSessionId),
+    );
+
+    const reply = (await store.read(pairId)).at(-1);
+    expect(reply).toMatchObject({
+      actor: { kind: 'agent', role: 'pilot' },
+      channel: 'navigator',
+      payload: {
+        kind: 'peer-message',
+        text: 'The requested answer.',
+        replyTo: requestId,
+      },
+    });
+    expect(adapter.followups.at(-1)?.sessionId).toBe(ids.navigatorSessionId);
+  });
+
+  test('rejects a replyTo that is not the current reply-required Peer request', async () => {
+    const ids = createPairSessionIds(pairId);
+    port.context = {
+      agentId: ids.pilotSessionId,
+      sessionId: ids.pilotSessionId,
+      turn: 2,
+    };
+    port.provenance = {
+      pairId,
+      senderRole: 'pilot',
+      inputEvents: [peerInput(pairId, 9, 'navigator', `${pairId}:2`, 1)],
+    };
+    router.bind(new PeerMessageService(coordinator, port));
+    const head = (await store.heads(pairId)).ledgerHead;
+
+    await expect(
+      router.toolDefinition().execute(
+        { text: 'Uncorrelated answer.', replyTo: `${pairId}:999` },
+        toolContext(ids.pilotSessionId),
+      ),
+    ).rejects.toBeInstanceOf(PeerMessagePolicyError);
+    expect((await store.heads(pairId)).ledgerHead).toBe(head);
   });
 
   test('rejects a queued Peer tool admission when the opposite Session Bridge becomes faulty', async () => {
@@ -519,6 +633,12 @@ describe('bounded bidirectional Peer Message communication', () => {
       'root-from-user',
       4,
     ],
+    [
+      'completion handoff input',
+      [completionInput('pair-peer-message', 10, 'root-from-delegation', 2)],
+      'root-from-delegation',
+      3,
+    ],
   ] as const)(
     'derives causal root and hop from durable %s provenance',
     async (_label, inputEvents, causalRootId, hop) => {
@@ -538,10 +658,44 @@ describe('bounded bidirectional Peer Message communication', () => {
     },
   );
 
+  test('uses the maximum hop across canonical peer and completion inputs with one root', async () => {
+    port.provenance = {
+      pairId,
+      senderRole: 'navigator',
+      inputEvents: [
+        peerInput(pairId, 10, 'pilot', 'shared-root', 1),
+        completionInput(pairId, 11, 'shared-root', 3),
+      ],
+    };
+    router.bind(new PeerMessageService(coordinator, port));
+
+    await router.toolDefinition().execute(
+      { text: 'continue from both directed inputs' },
+      toolContext(port.context.agentId),
+    );
+
+    expect((await store.read(pairId)).at(-1)?.payload).toMatchObject({
+      kind: 'peer-message',
+      causalRootId: 'shared-root',
+      hop: 4,
+    });
+  });
+
   test.each([
     [
       'attempted hop 5',
       [peerInput('pair-peer-message', 10, 'pilot', 'root', 4)],
+    ],
+    [
+      'completion handoff attempted hop 5',
+      [completionInput('pair-peer-message', 10, 'root', 4)],
+    ],
+    [
+      'mixed completion and user roots',
+      [
+        completionInput('pair-peer-message', 10, 'root', 1),
+        pairInput('pair-peer-message', 11),
+      ],
     ],
     [
       'multiple peer roots',

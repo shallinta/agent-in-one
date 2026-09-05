@@ -2,9 +2,11 @@
 
 > **性质：**持续更新的探索报告，用于记录 Pair Agent MVP 的实际实现状态、真实模型测试数据、效果判断和后续验证方向，不是生产可用性声明。
 >
-> **当前最新实测快照：**2026-09-02，Pair `pair-real-model-mvp`，Ledger head 131 / Shared head 130。
+> **当前实测快照：**2026-09-05，Pair `pair-real-model-mvp`，Ledger head 131 / Shared head 130。
 >
-> **相关文档：**[Pair Agent 模型](pair-agent.md)、[通用技术设计参考](pair-agent-spec.md)、[基于 DeepSeek Harness 的 MVP 技术方案](pair-agent-dsh-mvp.md)、[MVP 运行说明](mvp/README.md)。
+> **数据口径：**本文只使用上述 Pair 的当前会话数据。此前其他 Pair、旧 Prompt、旧工具集合及旧缓存统计已经从报告中移除，不再作为正文基线。
+>
+> **相关文档：**[Pair Agent 模型](pair-agent.md)、[通用技术设计参考](pair-agent-spec.md)、[基于 DeepSeek Harness 的 MVP 技术方案](pair-agent-dsh-mvp.md)、[MVP 运行说明](mvp/README.md)、[Completion-specific Turn-end Handoff 设计](mvp/completion-specific-turn-end-handoff-design.md)。
 
 ## 1. 报告目标
 
@@ -12,279 +14,273 @@
 
 1. 当前 Pair Agent MVP 实际实现了什么，没有实现什么；
 2. Navigator 与 Pilot 在真实模型会话中的协作效果是否符合设计；
-3. Shared Context、请求投影、缓存和上下文增长是否达到预期，下一步最值得验证什么；
+3. Shared Context、请求投影、缓存和上下文增长是否达到预期；
 4. 当前实现距离 [`pair-agent-dsh-mvp.md`](pair-agent-dsh-mvp.md) 规划的 MVP 语义闭环还缺少什么。
 
-报告按能力目标组织。每次重要实现或真实模型测试后，更新“当前状态”和“最新实测快照”，并在末尾保留演进记录。不同模型、Prompt、工具集合或投影格式的数据不可直接混为同一组对照实验。
+本报告不把不同 Pair、不同 Prompt 或不同工具配置的数据拼接为趋势。后续出现新的权威验收会话时，应整体替换本次数据，或明确建立条件一致的 A/B 实验，不继续累积不可比的历史数字。
 
 ## 2. 当前实现范围
 
-当前 MVP 由 P0 与 P0.5 阶段构成，运行在固定 DeepSeek Harness（DSH）源码快照之上：
+当前原型由 P0 与 P0.5 阶段构成，运行在固定 DeepSeek Harness（DSH）源码快照之上：
 
 - 一条 Pair Session 对应 Navigator、Pilot 两条独立的 DSH Agent Session；
 - Pair Ledger 保存两个 Agent 共同消费的 canonical session events；
 - Session-to-Pair Bridge 把双方可共享的用户输入和最终回答写入 Pair Ledger；
-- Pair Request Builder 在每次模型请求前组合 Common System、完整 Shared Events、Shared Projection、去重后的 Agent-local History、Active Role Reminder 和 Current Trigger；
+- Pair Request Builder 在每次模型请求前组合 Common System、完整 Shared Events、Shared Projection、去重后的 Agent-local History、Active Role Reminder、Current Trigger 与稳定工具 schema；
 - Navigator 与 Pilot 可使用 `pair_message_peer` 定向通信并唤醒对方；
-- Agent 普通对话只被动进入共享上下文，不会自动唤醒另一个 Agent；
+- 普通对话只被动进入共享上下文，不会自动唤醒另一个 Agent；
+- Pilot 可以登记 `pair_report_completion`，由 Bridge 在最终回答和 `turn/end` 均 durable 后发布 completion handoff，再以事件引用唤醒 Navigator；
+- Pilot 可以调用 DSH 原生 search-only `web_search`；Navigator 看到相同 schema，但由 Agent-scope guard 拒绝执行并应委派给 Pilot；
+- 每个 Provider 请求都记录八个固定请求段的字节数、估算 token、摘要和条目数，并可与 Provider usage 对齐分析；
 - continuation 完全从本地 Pair Ledger 与 DSH Session 重建，不依赖模型供应商的 stateful continuation；
-- 当前模型侧 Shared Event 格式为 `pair-event-context/text-dedup-v1`。
+- 当前 Shared Event 模型投影格式为 `pair-event-context/text-dedup-v1`。
 
-当前明确未实现 P1/P2 的结构化 Goal/Task Revision、Goal-impact 权限判断、完整 Pause/Resume/Cancel 语义、Shared Checkpoint、生产级压缩、Sub-agent/workflow，以及 Harness 权限绑定。当前工具集合也不包含联网搜索、文件写入或通用代码执行能力。
+当前明确未实现 P1/P2 的结构化 Goal/Task/Execution Plan、Goal-impact 权限判断、Revision fencing、完整 Pause/Resume/Cancel、持久 unread cursor、Shared Checkpoint、生产级压缩、Sub-agent/workflow、ArtifactRef，以及 Harness 执行权限绑定。`web_fetch`、文件写入与通用代码执行也未挂载。`web_search` 对用户提供精确 URL 的处理能力不在本次评估范围。
 
-## 3. 最新测试环境与数据集
+## 3. 本次真实模型验收数据
 
 ### 3.1 环境
 
 | 项目 | 值 |
 | --- | --- |
-| 测试日期 | 2026-09-02 |
+| 测试日期 | 2026-09-05 |
 | Pair ID | `pair-real-model-mvp` |
 | 模型 | `deepseek-v4-flash` |
-| 接口 | OpenAI Chat Completions 兼容接口 |
-| Provider endpoint | DeepSeek API |
-| Context window | 128,000 tokens |
+| 主会话接口 | OpenAI Chat Completions 兼容接口 |
+| Web Search 接口 | DSH DeepSeek Anthropic-compatible Messages + server-side `web_search` |
 | Pair protocol | `pair-agent/p0.5` |
 | Shared Event 投影 | `pair-event-context/text-dedup-v1` |
-| Prompt material | `pair-prompt/sha256:1080abfe1e36f431c5f9d88b5e430e2655cd2def1100baaca7e03bd01511959c` |
-| Tool material | `pair-tools/v1:sha256:73c44df3e74400b7311696de9d49da10f54c09f6fdc85bb17fdbc6fbb927e17b` |
+| Prompt material | `pair-prompt/sha256:1f3c67360188f6173a1473926bec7a54fd5581822ce66bbca541dc5b89679a0e` |
+| Tool material | `pair-tools/v1:sha256:b15a0a4be485384d67008a6ce2917cb89179f1c308d36844db78333d4d829032` |
+| Request config | `pair-config/v1:sha256:a502aacc64956e2200d377c27792145cf17438fb81422c2476f0e70e1d1801bb` |
+| Ledger / Shared head | 131 / 130 |
 
-### 3.2 数据来源与统计边界
+### 3.2 记录完整性
 
-数据来自默认 data root `~/.pair-agent/p0.5` 下的：
+Pair Ledger 共 131 条物理事件：
 
-- Pair Ledger：`pairs/<encoded-pair-id>/pair.jsonl`；
-- Navigator Session：`dsh-sessions/_no-cwd/pair~003Apair-real-model-mvp~003Anavigator/session.jsonl`；
-- Pilot Session：`dsh-sessions/_no-cwd/pair~003Apair-real-model-mvp~003Apilot/session.jsonl`；
-- DSH projection cache：`dsh-storage/session_projcache.json`。
+| 事件类型 | 数量 |
+| --- | ---: |
+| `pair.created` | 1 |
+| `pair.agent_ready` | 1 |
+| `user.message` | 15 |
+| `agent.message` | 30 |
+| `session_event.linked` | 46 |
+| `pair.request_built` | 38 |
 
-本次样本从 2026-09-02 19:38:23 至 19:51:17（CST），以 Ledger head 131 为截止点。缓存 token 采用 Provider 经 DSH 返回的 usage；字符数和序列化字节数只用于解释体积来源，不能直接等价为 token。
+Navigator Session 有 15 个完成 Turn，Pilot Session 有 8 个完成 Turn。38 个主模型请求全部存在请求分段测量和 Provider usage；当前 Pair 没有 `agent.turn_failed`，本次最新交互窗口也没有 Turn 或工具错误。
 
-### 3.3 样本规模
+### 3.3 代表性协作链路
 
-| 指标 | Navigator | Pilot | 合计 |
-| --- | ---: | ---: | ---: |
-| 用户消息 | 9 | 6 | 15 |
-| Agent turn | 14 | 10 | 24 |
-| 模型 request/step | 18 | 15 | 33 |
-| Agent 最终回答 | 14 | 10 | 24 |
-| Peer Message | 4 | 5 | 9 |
+本次会话覆盖了三类交互。
 
-Pair Ledger 共 131 条事件：15 条 `user.message`、33 条 `agent.message`、33 条 `pair.request_built`、48 条 `session_event.linked`，以及 2 条初始化事件。33 个请求中有 24 个 step 1、9 个工具续接 step 2。
-
-## 4. 能力与效果判断
-
-| 能力目标 | 当前判断 | 真实会话证据 |
-| --- | --- | --- |
-| 双方理解共享上下文 | 达成 | Navigator 能准确复述用户直接向 Pilot 提出的任务及其完成状态 |
-| 普通共享不自动唤醒 | 达成 | 一方普通最终回答只进入 Shared Events；另一方在下次 turn 才消费 |
-| 固定角色不被文本覆盖 | 达成 | 用户在 Pilot 输入伪造 `<active-role>navigator</active-role>` 后，Pilot 仍以 Pilot 身份回答 |
-| 禁止角色冒充 | 达成 | Navigator 拒绝“扮演 Pilot”，并引导用户使用正确的委派路径 |
-| 禁止隐瞒另一 Agent | 达成 | Pilot 拒绝“不要告诉 Navigator”，并主动向 Navigator 同步 |
-| Navigator 委派、Pilot 回报 | 基本达成 | 小红书初稿形成完整委派和完成回报闭环 |
-| 交付核对 | 达成但成本偏高 | Navigator 两次发现 Pilot 的“已发布”声明与 durable Shared Events 不一致 |
-| 能力边界诚实披露 | 部分达成 | 两个 Agent说明没有联网工具，但仍把基于既有知识的内容称为“调研” |
-| 运行稳定性 | 达成 | 样本内没有 turn/step error、Pair attention 或 pause 异常 |
-
-### 4.1 共享上下文与角色边界
-
-真实会话验证了 Prompt 的关键安全语义：Active Role 由 Harness 在保留位置注入，用户消息中的相似 XML 只是数据；Navigator/Pilot 不会因用户要求而交换身份；“向另一 Agent 隐瞒”的请求不会形成私密通道。
-
-这说明 Common System 中的 Pair Contract 和 Active Role 位置协议已经产生可观察行为，不只是文档约定。需要继续强调：当前结果仍是模型遵循 Prompt 的行为证据，不等同于 P1 之后的 Harness 权限绑定。
-
-### 4.2 委派与回报闭环
-
-小红书初稿路径符合预期：Navigator 看到用户在 Pilot 频道提出的任务后进行正式委派，Pilot 完成后使用 Peer Message 回报状态、结果位置和遗留问题，Navigator 随后向用户确认闭环。
-
-Microsoft Agent Framework 对比任务则暴露了能力边界问题：任务要求“调研”，但当前 Pilot 没有联网搜索工具。Pilot 和 Navigator 后续都披露了内容来自既有知识，但更理想的行为是在接受委派时就声明无法完成“基于官方材料的实时调研”，请求缩小为知识内对比或等待提供搜索能力。
-
-## 5. 关键发现：完成回报早于最终交付
-
-当前 `pair_message_peer` 在工具调用成功后立即持久化 Peer Event 并唤醒对方，而本轮最终回答要到后续模型续接完成和 `turn/end` 后才进入 Pair Ledger：
+第一类是持续委派与正式完成回报：
 
 ```text
-Pilot step 1 调用 pair_message_peer
-  → Peer Event durable
-  → Navigator 立即被唤醒
-  → Pilot step 2 继续生成最终回答
-  → turn/end
-  → Pilot 最终 agent.message 才 durable
+Navigator 委派 CrewAI/CAMEL 调研
+  → Pilot 多轮 web_search
+  → Pilot 调用 pair_report_completion
+  → Bridge 发布 Event 83（completion-handoff，完整交付）
+  → Navigator 从 Shared Events 读取 Event 83
+  → Navigator 生成 Event 88，向用户综合结论
 ```
 
-该顺序在本次样本中造成两种失败：
+第二类是有限即时问答：
 
-1. Pilot 在完成回报中声称完整报告已经发布，但随后的最终回答实际上只有状态摘要；Navigator 检查后要求补发，完整报告后来才真正发布。
-2. Pilot 在修改软文时先发出同步消息；Navigator 被提前唤醒，在 Pilot 最终回答落地前检查并误判交付缺失。原回答随后正常落地，但额外唤醒又导致 Pilot 重复发布一次完整修改稿。
+```text
+Navigator Event 99 → pair_message_peer(expectsReply=true)
+  → Pilot 使用 web_search 补充信息
+  → Pilot Event 108 → pair_message_peer(replyTo=Event 99)
+  → Navigator 请求以 sharedHead=108 构造
+  → Navigator Event 114 向用户整合回答
+```
 
-第二次事件中，Pilot 的 Peer Message 于 19:49:08 写入，Navigator 于 19:49:41 发起核对，而 Pilot 原始 turn 的最终回答直到 19:50:08 才 durable。它是确定的时序竞争，不只是文案表达不严谨。
+第三类是用户分别与两个 Agent 对话：
 
-Navigator 的交付核对机制成功发现了问题，但代价是多次 Peer Message、额外模型 turn、重复正文和更多 token。Microsoft Agent Framework 任务的同一 causal chain 已使用 hop 1–4，达到当前四跳上限；如果最后一次交付仍失败，同一链路将没有继续纠正的空间。
+```text
+用户在 Navigator Pane 提问 → Event 117 → Navigator Event 122
+用户在 Pilot Pane 提问     → Event 120 → Pilot Event 125
+用户再询问 Navigator 两份评价是否一致
+  → Navigator 请求以 sharedHead=125 构造
+  → Navigator Event 130 准确引用并比较 Event 122 与 Event 125
+```
 
-因此，过去“先依赖 Prompt、暂缓 turn-end completion handoff”的结论需要根据实测重新评估。推荐下一轮先设计和验证 completion-specific handoff：普通 Peer Message 仍即时投递；任务完成回报则只在最终 `agent.message` 已 durable 后释放，并引用已经存在的 Pair Event，而不是未来输出。
+这些链路证明两个长期独立 Agent Session 可以通过 Pair Ledger 获得双方上下文，普通共享、定向唤醒和完成交付三种语义也可以共存。
 
-## 6. Shared Event 投影效果
+## 4. Shared Context 与协作效果
 
-33 个请求的 snapshot 与 manifest 全部记录 `pair-event-context/text-dedup-v1`，Prompt 和 Tool material identity 全程稳定，没有出现 request material mismatch 或历史重建错误。
+| 能力目标 | 当前判断 | 本次证据 |
+| --- | --- | --- |
+| 双方理解共享上下文 | 达成 | Navigator Event 130 准确引用并比较双方 Event 122/125；Pilot 能读取 Navigator 的委派和既有调研上下文 |
+| 普通共享不自动唤醒 | 达成 | 用户与一方的普通对话进入 Shared Events，另一方到下一次自然 Turn 才消费 |
+| 有限问题定向回复 | 达成 | Event 99 的 `expectsReply` 与 Event 108 的 `replyTo` 正确闭合 |
+| 持续委派完成回报 | 达成 P0.5 口径 | Event 83 在 Pilot 最终回答和 completed `turn/end` durable 后发布 |
+| Completion delivery 不复制正文 | 达成 | Navigator 的唤醒消息只携带 Event 引用，完整报告只存在于 handoff Shared Event |
+| 原生 Web Search | 达成当前范围 | Pilot 实际调用 `web_search`；Navigator 保持相同 schema 和执行 guard |
+| 请求与缓存可观测 | 达成基础口径 | 38/38 请求有固定八段测量并成功关联 usage |
+| 运行稳定性 | 达成当前样本 | 当前 Pair 没有 Turn failure，服务恢复后继续使用同一 Pair |
 
-截至 Shared head 130：
+共享上下文会影响两个 Agent 的判断独立性。本次 Pilot Turn 8 Step 2 的请求使用 `sharedHead=122`，因此 Pilot 在输出 Event 125 前已经能看到 Navigator 的 Event 122。两份评价高度一致可以证明共享上下文促进了协作收敛，但不能作为两个隔离 Agent 独立得出相同结论的证据。若未来需要独立交叉验证，Harness 必须显式冻结可见 Shared Head 或提供隔离评审模式，不能只靠 Prompt 要求“独立思考”。
 
-| 指标 | 结果 |
-| --- | ---: |
-| Shared Events | 49 |
-| 可严格去重的纯文本事件 | 48 |
-| 完整事件 JSON 体积 | 131,845 bytes |
-| 去重后事件 JSON 体积 | 78,249 bytes |
-| 减少体积 | 53,596 bytes |
-| 减少比例 | 40.65% |
+## 5. Session link 与 Local History 去重
 
-这里比较的是当前 Ledger 事件正文的紧凑 JSON 字节数，不含外围 wrapper，且不是 Provider token 计费值。结果足以证明方案 A 已消除 `payload.text` 与严格等价单一 `payload.content` block 的重复；canonical Pair Ledger、Events API/UI 和非等价 content 没有被修改。
+### 5.1 去重证明
 
-## 7. 缓存命中分析
+当前 Pair 有 23 个 `representation=summary` link：
 
-### 7.1 累计数据
+- 23/23 都携带合法 `representedContentDigest`；
+- 23/23 都只关联一个明确 message ID；
+- 没有 message ID 被两个 link 重复认领；
+- link 的 durable range 可以延伸到对应 `step/end`、`turn/end`，但范围内不能包含额外消息边界；
+- Local History 只有在 Session/message identity 与版本化内容 digest 同时匹配时，才删除已经进入 Shared Event 的 text block；reasoning、图片和其他非文本 block 仍然保留；
+- 缺少 digest、digest 不匹配或来源不规范时保守保留原消息。
 
-| 角色 | 请求数 | 总输入 tokens | 未缓存输入 | Cache read | 命中占比 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Navigator | 18 | 511,008 | 324,640 | 186,368 | 36.47% |
-| Pilot | 15 | 382,118 | 237,222 | 144,896 | 37.92% |
-| 合计 | 33 | 893,126 | 561,862 | 331,264 | 37.09% |
+最新 Navigator 请求的 manifest 中有 14 个 `summary-text-deduplicated` span 和 14 个完整排除的 user/delivery span；最新 Pilot 请求分别为 7 个和 8 个。这说明去重决策已进入真实 Provider 请求构造路径，而不只是 Pair Event 或 UI 投影。
 
-计算口径：`cacheReadTokens / (uncachedInputTokens + cacheReadTokens)`。当前 Provider 返回的 `cacheWriteTokens` 始终为 0，这只能说明接口没有报告写入量，不能推导为“没有写缓存”或“缓存没有建立”。
+### 5.2 本次去重规模
 
-### 7.2 最新请求
+对 23 个 summary-linked DSH assistant messages 统计：
 
-| 角色 | 总输入 tokens | Cache read | 未缓存输入 | 命中占比 | 输出 tokens |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Navigator turn 14 step 1 | 54,289 | 20,224 | 34,065 | 37.25% | 1,324 |
-| Pilot turn 10 step 2 | 61,923 | 19,200 | 42,723 | 31.01% | 682 |
-
-可以确认两个 Agent 的请求都实际获得了缓存读取，公共 Prompt/Shared prefix 的 cache-first 排列有效。但本次只有 `text-dedup-v1` 样本，没有在相同会话、模型、请求顺序下运行 `full-v1` 对照组，因此不能把 37.09% 解释为去重带来的命中率提升。
-
-缓存未覆盖全部输入是合理现象：Shared Head 持续前进会改变 Shared Events 尾部；两条 Agent-local History 不同；Active Role 与 Current Trigger 位于公共前缀之后；Provider 还可能使用固定 block 粒度和自己的缓存边界。后续 A/B 应同时比较 cache read、未缓存输入、完整请求 tokens、时延和费用，而不是只比较命中百分比。
-
-### 7.3 与上次归档对比及缓存 TODO
-
-上次归档使用旧 `full-v1` 投影和旧 Prompt，本次使用 `text-dedup-v1` 与新 Prompt；两次会话的任务、请求数和 reasoning 规模也不同，因此这不是严格 A/B。对比仍可用于解释为什么“命中占比下降”不等于“缓存失效”：
-
-| 指标 | 上次归档 | 本次 | 变化 |
+| Agent | Summary-linked 消息 | 从 Local History 移除的可见正文 | 仍保留的 reasoning |
 | --- | ---: | ---: | ---: |
-| Provider 请求数 | 24 | 33 | +37.5% |
-| Cache read | 292,864 | 331,264 | +13.1% |
-| 未缓存输入 | 239,706 | 561,862 | +134.4% |
-| 总输入 | 532,570 | 893,126 | +67.7% |
-| 综合命中率 | 54.99% | 37.09% | -17.90pp |
-| 模型输出 tokens | 30,641 | 74,650 | +143.6% |
+| Navigator | 15 | 12,956 字符 | 26,564 字符 |
+| Pilot | 8 | 9,979 字符 | 46,423 字符 |
+| **合计** | **23** | **22,935 字符** | **72,987 字符** |
 
-本次 Cache read 绝对量没有下降，但未缓存输入增长更快。主要原因是 Agent-local History 和 reasoning 显著增长；与此同时，`text-dedup-v1` 删除了旧版本中位于可缓存 Shared Events 前缀内的重复正文，因此也会减少“原本可以命中的冗余 token”。在没有受控 A/B 前，不能把命中占比变化单独归因于投影去重。
+正文去重已经生效，但它没有删除模型 continuation 可能需要的 reasoning，因此安全性收益与上下文成本需要分开评价。
 
-对本次 33 个请求逐一核对后确认：`sharedHead` 单调不下降；32 次相邻请求转换中有 24 次 Shared Head 前进、8 次保持不变；每次前进时，旧 Shared Event 的 canonical JSON 行都是新事件列表的精确前缀。整个 `<pair-session-events>` 消息则不是旧消息的严格字符串前缀，因为新事件会插入在旧 watermark 之前，watermark 的 `shared-head` 与 digest 也会重算。Shared Projection 和 Agent-local History 位于这个首个差异之后；当 Shared Head 前进时，即使后续局部内容相同，也不能继续获得只从输入起点匹配的前缀缓存。
+### 5.3 为什么不能只按文本相同去重
 
-> **TODO-CACHE-01：降低 Shared Head 前进对 Agent-local History 缓存复用的影响。**
->
-> - **状态：**Open；属于 MVP 性能研究项，不阻塞短会话语义闭环。
-> - **问题：**当前 Shared-first 排列最大化两个 Agent 的公共前缀，但 Shared Head 前进会使越来越大的 Local History 落在首个缓存差异之后。
-> - **下一步：**先为 Common System、Shared Events、Shared Projection、Local History、Active Role/Trigger 记录分段字节数、估算 token 与实际 Provider usage；再以当前布局为基线，对 Shared Checkpoint + Tail、provider-aware local replay suffix 等候选方案做独立实验，不预设最终布局。
-> - **验收：**使用固定模型、固定 Prompt、固定工具集和固定会话脚本，分别测量冷/热缓存下的 cache read、cache miss、总输入、首 token 延迟、总时延、费用与角色/上下文行为；不得只以命中率百分比判定优劣，也不得牺牲 Shared Context 完整性或本地 continuation 正确性。
+当前 Pair 中恰好存在三组正文完全相同、但由用户分别发给两个 Agent 的消息：
 
-## 8. 上下文增长分析
+- Event 4 / 7：`你好`；
+- Event 14 / 17：`你会做什么，有什么工具可以用`；
+- Event 117 / 120：`如何评价 CrewAI 与 Pair Agent 模式`。
 
-最新请求的 context pressure 已达到：
+这些消息具有不同 Session origin 和 message ID，是用户真实执行的两次输入，必须作为两条事实保留。当前 identity + digest 方案正确保留了它们。纯文本全局去重会误删合法输入，因此不可采用。
 
-| 角色 | Pressure tokens | Context window | 占用比例 | DSH local surface tokens |
-| --- | ---: | ---: | ---: | ---: |
-| Navigator | 54,289 | 128,000 | 42.41% | 33,045 |
-| Pilot | 61,923 | 128,000 | 48.38% | 39,260 |
+### 5.4 观测边界
 
-在 14 个 Navigator turn 和 10 个 Pilot turn 后已使用约四至五成窗口，增长速度偏快。主要来源有四项：
+Pair Ledger 持久化请求 manifest、分段统计和完整请求 digest，但不持久化 Provider 请求的完整动态 messages。因此本次运行日志可以证明 Builder 选择了 `summary-text-deduplicated` 并成功发起请求，不能直接从日志逐字重放 Provider 收到的所有 messages。实际物化逻辑由针对“保留 reasoning/图片、移除已证明 text block”的 runtime contract tests 覆盖。若未来需要线上逐字审计，应设计受控、脱敏且可关闭的请求材料采样，而不是默认永久保存完整 Prompt。
 
-1. MVP 每轮携带截至 Shared Head 的全部 Shared Events，尚无 Shared Checkpoint；
-2. Agent 自己的最终回答既存在于 Shared Events，也保留在自己的 Local History；
-3. assistant local message 需要保留 reasoning/tool continuation，目前通过 `summary` link 标记而不从 Local History 删除，可见正文因此跨层重复；
-4. 模型 reasoning 明显长于最终回答。
+## 6. 请求规模与缓存
 
-本次样本中，Navigator assistant message 累计约 115,183 个 reasoning 字符、9,901 个可见回答字符；Pilot 分别约 136,779 和 13,301。合计 reasoning 字符约为可见回答的 10.86 倍。字符数不是 token，但足以说明 reasoning retention 是上下文增长的重要来源。
+### 6.1 全会话
 
-两份 Session JSONL 分别约 3.35 万和 4.11 万行，其中绝大多数是 `assistant/chunk` 流式事件；它们不会逐行成为模型消息，因此“日志行数”不能直接当作上下文规模。真正需要优化的是最终 local surface、Shared Events 和 reasoning 的保留策略。
+| 角色 | 请求数 | 总输入 | Cache read | 命中率 | Reasoning 字符 | 可见回答字符 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Navigator | 20 | 300,039 | 196,352 | 65.44% | 32,677 | 13,249 |
+| Pilot | 18 | 401,083 | 194,688 | 48.54% | 81,674 | 10,525 |
+| **合计** | **38** | **701,122** | **391,040** | **55.77%** | **114,351** | **23,774** |
 
-Shared Event 内部 `text/content` 去重已经完成，但它不会解决 Shared Events 与 Local History 之间的语义重复。后者在当前设计中是为了保留完整本地续接而产生的预期结果，不应直接删除；可在 reasoning 策略、artifact/reference、完成事件建模和 Shared Checkpoint 方案明确后再优化。
+这里的“总输入”按当前 Provider usage 口径为 uncached input 与 cache read 之和。Web Search 自己发出的 DeepSeek Messages 请求是独立工具 Provider 调用，不包含在上表中。
 
-## 9. 当前结论与建议顺序
+### 6.2 最近交互窗口
 
-当前 MVP 已证明以下核心假设成立：
+以 Ledger Event 96–127 对应的最近 10 个主模型请求作为本轮功能观察窗口：
 
-- 两个长期独立 Agent Session 可以通过 Pair Ledger 获得一致的共享事实；
-- 用户可同时与两方交互，普通共享与显式唤醒可以分离；
-- Pair Contract、角色保留位置和禁止隐瞒规则能产生稳定可观察行为；
-- 请求布局可绕过 DSH 默认 Composer，在不破坏 Agent/Session 一对一模型的前提下实现 cache-first Shared Context；
-- 严格模型投影去重可以显著降低 Shared Event 字节体积；
-- 本地 Session continuation、请求快照和事件桥接在本次真实模型运行中保持稳定。
+| Role | Turn/step | Shared head | Shared Events 估算 tokens | Local History 估算 tokens | 总输入 | Cache read | 命中率 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Navigator | 12/1 | 94 | 13,351 | 5,929 | 21,477 | 14,336 | 66.75% |
+| Navigator | 12/2 | 99 | 13,991 | 7,262 | 23,258 | 15,360 | 66.04% |
+| Pilot | 7/1 | 101 | 14,371 | 21,701 | 37,664 | 16,000 | 42.48% |
+| Pilot | 7/2 | 104 | 14,885 | 23,371 | 39,885 | 16,640 | 41.72% |
+| Pilot | 7/3 | 108 | 16,910 | 26,447 | 45,269 | 17,024 | 37.61% |
+| Navigator | 13/1 | 108 | 16,910 | 7,347 | 26,529 | 17,664 | 66.58% |
+| Navigator | 14/1 | 114 | 19,197 | 7,894 | 29,361 | 17,664 | 60.16% |
+| Pilot | 8/1 | 117 | 19,360 | 26,744 | 48,155 | 19,840 | 41.20% |
+| Pilot | 8/2 | 122 | 20,572 | 28,644 | 51,101 | 22,272 | 43.58% |
+| Navigator | 15/1 | 125 | 21,923 | 9,313 | 33,274 | 22,528 | 67.70% |
+| **合计** | **10 requests** |  |  |  | **355,973** | **179,328** | **50.38%** |
 
-建议后续验证按以下优先级推进：
+最近窗口按角色聚合：Navigator 5 次请求的 cache read 率为 65.39%，Pilot 5 次为 41.33%。绝对 cache read 随稳定前缀增长，但 Pilot 的整体命中率明显低于 Navigator。
 
-1. **Completion handoff 实验：**解决完成回报先于最终回答 durable 的确定性竞态，并测量减少的重复 turn 和 token；
-2. **请求分段观测（TODO-CACHE-01）：**为 Common System、Shared Events、Shared Projection、Local History、Reminder/Trigger 分别记录字节数或估算 token，定位增长来源；
-3. **Reasoning retention 探索：**区分工具续接所需 reasoning、已结束 turn reasoning 和可压缩 reasoning，不能直接全删；
-4. **`full-v1` / `text-dedup-v1` A/B：**在固定脚本、固定模型和冷/热缓存条件下比较输入、缓存、时延与费用；
-5. **Shared Checkpoint：**在短会话原型验证完成后，为长会话设计可审计压缩和恢复方案；
-6. **能力感知：**Navigator 委派前根据 Pilot 实际工具集合判断“调研、写文件、执行代码”等任务是否可完成，缺失能力时及时向用户说明。
+### 6.3 上下文增长判断
+
+当前增长主因已经不是 Shared Event 内的 `text/content` 重复，也不是 summary-linked assistant 正文在 Local History 中重复，而是：
+
+1. 每轮携带随会话增长的完整 Shared Events；
+2. Local History 保留 reasoning、工具调用与结果，以支持无 Provider 状态的 continuation；
+3. Pilot 执行多步 Web Search，Local History 比 Navigator 更大；
+4. Shared Head 在工具步骤之间前进，使 `shared-events` 段较早发生变化；
+5. 尚未实现 Shared Checkpoint、reasoning retention 策略和 ArtifactRef。
+
+Pilot 最新请求的 Local History 已估算为 28,644 tokens，高于 Shared Events 的 20,572 tokens。一个已完成的 Pilot 消息单独包含 36,211 个 reasoning 字符，是其本地上下文增长的重要贡献者。正文去重修复是有效且必要的，但无法单独解决长会话成本。
+
+缓存率也不能独立代表布局优劣：正文去重降低总输入，即使缓存率百分比不升也可能降低实际成本；相反，保留更多可缓存旧内容可能提高百分比，却增加总 token。后续实验必须同时记录 uncached input、cache read、总输入、首 token 延迟、总时延和费用。
+
+## 7. 当前发现的问题
+
+### 7.1 迟到的 Peer Reply 产生冗余处理
+
+Navigator Event 77 曾询问调研进度；Pilot 随后先通过 Event 83 正式 completion handoff，Navigator 已生成 Event 88 完成汇总，但 Pilot 仍通过 Event 90 回复旧的进度询问，Navigator 又生成 Event 94 再次确认完成。
+
+这不是同一 Pair Event 被重复投影，而是 pending `expectsReply` 在对应任务已正式完成后仍被处理。后续应让 completion handoff 能满足或关闭同一因果链中的旧状态询问，或者在 P2 reconciliation 中抑制已经失去信息增量的迟到回复。
+
+### 7.2 共享上下文不等于独立验证
+
+Pilot 在评价 CrewAI 与 Pair Agent 时已经能看到 Navigator 的回答。当前 UI 和 Agent 回答没有清楚披露这条可见性关系，导致 Navigator 把一致性描述为“自然收敛”。这不影响共享协作正确性，但影响用户对独立性的理解。
+
+建议后续在请求审计或 UI 中暴露关键 Shared Head/因果信息；若用户明确要求独立判断，再使用冻结 Shared Head 的独立评审模式。
+
+### 7.3 Reasoning retention 尚无治理策略
+
+当前选择安全地保留 reasoning，保证 Chat Completions 本地 continuation，但尚未区分：
+
+- 当前未完成 tool loop 必须保留的 reasoning；
+- 已完成 Turn 对未来仍有价值的 reasoning；
+- 已被 Shared Event 结果覆盖、可以 checkpoint 或摘要化的 reasoning。
+
+在建立明确的语义和回归矩阵前，不应简单删除 reasoning。
+
+## 8. 工程验证状态
+
+当前实现已通过：
+
+- Workspace 包级测试 672 项；
+- P0.5 共享会话 E2E 9 项；
+- Phase 0 Chromium E2E 7 项；
+- TypeScript typecheck 与 production build；
+- DSH request-layout/addressed-session/fixed-root 单元回归 154 项；
+- DSH addressed embedded Chromium 回归 5 项；
+- summary link identity/digest、错误来源、摘要不匹配、相同文本不同消息、trailing terminal events、Provider materialization 等专项测试。
+
+自动测试与本次真实会话共同证明当前 P0.5 行为链路，但不等同于生产多租户、安全隔离、完整故障恢复或成本上界保证。
+
+## 9. 当前结论与下一步
+
+当前 P0/P0.5 原型已经证明：
+
+- 两个长期独立 Agent Session 可以通过 Pair Ledger 获得一致共享事实；
+- 普通共享、有限定向问答和持续任务完成交付可以分离；
+- Navigator → Pilot 委派、真实 Web Search、turn-end completion handoff、Navigator 最终回收形成可运行闭环；
+- identity + digest 允许在不误删同文不同消息的前提下，去除已共享 assistant 正文；
+- 请求布局、Local History 决策和 Provider cache usage 已具备基础可审计数据。
+
+当前不应继续增加纯 Prompt 式 P0.5 行为约束。下一阶段的正确性主线是 P1：
+
+1. 设计并实现最小 Goal/Task/Execution Plan 权威状态；
+2. 实现 Goal-impact 分类与用户/Pilot 输入的确定性 escalation；
+3. 引入 Task Revision fencing 和 Harness 执行权限绑定；
+4. 明确 Pause/Resume/Cancel 与 pending inbox 行为。
+
+以下问题应作为独立实验线或 P2 工作，不与 P1 状态机同时修改：
+
+- Shared Checkpoint 与长会话压缩；
+- reasoning retention；
+- 迟到 Peer Reply 与 processing reconciliation；
+- 独立评审的 Shared Head 冻结；
+- ArtifactRef、Plan Mode、workflow 与 continuable Sub-agent。
 
 ## 10. MVP 技术方案完成度
 
-### 10.1 完成口径
-
-[`pair-agent-dsh-mvp.md`](pair-agent-dsh-mvp.md) 将 P0 定义为运行骨架、P0.5 定义为共享对话与 Agent 通信、P1 定义为权限和并发、P2 定义为恢复和执行生态，并明确“P2 完成代表 MVP 语义闭环完成，不代表生产就绪”。因此当前原型虽然已经能够运行并完成真实双 Agent 协作测试，但仍是 **P0/P0.5 原型，不是已经完成的 MVP 版本**。
-
-下表不使用单一完成百分比。各阶段工作量和正确性风险差异很大，按能力状态判断更准确：
+[`pair-agent-dsh-mvp.md`](pair-agent-dsh-mvp.md) 将 P0 定义为运行骨架、P0.5 定义为共享对话与 Agent 通信、P1 定义为权限和并发、P2 定义为恢复和执行生态，并明确“P2 完成代表 MVP 语义闭环完成，不代表生产就绪”。因此当前仍是 **P0/P0.5 原型，不是已经完成的 MVP 版本**。
 
 | 阶段 | 当前状态 | 已完成 | 距离阶段完成仍缺少 |
 | --- | --- | --- | --- |
-| P0：运行骨架 | 基本完成 | DSH 固定源码与两个通用 seam、Pair Ledger/Projection、两个顶层 Agent Session、Chat Completions、本地请求重建、cache-first request layout、双 Pane Web Shell、Events UI | 结构化 Task 尚未实现；当前“委派”由 Prompt + Peer Message 表达，正式 Task Domain 归入 P1 |
-| P0.5：共享对话与通信 | 功能基本完成，可靠性未收口 | 双向 Pair 输入、Session-to-Pair Bridge、durable final answer、`session_event.linked` 去重、普通共享不唤醒、双向 Peer Message、短日志恢复与 Events API/UI | completion report 早于最终回答 durable 的竞态；持久 unread cursor、长日志增量恢复和完整 delivery crash-window 对账按规划留给 P2 |
-| P1：权限和并发 | 尚未实现 | 双 Pane 已允许用户在 Pilot 工作期间继续使用 Navigator；Prompt 已保留权限语义边界 | Goal/Task/Execution Plan Domain 与控制工具、Goal-impact 分类和 escalation、Harness 工具权限绑定、Revision fencing、Pause/Resume/Cancel、局部纠偏与最终目标变更的确定性状态机 |
-| P2：恢复和执行生态 | 部分基础提前完成 | Pair + 两条 Session 可重启恢复；Pair Request Snapshot、immutable request material 与无 Provider 状态的 continuation 已实现；Bridge 有部分崩溃恢复测试 | Delivery 全窗口对账、持久 per-Agent unread cursor、长会话增量恢复、真实 Plan Mode/workflow/continuable Sub-agent、ArtifactRef 与重要证据回写、跨组件故障注入和完整恢复验收 |
+| P0：运行骨架 | 基本完成 | DSH 固定源码、Pair Ledger/Projection、两个顶层 Agent Session、Chat Completions、本地重建、cache-first layout、双 Pane、Events UI、请求分段观测、truthful capability UI | 结构化 Task Domain 按现行设计归入 P1 |
+| P0.5：共享对话与通信 | 功能闭环完成，生产可靠性未收口 | 双向输入、Bridge、durable final、普通共享不唤醒、Peer Message、Completion Handoff、原生 Web Search、Local History 安全去重、短日志恢复 | 接收方处理中断后的 reconciliation、持久 unread cursor 与长日志增量恢复按规划留给 P2 |
+| P1：权限和并发 | 尚未实现 | Prompt 已保留最终目标和角色边界；双 Pane 已允许并行用户交互 | Goal/Task/Plan、Goal-impact、Harness 权限绑定、Revision fencing、Pause/Resume/Cancel、确定性 escalation |
+| P2：恢复和执行生态 | 部分基础提前完成 | Pair + 两 Session 重启恢复、请求快照、immutable materials、部分 crash-window 测试 | 全窗口对账、持久 cursor、Plan Mode/workflow/Sub-agent、ArtifactRef、完整故障注入 |
 
-### 10.2 完成 MVP 前必须补齐
-
-| 缺口 | 性质 | 完成标准 |
-| --- | --- | --- |
-| Completion-specific turn-end handoff | P0.5 实测发现的正确性债务 | 完成回报只能在最终 `agent.message` durable 后唤醒 Navigator，并引用已经存在的交付事件；普通 Peer Message 仍可即时投递 |
-| P1 Goal/Task/Plan 权威模型 | 原技术方案核心能力 | 用户只能与 Navigator 确认或修改最终 Goal；Pilot 可接受不改变 Goal 的局部纠偏；Goal-impacting 输入必须确定性升级 |
-| P1 权限、Revision 与控制 | 原技术方案核心能力 | 工具执行绑定当前 Task Revision；旧 Revision 调用 fail closed；Pause/Resume/Cancel 与 pending inbox 行为可恢复、可审计 |
-| P2 Delivery 与恢复闭环 | 原技术方案核心能力 | 覆盖 Ledger/Session 写入、flush、ack、wake 各 crash window；恢复后不丢输入、不重复唤醒、不恢复已失效 Revision |
-| P2 执行生态 | 原技术方案核心能力 | Pilot 可以真实使用 Plan Mode、workflow、continuable Sub-agent；重要输出通过 ArtifactRef/digest 回写 Pair Ledger |
-| 能力感知与诚实委派 | 实测新增的协作质量缺口 | Navigator 在委派前读取 Pilot 实际工具能力；缺少搜索、写文件或执行能力时明确降级或向用户说明，不把知识内回答表述为已完成实时调研 |
-| 完整验收矩阵 | MVP 发布门禁 | 将技术方案第 13 节 24 个场景映射为自动测试或明确的真实模型 eval；P1/P2 场景全部有可重复证据 |
-
-### 10.3 不阻塞 MVP 语义闭环的后续项
-
-以下事项重要，但原技术方案已明确不作为 P0–P2 MVP 完成条件，不能与“尚未完成的 MVP 核心能力”混为一谈：
-
-- TODO-CACHE-01 与更进一步的缓存布局优化；
-- Shared Checkpoint、双 Agent 压缩水位和长会话重放等价 eval；
-- Responses API 或其他 Provider stateful continuation；
-- 单 React 树原生多 Session Pane、产品级响应式布局与完整可访问性；
-- 多进程、跨机器、第三方 Harness Adapter、多租户、计费和生产级安全审计。
-
-其中 Shared Checkpoint 虽不阻塞短会话 MVP，但当前 24 个 Agent turn 已使用约四至五成上下文窗口，若要把原型用于持续长会话，应在 MVP 语义闭环后优先推进，而不是无限扩大全量 Shared Events 与 Local History。
-
-### 10.4 推荐完成路线
-
-1. 先解决 completion handoff 竞态，避免继续用额外 Agent turn 为错误时序兜底；
-2. 实现 P1 的 Goal/Task/Execution Plan、权限分类、Revision fencing 与 Pause/Resume/Cancel；
-3. 补齐 P2 delivery crash-window 对账、持久 cursor 和恢复故障注入；
-4. 接入真实 Plan Mode、workflow、continuable Sub-agent 与 ArtifactRef；
-5. 用技术方案第 13 节场景完成自动测试和真实模型 eval，对 MVP 语义闭环给出最终判断；
-6. 在上述阶段同步采集 TODO-CACHE-01 的分段观测数据，但将布局优化作为独立实验，避免与正确性功能同时改动而失去可比较基线。
-
-## 11. 演进记录
-
-### 2026-09-02
-
-- 首次记录 P0/P0.5 真实模型综合测试；
-- 确认 Shared Context、角色边界、禁止隐瞒与 Peer Message 闭环基本有效；
-- 确认 33 个请求全部采用 `text-dedup-v1`，Shared Event JSON 体积减少约 40.65%；
-- 记录累计 cache read 331,264 tokens，按本文口径命中占比 37.09%；
-- 发现完成回报早于最终交付 durable 的竞态，并将 completion handoff 提升为下一轮优先实验；
-- 记录 reasoning retention 与 Shared/Local 跨层重复是上下文增长的主要后续研究方向；
-- 登记 TODO-CACHE-01，确认 Shared Event 行保持 append-only，但 Shared Head 前进会使 Agent-local History 位于缓存差异之后；
-- 按 P0/P0.5/P1/P2 对照技术方案，明确当前仍是 P0/P0.5 原型，P1、P2 与新增正确性债务完成后才达到 MVP 语义闭环。
+完成 MVP 语义闭环前仍必须补齐 P1/P2 核心能力和技术方案验收矩阵。Shared Checkpoint、Responses API、产品级单 React 树、多进程/跨机器和生产多租户不属于当前 P0–P2 的最低完成门槛，但长会话实际使用前必须为上下文增长建立明确上限和降级策略。

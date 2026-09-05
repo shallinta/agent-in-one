@@ -384,6 +384,31 @@ describe('PairCoordinator durable delivery', () => {
     expect(adapter.followups[0]?.deliveryId).toBe(adapter.followups[1]?.deliveryId);
   });
 
+  test('rejects malformed Peer reply metadata before appending or delivering', async () => {
+    const base = {
+      pairId: 'pair-commands',
+      senderRole: 'navigator' as const,
+      senderSessionId: 'pair:pair-commands:navigator',
+      senderTurn: 9,
+      sourceIdentity: 'dsh:pair:pair-commands:navigator:turn:9:peer-message',
+      text: 'invalid correlated message',
+      causalRootId: 'pair-commands:2',
+      hop: 1,
+    };
+    const before = await store.heads('pair-commands');
+
+    await expect(coordinator.sendPeerMessage({ ...base, replyTo: '  ' }))
+      .rejects.toBeInstanceOf(InvalidCommandError);
+    await expect(coordinator.sendPeerMessage({
+      ...base,
+      expectsReply: true,
+      replyTo: 'pair-commands:2',
+    })).rejects.toBeInstanceOf(InvalidCommandError);
+
+    expect(await store.heads('pair-commands')).toEqual(before);
+    expect(adapter.followups).toEqual([]);
+  });
+
   test('fails closed when a sender Turn identity is already owned by a non-canonical event', async () => {
     const identity = 'dsh:pair:pair-commands:navigator:turn:8:peer-message';
     const head = (await store.heads('pair-commands')).ledgerHead;

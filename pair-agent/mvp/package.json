@@ -9,6 +9,7 @@
     "pnpm": "11.7.0"
   },
   "scripts": {
+    "analyze:requests": "node scripts/analyze-requests.mjs",
     "dev": "node scripts/dev.mjs",
     "verify": "node scripts/verify.mjs",
     "test": "pnpm run test:source && pnpm -r --if-present test",
@@ -16,7 +17,7 @@
     "typecheck": "pnpm -r --if-present typecheck && pnpm run typecheck:root",
     "typecheck:root": "tsc --noEmit -p tsconfig.base.json",
     "build": "pnpm -r --if-present --filter '!@pair-agent/pair-web' build && pnpm --filter @pair-agent/pair-web build:check && pnpm run build:root",
-    "build:root": "node --check scripts/prepare-dsh.mjs && node --check scripts/verify-dsh.mjs && node --check scripts/refresh-dsh-runtime-artifacts.mjs && node --check scripts/dev.mjs && node --check scripts/verify.mjs",
+    "build:root": "node --check scripts/prepare-dsh.mjs && node --check scripts/verify-dsh.mjs && node --check scripts/refresh-dsh-runtime-artifacts.mjs && node --check scripts/analyze-requests.mjs && node --check scripts/dev.mjs && node --check scripts/verify.mjs",
     "prepare:source": "node scripts/prepare-dsh.mjs",
     "verify:source": "node scripts/verify-dsh.mjs",
     "refresh:runtime-artifacts": "node scripts/refresh-dsh-runtime-artifacts.mjs --write-lock"

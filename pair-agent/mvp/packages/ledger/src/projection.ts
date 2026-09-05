@@ -394,6 +394,7 @@ export function foldPairEvent(
     case 'pair.agent_failed':
     case 'user.message':
     case 'agent.message':
+    case 'agent.turn_failed':
     case 'artifact.recorded':
     case 'session_event.linked':
     case 'pair.request_built':

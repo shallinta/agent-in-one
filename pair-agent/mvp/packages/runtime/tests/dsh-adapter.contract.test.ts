@@ -3,7 +3,11 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-import { createPairSessionIds, type DshBuildRef } from '@pair-agent/contracts';
+import {
+  createPairSessionIds,
+  type DshBuildRef,
+  type JsonObject,
+} from '@pair-agent/contracts';
 import {
   createContentAddressedPairPrompt,
   SHARED_EVENT_CONTEXT_FULL_V1,
@@ -14,6 +18,10 @@ import { JsonlPairLedgerStore, LedgerConflictError } from '@pair-agent/ledger';
 import { afterEach, describe, expect, test } from 'vitest';
 
 import { PairCoordinator } from '../src/coordinator.js';
+import {
+  CompletionHandoffRouter,
+  CompletionHandoffService,
+} from '../src/completion-handoff.js';
 import {
   DshPairAgentAdapter,
   DshSourceVerificationError,
@@ -154,6 +162,146 @@ async function createRuntime(
 }
 
 describe('DshPairAgentAdapter real-runtime contract', () => {
+  test('exposes native web_search to both cached request layouts, denies Navigator execution, and lets Pilot search', async () => {
+    const pairId = 'pair-native-web-search';
+    const ids = createPairSessionIds(pairId);
+    const dataRoot = await temporaryRoot('native-web-search');
+    const store = new JsonlPairLedgerStore(join(dataRoot, 'pairs'));
+    const searchRequests: Array<Record<string, unknown>> = [];
+    const server = createServer((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on('data', (chunk: Buffer) => chunks.push(chunk));
+      request.on('end', () => {
+        searchRequests.push(
+          JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>,
+        );
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({
+          content: [
+            {
+              type: 'text',
+              text: 'Search result.',
+              citations: [{
+                type: 'web_search_result_location',
+                url: 'https://example.test/result',
+                cited_text: 'verified snippet',
+              }],
+            },
+            {
+              type: 'web_search_tool_result',
+              content: [{
+                type: 'web_search_result',
+                url: 'https://example.test/result',
+                title: 'Result',
+                page_age: '2026-09-04',
+              }],
+            },
+          ],
+        }));
+      });
+    });
+    await new Promise<void>((resolveListen, rejectListen) => {
+      server.once('error', rejectListen);
+      server.listen(0, '127.0.0.1', resolveListen);
+    });
+    const address = server.address();
+    if (address === null || typeof address === 'string') {
+      throw new Error('web-search test server exposed no TCP address');
+    }
+    const keyName = 'PAIR_AGENT_TEST_SEARCH_KEY';
+    const priorKey = process.env[keyName];
+    process.env[keyName] = 'test-search-key';
+    let runtime: Awaited<ReturnType<typeof launchDshPairWebRuntime>> | undefined;
+    try {
+      runtime = await launchDshPairWebRuntime({
+        source: { derivedRoot: dshRoot, lockPath: dshLockPath },
+        dataRoot,
+        store,
+        commonSystem,
+        provider: 'openai-completions',
+        model: 'capture-model',
+        capture: {
+          responsesBySession: {
+            [ids.navigatorSessionId]: [
+              {
+                toolCall: {
+                  id: 'call-navigator-search',
+                  name: 'web_search',
+                  arguments: { queries: ['must be denied'] },
+                },
+              },
+              'Navigator delegated web research.',
+            ],
+            [ids.pilotSessionId]: [
+              {
+                toolCall: {
+                  id: 'call-pilot-search',
+                  name: 'web_search',
+                  arguments: { queries: ['Pair Agent'] },
+                },
+              },
+              'Pilot cited the search result.',
+            ],
+          },
+        },
+        webSearch: {
+          apiKeyEnv: keyName,
+          baseURL: `http://127.0.0.1:${String(address.port)}`,
+        },
+        web: { host: '127.0.0.1', port: 0 },
+      });
+      const registry = new PairRegistry(store, runtime.adapter);
+      const coordinator = new PairCoordinator(registry, store, runtime.adapter);
+      await coordinator.createPair({
+        pairId,
+        dshBuild: runtime.adapter.getDshRuntimeAttestation().dshBuild,
+        expectedLedgerHead: 0,
+      });
+
+      await coordinator.sendNavigator({
+        pairId,
+        text: 'Search directly as Navigator.',
+        expectedLedgerHead: (await store.heads(pairId)).ledgerHead,
+      });
+      await runtime.adapter.whenIdle(ids.navigatorSessionId);
+      expect(searchRequests).toHaveLength(0);
+      expect(JSON.stringify(runtime.adapter.sessionEvents(ids.navigatorSessionId)))
+        .toContain('Navigator cannot execute web_search');
+
+      await coordinator.assignTask({
+        pairId,
+        expectedLedgerHead: (await store.heads(pairId)).ledgerHead,
+        task: {
+          id: 'native-web-search',
+          revision: 1,
+          summary: 'Search the web using the native DSH tool.',
+          state: 'queued',
+        },
+      });
+      await runtime.adapter.whenIdle(ids.pilotSessionId);
+      expect(searchRequests).toHaveLength(1);
+      expect(searchRequests[0]).toMatchObject({
+        messages: [{ role: 'user' }],
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      });
+      const captures = runtime.adapter.captureRequests();
+      expect(captures).toHaveLength(4);
+      expect(captures.every((request) =>
+        request.tools?.some((tool) => tool.name === 'web_search') === true,
+      )).toBe(true);
+      expect(JSON.stringify(runtime.adapter.sessionEvents(ids.pilotSessionId)))
+        .toContain('https://example.test/result');
+      await coordinator.close();
+    } finally {
+      await runtime?.close().catch(() => undefined);
+      await new Promise<void>((resolveClose, rejectClose) =>
+        server.close((error) => error ? rejectClose(error) : resolveClose()),
+      );
+      if (priorKey === undefined) Reflect.deleteProperty(process.env, keyName);
+      else process.env[keyName] = priorKey;
+    }
+  }, 60_000);
+
   test('rejects actual Prompt material that disagrees with its bundle identity', async () => {
     const dataRoot = await temporaryRoot('prompt-bundle-mismatch');
     const bundle = createContentAddressedPairPrompt({
@@ -423,7 +571,7 @@ describe('DshPairAgentAdapter real-runtime contract', () => {
     }
   }, 30_000);
 
-  test('fails a missing Session capture queue without consuming another Session response', async () => {
+  test('fails a missing Session capture queue and notifies Navigator without cross-consuming it', async () => {
     const pairId = 'pair-capture-session-missing';
     const ids = createPairSessionIds(pairId);
     const runtime = await createRuntime(
@@ -457,15 +605,18 @@ describe('DshPairAgentAdapter real-runtime contract', () => {
           }),
         }),
       );
-
-      await runtime.coordinator.sendNavigator({
-        pairId,
-        text: 'Navigator consumes only its own queue.',
-        expectedLedgerHead: (await runtime.store.heads(pairId)).ledgerHead,
-      });
       await runtime.adapter.whenIdle(ids.navigatorSessionId);
+      const events = await runtime.store.read(pairId);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: 'agent.turn_failed',
+          source: 'pilot-session',
+          channel: 'navigator',
+          payload: expect.objectContaining({ failedRole: 'pilot' }),
+        }),
+      );
       expect(
-        (await runtime.store.read(pairId)).some(
+        events.some(
           (event) => event.payload.text === 'Navigator queue remains isolated.',
         ),
       ).toBe(true);
@@ -1438,6 +1589,201 @@ describe('DshPairAgentAdapter real-runtime contract', () => {
       .toBe(events.at(-1)?.seq);
     await runtime.coordinator.close();
   }, 30_000);
+
+  test('wires reference-only completion delivery and rebuilds durable admission dedupe on recovery', async () => {
+    const pairId = 'pair-dsh-completion-recovery';
+    const ids = createPairSessionIds(pairId);
+    const pairRoot = await temporaryRoot('completion-recovery-ledger');
+    const sessionRoot = await temporaryRoot('completion-recovery-sessions');
+    const firstRouter = new CompletionHandoffRouter();
+    const first = await createRuntime(pairId, pairRoot, sessionRoot, {
+      tools: [firstRouter.toolDefinition()],
+      responsesBySession: {
+        [ids.pilotSessionId]: [
+          {
+            toolCall: {
+              id: 'call-completion-recovery',
+              name: 'pair_report_completion',
+              arguments: {},
+            },
+          },
+          'complete durable report',
+        ],
+        [ids.navigatorSessionId]: ['Navigator integrated the completion.'],
+      },
+    });
+    firstRouter.bind(new CompletionHandoffService(first.adapter));
+
+    await first.coordinator.createPair({ pairId, dshBuild, expectedLedgerHead: 0 });
+    await first.coordinator.sendPilot({
+      pairId,
+      text: 'Complete the delegated work.',
+      expectedLedgerHead: (await first.store.heads(pairId)).ledgerHead,
+    });
+    await first.adapter.whenIdle(ids.pilotSessionId);
+    await first.adapter.whenIdle(ids.navigatorSessionId);
+
+    const firstPairEvents = await first.store.read(pairId);
+    const completion = firstPairEvents.find(
+      (candidate) => candidate.payload.kind === 'completion-handoff',
+    );
+    expect(completion).toBeDefined();
+    const completionId = `${pairId}:${String(completion!.seq)}`;
+    const navigatorSessionEvents = first.adapter.sessionEvents(
+      ids.navigatorSessionId,
+    );
+    const completionDeliveries = navigatorSessionEvents.filter((candidate) => {
+      if (candidate.type !== 'user/message') return false;
+      const data = candidate.data as Record<string, unknown>;
+      const source = data.source as Record<string, unknown> | undefined;
+      return (
+        source?.kind === 'plugin' &&
+        source.plugin === 'pair-agent:delivery' &&
+        source.deliveryId === completionId &&
+        source.pairEventId === completionId
+      );
+    });
+    expect(completionDeliveries).toHaveLength(1);
+    const deliverySource = completionDeliveries[0]!.data as {
+      source: { trigger: JsonObject };
+      content: JsonObject[];
+    };
+    expect(deliverySource.source.trigger).toEqual({
+      kind: 'completion-handoff',
+      pairEventId: completionId,
+      senderRole: 'pilot',
+      senderTurn: 1,
+    });
+    expect(JSON.stringify(deliverySource)).not.toContain('complete durable report');
+    const navigatorRequest = first.adapter.captureRequests().find(
+      (request) => request.sessionId === ids.navigatorSessionId,
+    );
+    expect(navigatorRequest).toBeDefined();
+    const navigatorRequestEvent = firstPairEvents.find(
+      (candidate) => candidate.seq === navigatorRequest!.snapshotLedgerSeq,
+    );
+    const navigatorSnapshot = navigatorRequestEvent?.payload.snapshot as
+      | { sourceLedgerHead?: number }
+      | undefined;
+    expect(navigatorSnapshot?.sourceLedgerHead).toBeGreaterThanOrEqual(completion!.seq);
+    expect(JSON.stringify(navigatorRequest?.messages)).toContain(
+      'complete durable report',
+    );
+    expect(JSON.stringify(navigatorRequest?.messages).split('complete durable report'))
+      .toHaveLength(2);
+    const navigatorTurnsBeforeRecovery = navigatorSessionEvents.filter(
+      (candidate) => candidate.type === 'turn/start',
+    ).length;
+    const requestCountBeforeRecovery = firstPairEvents.filter(
+      (candidate) => candidate.type === 'pair.request_built',
+    ).length;
+    await first.coordinator.close();
+
+    const secondRouter = new CompletionHandoffRouter();
+    const second = await createRuntime(pairId, pairRoot, sessionRoot, {
+      tools: [secondRouter.toolDefinition()],
+      responsesBySession: {
+        [ids.navigatorSessionId]: ['must not be consumed'],
+        [ids.pilotSessionId]: ['must not be consumed'],
+      },
+    });
+    secondRouter.bind(new CompletionHandoffService(second.adapter));
+    await second.registry.recoverPair(pairId);
+
+    const recoveredNavigatorEvents = second.adapter.sessionEvents(
+      ids.navigatorSessionId,
+    );
+    expect(
+      recoveredNavigatorEvents.filter((candidate) => {
+        if (candidate.type !== 'user/message') return false;
+        const data = candidate.data as Record<string, unknown>;
+        const source = data.source as Record<string, unknown> | undefined;
+        return source?.deliveryId === completionId;
+      }),
+    ).toHaveLength(1);
+    expect(
+      recoveredNavigatorEvents.filter(
+        (candidate) => candidate.type === 'turn/start',
+      ),
+    ).toHaveLength(navigatorTurnsBeforeRecovery);
+    expect(second.adapter.captureRequests()).toEqual([]);
+    expect(
+      (await second.store.read(pairId)).filter(
+        (candidate) => candidate.type === 'pair.request_built',
+      ),
+    ).toHaveLength(requestCountBeforeRecovery);
+    await second.coordinator.close();
+  }, 60_000);
+
+  test('can retry resume on the same adapter after corrupted delivery admission is repaired', async () => {
+    const pairId = 'pair-dsh-retry-repaired-delivery';
+    const ids = createPairSessionIds(pairId);
+    const pairRoot = await temporaryRoot('retry-repaired-delivery-ledger');
+    const sessionRoot = await temporaryRoot('retry-repaired-delivery-sessions');
+    const first = await createRuntime(pairId, pairRoot, sessionRoot, {
+      responsesBySession: {
+        [ids.navigatorSessionId]: ['Navigator persisted one delivery.'],
+        [ids.pilotSessionId]: [],
+      },
+    });
+    await first.coordinator.createPair({ pairId, dshBuild, expectedLedgerHead: 0 });
+    await first.coordinator.sendNavigator({
+      pairId,
+      text: 'Durable delivery for recovery validation.',
+      expectedLedgerHead: (await first.store.heads(pairId)).ledgerHead,
+    });
+    await first.adapter.whenIdle(ids.navigatorSessionId);
+    const artifact = first.adapter.sessionArtifact(ids.navigatorSessionId);
+    await first.coordinator.close();
+
+    const original = await readFile(artifact.path, 'utf8');
+    const rows = original.trimEnd().split('\n').map(
+      (line) => JSON.parse(line) as Record<string, unknown>,
+    );
+    const delivery = rows.find((row) => {
+      if (row.type !== 'user/message') return false;
+      const data = row.data as Record<string, unknown> | undefined;
+      const source = data?.source as Record<string, unknown> | undefined;
+      return source?.plugin === 'pair-agent:delivery';
+    })!;
+    const deliveryData = delivery.data as Record<string, unknown>;
+    const deliverySource = deliveryData.source as Record<string, unknown>;
+    deliverySource.trigger = {
+      ...(deliverySource.trigger as Record<string, unknown>),
+      text: 'forged recovery payload',
+    };
+    await writeFile(artifact.path, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+
+    const second = await createRuntime(pairId, pairRoot, sessionRoot, {
+      responsesBySession: {
+        [ids.navigatorSessionId]: [],
+        [ids.pilotSessionId]: [],
+      },
+    });
+    await expect(second.adapter.resumePairAgent({
+      pairId: pairId as never,
+      role: 'navigator',
+      sessionId: ids.navigatorSessionId,
+    })).rejects.toThrow(/durable Pair Event|provenance/i);
+    expect(second.adapter.ownedHandleCount()).toBe(0);
+
+    await writeFile(artifact.path, original);
+    const resumed = await second.adapter.resumePairAgent({
+      pairId: pairId as never,
+      role: 'navigator',
+      sessionId: ids.navigatorSessionId,
+    });
+    expect(resumed.descriptor.sessionId).toBe(ids.navigatorSessionId);
+    expect(second.adapter.ownedHandleCount()).toBe(1);
+    expect(second.adapter.sessionEvents(ids.navigatorSessionId).filter((event) => {
+      if (event.type !== 'user/message') return false;
+      const data = event.data as Record<string, unknown>;
+      const source = data.source as Record<string, unknown> | undefined;
+      return source?.plugin === 'pair-agent:delivery';
+    })).toHaveLength(1);
+    await second.adapter.release(resumed.handle);
+    await second.coordinator.close();
+  }, 60_000);
 
   test('fails closed on unknown session bindings and corrupted persisted sessions', async () => {
     const pairId = 'pair-dsh-corrupt';

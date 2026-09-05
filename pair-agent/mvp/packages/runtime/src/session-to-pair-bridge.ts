@@ -1,11 +1,15 @@
 import {
+  isCompletionHandoffAgentMessage,
   type JsonObject,
   type PairId,
   type PairRole,
   parsePairId,
 } from '@pair-agent/contracts';
 
-import { PairDerivedEventWriter } from './pair-derived-event-writer.js';
+import {
+  PairDerivedEventWriter,
+  requireCanonicalDerivedEvent,
+} from './pair-derived-event-writer.js';
 import {
   deriveDurableSessionGroups,
   type DerivedSessionGroup,
@@ -22,6 +26,26 @@ export interface PairSessionBridgePort {
     fromSeq: number,
   ): Promise<readonly DshSessionEvent[]>;
   whenAgentIdle(sessionId: string): Promise<void>;
+}
+
+export interface CompletionHandoffDeliveryInput {
+  readonly pairId: string;
+  readonly pairEventId: string;
+  readonly senderRole: 'pilot';
+  readonly senderTurn: number;
+}
+
+export interface CompletionHandoffDeliveryPort {
+  deliverCompletion(input: CompletionHandoffDeliveryInput): Promise<void>;
+  deliverTurnFailure(input: TurnFailureDeliveryInput): Promise<void>;
+}
+
+export interface TurnFailureDeliveryInput {
+  readonly pairId: string;
+  readonly pairEventId: string;
+  readonly failedRole: 'pilot';
+  readonly failedTurn: number;
+  readonly code: string;
 }
 
 interface SessionBinding {
@@ -126,6 +150,7 @@ export class SessionToPairBridge {
   constructor(
     private readonly port: PairSessionBridgePort,
     private readonly writer: PairDerivedEventWriter,
+    private readonly completionDeliveryPort?: CompletionHandoffDeliveryPort,
   ) {
     this.#off = port.onSessionEvent((sessionId, event) => {
       if (!shouldDrain(event)) return;
@@ -266,7 +291,7 @@ export class SessionToPairBridge {
         }),
       );
       for (const group of sortGroups(scans.flatMap((scan) => scan.groups))) {
-        await this.writer.appendGroup(pairId, group.records);
+        await this.#appendGroup(pairId, group);
       }
       for (const scan of scans) {
         scan.state.nextSeq =
@@ -389,12 +414,102 @@ export class SessionToPairBridge {
         existingPairEvents,
       });
       for (const group of groups) {
-        await this.writer.appendGroup(binding.pairId, group.records);
+        await this.#appendGroup(binding.pairId, group);
       }
       state.nextSeq =
         suffix.length === 0 ? state.nextSeq : suffix.at(-1)!.seq + 1;
       state.pending = pendingTail(combined);
       state.fault = undefined;
     }
+  }
+
+  async #appendGroup(
+    pairId: PairId,
+    group: DerivedSessionGroup,
+  ): Promise<void> {
+    const events = await this.writer.appendGroup(pairId, group.records);
+    const failureDelivery = group.failureDelivery;
+    if (failureDelivery !== undefined) {
+      const failure = requireCanonicalDerivedEvent(
+        events,
+        failureDelivery.sourceId,
+      );
+      const failureId = `${failure.pairId}:${String(failure.seq)}`;
+      if (
+        failure.pairId !== pairId ||
+        group.role !== 'pilot' ||
+        failure.type !== 'agent.turn_failed' ||
+        failure.actor.kind !== 'host' ||
+        failure.source !== 'pilot-session' ||
+        failure.channel !== 'navigator' ||
+        failure.visibility !== 'shared' ||
+        failure.authority !== 'host' ||
+        failure.payload.failedRole !== 'pilot' ||
+        failure.payload.failedTurn !== failureDelivery.failedTurn ||
+        typeof failure.payload.code !== 'string'
+      ) {
+        throw new Error(
+          `Derived failure ${failureDelivery.sourceId} is not a canonical Pilot Turn failure`,
+        );
+      }
+      if (this.completionDeliveryPort === undefined) {
+        throw new Error('Pair Bridge delivery port is not configured');
+      }
+      await this.completionDeliveryPort.deliverTurnFailure({
+        pairId,
+        pairEventId: failureId,
+        failedRole: 'pilot',
+        failedTurn: failureDelivery.failedTurn,
+        code: failure.payload.code,
+      });
+    }
+    const delivery = group.completionDelivery;
+    if (delivery === undefined) return;
+
+    const completion = requireCanonicalDerivedEvent(events, delivery.sourceId);
+    const completionId = `${completion.pairId}:${String(completion.seq)}`;
+    const origin = plainObject(completion.payload.origin);
+    if (
+      completion.pairId !== pairId ||
+      group.role !== 'pilot' ||
+      !isCompletionHandoffAgentMessage(completion) ||
+      origin?.turn !== delivery.senderTurn
+    ) {
+      throw new Error(
+        `Derived completion ${delivery.sourceId} is not the canonical Pilot handoff`,
+      );
+    }
+
+    const linkSpecs = group.records.filter(
+      (record) =>
+        record.draft.type === 'session_event.linked' &&
+        record.representedSourceId === delivery.sourceId,
+    );
+    if (linkSpecs.length !== 1) {
+      throw new Error(
+        `Derived completion ${delivery.sourceId} requires one canonical Session link`,
+      );
+    }
+    const link = requireCanonicalDerivedEvent(events, linkSpecs[0]!.sourceId);
+    if (
+      link.type !== 'session_event.linked' ||
+      link.pairId !== pairId ||
+      link.seq <= completion.seq ||
+      link.payload.pairEventId !== completionId
+    ) {
+      throw new Error(
+        `Derived completion ${delivery.sourceId} was not durably linked after its message`,
+      );
+    }
+
+    if (this.completionDeliveryPort === undefined) {
+      throw new Error('Completion handoff delivery port is not configured');
+    }
+    await this.completionDeliveryPort.deliverCompletion({
+      pairId,
+      pairEventId: completionId,
+      senderRole: 'pilot',
+      senderTurn: delivery.senderTurn,
+    });
   }
 }

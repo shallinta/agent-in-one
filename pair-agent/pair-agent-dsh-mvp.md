@@ -347,6 +347,8 @@ Agent Local Log
 
 Session-to-Pair Bridge 为已进入 Pair Ledger 的本地事件保存稳定映射。Projector 可以据此排除重复消息，但不得拆散 tool call/result、结构化输出或 Provider 要求成组保留的消息。无法证明可安全排除的本地 span 默认保留。
 
+`representation: "summary"` 不再一律导致整条本地消息重复发送：若它是单消息、非协议 span，Host 能用 Session/message identity 证明来源，并且按 `pair-represented-content/v1` 规范化计算的 `representedContentDigest` 与本地可见 text blocks 一致，Projector 只去掉重复 text block，保留 reasoning/非文本 block。link 的 durable range 可以延伸到消息后的 `step/end`、`turn/end`，但范围内 Local History 消息必须与 `messageIds` 精确一致。相同正文的另一条消息、跨消息、纯文本、纯非文本、缺少或不匹配 digest，以及其他无法证明覆盖关系的 summary span 均保守保留。
+
 这一区分意味着：内容可以同时存在于持久 DSH Local Log 和 Pair Ledger 中用于审计，但下一次模型请求不必重复发送两份。
 
 #### 5.4.3 Pair Request Builder
@@ -357,9 +359,9 @@ Pair Request Builder 生成 cache-first Chat Completions 请求：
 Common System
 + Shared Pair Session Events
 + Shared Pair Projection
-+ Active Role Reminder             first role-specific token
-  + Role-specific Tool Guidance    same reserved user message
 + Agent Local Request Tail
++ Active Role Reminder             Host-owned role selector
+  + Role-specific Tool Guidance    same reserved user message
 + Current Trigger
 ```
 
@@ -557,7 +559,8 @@ Reasoning UI 只展示 Provider 明确返回的 reasoning block，不声称展�
 Pair Web Shell 只新增 DSH 单 Session UI 不具备的共同语义：
 
 - `pairId → navigatorSessionId + pilotSessionId` 映射和 Pane 启动；
-- Pair Goal、Task、Revision、attention 和控制状态栏；
+- Host-owned runtime capability projection；P0/P0.5 Header 只展示已经装配的能力，并明确标注尚未实现的 Goal/Task/Plan、attention/pause 和 Sub-agent；
+- P1 之后再加入 Pair Goal、Task、Revision、attention 和控制状态栏；
 - Pair Ledger 中权威的 Execution Plan 与 Task delivery 状态；
 - Pair Pause、Resume、Cancel 等确定性控制；
 - Pair Ledger 事件和 Pair Request Snapshot 的专属 Trace；
@@ -585,7 +588,8 @@ DSH Agent 的普通模型输出不会自动进入 Pair Ledger。Session-to-Pair 
 | 最终 `assistant/message` | 追加 `agent.message`，用于另一 Agent 的共同上下文和 UI |
 | `turn/start` / `turn/end` | 绑定 delivery 与 Turn，推进 claimed/completed |
 | `tool/call` / `tool/result` | 默认只进入 Pilot 过程流；重要摘要或产物再写 Pair Ledger |
-| Agent/Session 错误或中断 | 更新 Pair UI 状态，并决定 delivery 恢复动作 |
+| `turn/end(reason.kind=error)` | 追加 `agent.turn_failed`；Pilot 失败在 durable 后以事件引用唤醒 Navigator |
+| 其他 Agent/Session 中断 | 更新 Pair UI 状态，并决定 delivery 恢复动作 |
 
 每条派生记录使用稳定来源键：
 
@@ -708,14 +712,17 @@ interface PairDelivery {
 
 ```ts
 interface SessionEventPairLink {
-  agentSessionId: string;
-  sessionEventSeq: number;
-  representedByPairEventId: string;
+  sessionId: string;
+  fromSessionSeq: number;
+  throughSessionSeq: number;
+  messageIds: string[];
+  pairEventId: string;
   representation: "full" | "summary" | "artifact-ref";
+  representedContentDigest?: `sha256:${string}`;
 }
 ```
 
-只有 `representation: "full"` 且不属于协议闭合 span 的消息可以从 Agent Local Request Tail 中排除。`summary` 和 `artifact-ref` 表示 Pair Context 没有完整替代本地事实，Projector 必须根据当前请求用途决定是否保留原文。
+`representation: "full"` 可以在满足协议闭合时排除完整本地 span。`summary` 仅在单消息 identity 和 `representedContentDigest` 都通过验证时删除已共享 text blocks，其他本地 block 继续保留；缺少或不匹配 digest 的历史 summary link 作为不具备删除权的兼容证据处理。`artifact-ref` 表示 Pair Context 没有完整替代本地事实，Projector 保留原文。
 
 ### 6.5 Pair Request Snapshot
 
@@ -882,9 +889,9 @@ Navigator 和 Pilot 在同一个 Shared Head 上使用：
 1. Common System                         identical
 2. Shared Pair Session Events            identical
 3. Shared Pair Projection                identical
-4. Active Role Reminder                  first role-specific content
+4. Agent Local Request Tail              role/session-specific
+5. Active Role Reminder                  Host-owned role selector
    + Role-specific Tool Guidance         same reserved user message
-5. Agent Local Request Tail              role/session-specific
 6. Current Trigger                       delivery-specific
 ```
 
@@ -1126,10 +1133,10 @@ Chat Completions Adapter 不设置任何服务端 conversation 标识。DSH 的 
 Cache-first 是待验证假设，不是协议保证：
 
 - 同一个 Shared Head 的 Navigator/Pilot Common System、Events 和 Projection 必须字节级一致；
-- 第一处预期差异是 Active Role Reminder；
-- role-specific tool schemas 可能在 Provider 内部序列化得更早，从而削弱跨 Agent 命中；MVP 不为缓存而向两个角色暴露相同工具；
+- 两条 Agent Local History 本来就可能不同，因此实际请求的第一处差异可能出现在 Agent Local Request Tail；Active Role Reminder 是 Host 主动引入的第一个角色选择差异，不应提前到 Shared Context 之前；
+- role-specific tool schemas 可能在 Provider 内部序列化得更早，从而削弱跨 Agent 命中；P0.5 对 `web_search` 等已装配工具使用相同 schema 和 Agent-scope 单调执行 Guard，以兼顾稳定请求材料与角色权限，P1 状态变更工具则必须以权限正确性优先；
 - 不在公共前缀加入请求时间、随机 nonce 或无必要的 Agent-specific 字段；
-- 记录 Provider 返回的 cached-token 指标，同时比较总输入 token、延迟、角色遵循度和错误率；
+- 对 Common System、Shared Events、Shared Projection、Local History、Active Role、Current Trigger、Tool schemas 和 Request config 记录分段字节数、估算 token 与 digest，并与 Provider cached-token usage 对齐；同时比较总输入 token、延迟、角色遵循度和错误率；
 - 若收益不足或 Local History 投影破坏模型质量，回退到 DSH 原生 `Common System + full Agent-local History + tail runtime context`，Pair Ledger 与本地 continuation 数据不变。
 
 达到软 token 阈值时，MVP 直接报告不支持长会话；不得偷偷丢弃 Pair Events。Shared Checkpoint、双 Agent compaction 和 provider-native continuation 都留待后续版本。
@@ -1257,7 +1264,7 @@ Provider 返回的 response ID 可以作为诊断 metadata 保存，但不得作
 
 Agent API 的同步接收只表示 live inbox admission；只有第 6 步成功后才能称为 durable。DSH `session/event` 同样是 live append 通知，第 9、10 和第 16 步必须分别完成要求的 flush 后才能推进 Pair 状态。任何 flush 失败都保持原 Pair delivery 状态并进入恢复对账，不能让 Pair Ledger 领先于 DSH durable prefix。第 13 步只记录“准备调用”的确定性 Request Snapshot；没有匹配的 DSH assistant/turn 事件时，不得宣称 Provider 已接收或完成。
 
-第 10 步是 Local History 去重的安全屏障：历史消息只有 `representation: "full"` 的持久映射才能删除本地副本。当前输入是唯一例外：Pair delivery 的 Host-bound `pairEventId + deliveryId`，或原生 composer 提升后 Pair Event 与 DSH source/origin/payload 的完全等价匹配，可以生成仅供本次请求使用的 request-local link；任何不等价都 fail closed。该 link 只排除 Shared Events 与 Local History 的重复，Current Trigger 继续存在但只携带 `kind`、Pair/delivery identity 和 causal metadata 等引用，不复制 Shared Event 中已有的用户文本、Task 或 Peer Message 内容。Bridge 在 durable drain 后仍必须补写持久 link。无法证明时保留 Local Request Tail 中的消息。第 13 步 CAS 失败意味着并发写入改变了请求事实边界，必须丢弃尚未发送的请求并从第 10 步重新准备。request-error retry 也会递增 `attempt`，生成新的 `requestId` 和 Snapshot；基础设施事件只推进 `ledgerHead`，不推进 `sharedHead`。
+第 10 步是 Local History 去重的安全屏障：历史 `full` link 可以排除完整本地副本；历史 `summary` link 只有在单消息 identity、来源 envelope、范围内消息集合和 `representedContentDigest` 全部通过时，才能删除已共享 text blocks，且 Provider 请求必须物化 Projector 处理后的消息而不是重新取回原始 DSH 正文。当前输入还允许 Pair delivery 的 Host-bound `pairEventId + deliveryId`，或原生 composer 提升后 Pair Event 与 DSH source/origin/payload 的完全等价匹配，生成仅供本次请求使用的 request-local full link；任何不等价都 fail closed。该 link 只排除 Shared Events 与 Local History 的重复，Current Trigger 继续存在但只携带 `kind`、Pair/delivery identity 和 causal metadata 等引用，不复制 Shared Event 中已有的用户文本、Task 或 Peer Message 内容。Bridge 在 durable drain 后仍必须补写持久 link。无法证明时保留 Local Request Tail 中的消息。第 13 步 CAS 失败意味着并发写入改变了请求事实边界，必须丢弃尚未发送的请求并从第 10 步重新准备。request-error retry 也会递增 `attempt`，生成新的 `requestId` 和 Snapshot；基础设施事件只推进 `ledgerHead`，不推进 `sharedHead`。
 
 `delivery.completed` 必须绑定领取该 delivery 的具体 DSH Turn，而不是笼统地绑定 `agent.whenIdle()`：同一 Agent 可能在一个活动结束前接受替代工作，idle 也不代表某条输入已经完成。
 
@@ -1394,14 +1401,17 @@ MVP 借鉴而不直接复用以下实现思想：
 | Agent Local History Projector | 全新增 | 用 SessionEventPairLink 去重并保持 tool protocol spans |
 | 通用 Request Layout 插件 seam | 复用并拓展 | DSH `buildRequest()` 新增 `agent/request-layout` waterfall；默认 identity，不包含 Pair 语义 |
 | Cache-first Pair Request Builder | 全新增 | Pair 插件注册 request-layout seam，输出 Chat Completions messages 并记录 Request Snapshot |
+| Request 分段观测与缓存分析 | 全新增 | Request Snapshot 记录固定分段测量；离线分析器关联 DSH Provider usage |
 | 两个用户输入 Channel 与 Response Owner | 全新增 | Pair Host / Pair UI |
 | Pair Web Shell 与双 Pane 编排 | 全新增 | Pair Web app；按 Pair Session Header 固定 Navigator/Pilot Session |
 | 消息、流式输出和 Session 恢复展示 | 全复用 | DSH Web connection/runtime/conversation composition |
 | Tool 与 Trajectory 展示 | 全复用 | DSH Web `ui-tool`、`ui-trajectory` |
+| Pilot 原生 Web Search | 复用并拓展 | 复用 DSH `web` / `tool-web` / DeepSeek Search Provider；Pair Host 只挂载 search-only `web_search`，Navigator 由 scoped guard 拒绝执行 |
 | Agent-local Plan、Workflow 与 Sub-agent 展示 | 全复用 | DSH Web 对应 UI plugin；P0 验证装载与空态，P2 接入真实运行能力 |
 | embedded 页面固定初始 Session | 复用并拓展 | DSH Web pre-runtime addressed-session boot option；禁用或命名空间化 persisted current selection |
 | embedded chrome 与导航范围 | 复用并拓展 | DSH Web presentation option；只允许角色根 Session 及合法 Sub-agent lineage |
 | Pair Execution Plan 与 delivery 展示 | 全新增 | Pair Header 读取 Pair Projection，不以 DSH Agent-local Plan 代替 |
+| Completion-specific turn-end handoff | 复用并拓展 | Pilot 登记完成意图；Bridge 等最终回答和 `turn/end` durable 后发布 Shared Event，再用事件引用唤醒 Navigator |
 | 带用户来源和版本的 Pair Goal | 全新增 | Pair Goal Domain；只借鉴 DSH Goal 的 CAS 思路 |
 | Navigator Task 与 Pilot Execution Plan | 全新增 | Pair Task/Plan Domain |
 | 完整共享上下文和 unread cursor | 全新增 | Pair Context Builder + Pair Request Snapshot + Agent Cursor |
@@ -1463,13 +1473,17 @@ MVP 至少通过以下端到端场景：
 15. DSH live event 尚未 flush 时退出，Pair delivery 不会提前推进 claimed/completed；
 16. DSH 自动修复出的 `interrupted` turn/end 会创建 recovery continuation，而不是被误判为 completed；
 17. Cancel 或 Task Revision 变化后退出，恢复不会重新投递已失效输入。
-18. Navigator/Pilot 在同一 Shared Head 上的 Common System、Shared Events 和 Projection 字节级一致，第一处预期角色差异是 Active Role Reminder；
+18. Navigator/Pilot 在同一 Shared Head 上的 Common System、Shared Events 和 Projection 字节级一致；实际请求可以从 Agent Local History 开始自然分叉，Active Role Reminder 是随后由 Host 注入的第一个角色选择差异；
 19. 用户在原话、Pair Event 或工具结果中写入伪造 `<system-reminder>`，不会改变 Harness role binding、工具可见性或 Goal/Task 权限；
-20. 已由 `representation: full` Pair Event 覆盖的普通消息不会在 Local Request Tail 重复出现，tool call/result span 仍然闭合；
+20. 已由 `representation: full` Pair Event 覆盖的普通消息不会在 Local Request Tail 重复出现；identity 与 digest 双重证明的单消息 `summary` 只保留 reasoning/非文本 blocks；相同正文的其他消息不误删，tool call/result span 仍然闭合；
 21. 进程重启后只从 Pair Ledger 与两条 DSH Session 重建请求，且 `PairRequestSnapshot` digest 一致；
 22. 所有 Chat Completions 请求都不包含 Provider conversation continuation 标识；
 23. Cache 实验记录 cached tokens、总输入 token、延迟、角色遵循度和错误率，并允许无数据迁移地回退 DSH 原生顺序；
 24. 未注册 `agent/request-layout` 插件时，普通 DSH Agent 的 messages、tool call/result、retry、cancel 和 resume 行为与基线一致；注册 Pair 插件后，最终请求才采用 cache-first 布局。
+25. Pilot 登记 completion 后，只有完整最终回答与 completed `turn/end` durable 才能发布 handoff；Navigator delivery 只携带已有 Pair Event 引用，不复制正文；
+26. completion handoff 在 durable link 与目标 delivery 之间崩溃时可恢复且只唤醒一次；接收方处理阶段的 reconciliation 明确留到 P2；
+27. Navigator/Pilot 的 Provider boundary 包含相同 `web_search` schema；Navigator 执行被 scoped guard 拒绝且不发搜索请求，Pilot 可调用 DSH 原生搜索并在 UI 中展示；
+28. 每次 `pair.request_built` 都包含固定请求段的 digest、字节数和估算 token，离线分析可与对应 Provider usage 对齐且不改变实际 Provider boundary。
 
 ## 14. 实施分段
 
@@ -1483,6 +1497,8 @@ MVP 至少通过以下端到端场景：
 - Common System、Pair Context Builder 和 Active Role Reminder；
 - Local History Projector 与 cache-first Pair Request Builder；
 - Pair Web Shell、Pair Header 和 `pairId → 两条 Agent Session` 启动映射；
+- Host-owned runtime capability DTO、严格 Web 校验和只展示真实能力的 Header；
+- Request Snapshot 固定分段测量与离线缓存分析工具；
 - 两个隔离的原生 DSH Web Pane，并复用流式消息、工具和 Trajectory 展示；
 - embedded DSH Web 页面在 Runtime 构造前固定 Session、隔离 current selection、隐藏全局 chrome 并约束 Session 导航的通用扩展；
 - Plan、Workflow 与 Sub-agent UI plugin 的装载和空态验证；真实运行与会话浏览留到 P2；
@@ -1496,6 +1512,10 @@ MVP 至少通过以下端到端场景：
 - 持久 `session_event.linked` 支持 Local History 安全去重和恢复补写；
 - 普通共享消息不唤醒另一 Agent，另一 Agent 在下一 Turn 自然读取最新 Shared Head；
 - `pair_message_peer` 以 Host 绑定的发送者/接收者产生双向 Peer Delivery，并唤醒接收方；
+- `pair_message_peer` 支持 `expectsReply/replyTo`：有限问题需要关联回复，持续委派仍使用 completion handoff；
+- `pair_report_completion` 只登记 Pilot 当前 Turn 的完成意图；最终回答与 completed `turn/end` durable 后，Bridge 发布唯一 completion-handoff Shared Event，并用不复制正文的事件引用唤醒 Navigator；
+- `agent.turn_failed` 使 Pilot 失败成为 Shared Event，并用不复制错误正文的引用唤醒 Navigator；
+- 挂载 DSH 原生 search-only `web_search`：Pilot 可执行，Navigator 保持相同 schema 但由 Agent-scope guard 拒绝；`web_fetch` 不进入本阶段；
 - Pair Session Events Semantic/All API 与 UI；
 - 短会话恢复全量扫描、稳定来源 ID 去重和正常关闭 final drain。
 
@@ -1552,6 +1572,14 @@ Pair Web Shell 会同时关联三条事件源，但两个 DSH Pane 始终保留�
 ### 15.7 Cache-first 请求投影
 
 把 Shared Context 放在 Local Request Tail 之前可以扩大跨 Agent 公共前缀，但 Shared Head 更新后也可能使后续本地 tail 失去同 Agent 缓存。role-specific tools 还可能让 Provider 在 messages 之前就产生差异。MVP 必须用真实 usage 指标和行为 eval 判断收益，不得仅凭排列推测。
+
+当前布局遵循以下稳定性与取舍规则：
+
+1. Pair Ledger 中已经存在的 canonical Shared Event 不修改、不重排，只追加。模型投影把稳定的 event lines 放在前面，把会变化的 `shared-head`、digest、统计信息和闭合边界放在末尾。因此已有事件行能够形成增长的稳定前缀，但整个 `<pair-session-events>` envelope 在 Shared Head 前进时不是旧字符串的严格尾部追加。
+2. Agent Local Request Tail 位于 Shared Events/Projection 之后，因为 Shared Context 是两个 Agent 的共同事实，而 Local History 是单 Session continuation。`representation: full` 等可信映射允许排除整个已共享 span；安全的单消息 `summary` link 只有在 Session/message identity 与版本化内容 digest 都一致时才排除已共享 text block，并保留 reasoning/非文本内容。durable range 末尾的 `step/end`、`turn/end` 不作为消息边界，但范围内出现额外消息会使证明失效。对方新增 Shared Event 不必然改变本 Agent 的 Local History，tool call/result、未完成 continuation 和尚未证明可排除的消息仍保留。Local History 若只在尾部增长仍可能复用自身前缀，但删除或重组 span 会使较早位置发生变化。因此当前方案优先跨 Agent 公共前缀，接受一部分同 Agent Local History 缓存损失。
+3. Active Role Reminder 位于 Local History 之后、Current Trigger 之前。它对同一角色通常稳定，但 Navigator/Pilot 内容必然不同；其位置影响的是后续全部 token 能否继续复用，而不只是 Reminder 自身长度。把它后置既避免角色 selector 过早截断公共前缀，也让身份说明靠近本轮 Trigger。由于两条 Local History 已可能先分叉，不能把 Active Role 笼统称为整个请求的“第一处差异”；它是 Host 明确引入的第一个角色选择差异。
+
+这是一项有意选择：当前请求布局优先 `跨 Agent 共同事实与公共前缀`，其次才是 `单 Agent Local History 的最大缓存复用`。Shared Head 前进时，Shared Events 之后的 Projection、Local History、Reminder 和 Trigger 可能无法继续命中同一前缀缓存；同一 Shared Head 内的工具续接则通常只从 Local History 开始变化。最终收益必须由分段观测和 Provider usage 验证。
 
 ### 15.8 User-role Active Role Reminder
 

@@ -1,7 +1,6 @@
 import {
   createPairSessionIds,
   MAX_PAIR_MESSAGE_BYTES,
-  MAX_PEER_HOPS,
   parsePairId,
   type JsonObject,
   type PairEvent,
@@ -9,13 +8,16 @@ import {
 } from '@pair-agent/contracts';
 
 import {
+  CanonicalDirectedCausalityError,
+  deriveCanonicalDirectedCausality,
+} from './canonical-directed-causality.js';
+import { isCanonicalDirectedPeerMessage } from './peer-message-event.js';
+import {
   DeliveryPendingError,
   InvalidCommandError,
   PairCoordinator,
-  pairEventId,
   type DeliveryResult,
 } from './coordinator.js';
-import { isCanonicalDirectedPeerMessage } from './peer-message-event.js';
 
 export interface PeerMessageToolExecutionContext {
   readonly agentId?: string;
@@ -43,8 +45,10 @@ export interface PeerMessageExecutionPort {
   ): Promise<PeerMessageTurnProvenance>;
 }
 
-export interface PeerMessageArgs extends JsonObject {
+export interface PeerMessageArgs {
   readonly text: string;
+  readonly expectsReply?: true;
+  readonly replyTo?: string;
 }
 
 export type PeerMessageSendResult =
@@ -81,14 +85,17 @@ export interface PeerMessageToolDefinition {
 }
 
 function validateArgs(args: JsonObject): PeerMessageArgs {
+  const allowedKeys = new Set(['text', 'expectsReply', 'replyTo']);
   if (
     typeof args !== 'object' ||
     args === null ||
     Array.isArray(args) ||
-    Object.keys(args).length !== 1 ||
+    !Object.keys(args).every((key) => allowedKeys.has(key)) ||
     !Object.hasOwn(args, 'text')
   ) {
-    throw new PeerMessagePolicyError('Peer Message arguments must contain only text');
+    throw new PeerMessagePolicyError(
+      'Peer Message arguments may contain only text, expectsReply, and replyTo',
+    );
   }
   const text = args.text;
   if (
@@ -100,7 +107,51 @@ function validateArgs(args: JsonObject): PeerMessageArgs {
       `Peer Message text must be non-empty and at most ${MAX_PAIR_MESSAGE_BYTES} UTF-8 bytes`,
     );
   }
-  return { text };
+  if (
+    args.expectsReply !== undefined &&
+    typeof args.expectsReply !== 'boolean'
+  ) {
+    throw new PeerMessagePolicyError('Peer Message expectsReply must be boolean');
+  }
+  if (
+    args.replyTo !== undefined &&
+    (typeof args.replyTo !== 'string' ||
+      args.replyTo.trim() === '' ||
+      args.replyTo.length > 160)
+  ) {
+    throw new PeerMessagePolicyError(
+      'Peer Message replyTo must be a non-empty Pair Event ID of at most 160 characters',
+    );
+  }
+  if (args.expectsReply === true && args.replyTo !== undefined) {
+    throw new PeerMessagePolicyError(
+      'A Peer Message reply cannot request another reply',
+    );
+  }
+  return {
+    text,
+    ...(args.expectsReply === true ? { expectsReply: true } : {}),
+    ...(typeof args.replyTo === 'string' ? { replyTo: args.replyTo } : {}),
+  };
+}
+
+function validateReplyBinding(
+  provenance: PeerMessageTurnProvenance,
+  replyTo: string | undefined,
+): void {
+  if (replyTo === undefined) return;
+  const matches = provenance.inputEvents.filter(
+    (event) =>
+      `${event.pairId}:${String(event.seq)}` === replyTo &&
+      isCanonicalDirectedPeerMessage(event) &&
+      event.channel === provenance.senderRole &&
+      event.payload.expectsReply === true,
+  );
+  if (matches.length !== 1) {
+    throw new PeerMessagePolicyError(
+      'Peer Message replyTo must identify the current reply-required Peer request',
+    );
+  }
 }
 
 function pendingMessage(error: DeliveryPendingError): string {
@@ -113,58 +164,15 @@ function pendingMessage(error: DeliveryPendingError): string {
 function deriveCausality(
   provenance: PeerMessageTurnProvenance,
 ): { readonly causalRootId: string; readonly hop: number } {
-  if (provenance.inputEvents.length === 0) {
-    throw new PeerMessagePolicyError(
-      'Peer Message requires one durable current-Turn input provenance',
-    );
-  }
   const pairId = parsePairId(provenance.pairId);
-  if (provenance.inputEvents.some((event) => event.pairId !== pairId)) {
-    throw new PeerMessagePolicyError('Peer Message input provenance crosses Pair identity');
-  }
-  const ordinaryAgentMessage = provenance.inputEvents.find(
-    (event) => event.type === 'agent.message' && !isCanonicalDirectedPeerMessage(event),
-  );
-  if (ordinaryAgentMessage !== undefined) {
-    throw new PeerMessagePolicyError(
-      'Ordinary agent.message cannot trigger Peer Message causality',
-    );
-  }
-
-  const peerInputs = provenance.inputEvents.filter(isCanonicalDirectedPeerMessage);
-  if (peerInputs.length > 0) {
-    if (peerInputs.length !== provenance.inputEvents.length) {
-      throw new PeerMessagePolicyError('Peer Message input provenance is ambiguous');
+  try {
+    return deriveCanonicalDirectedCausality(pairId, provenance.inputEvents);
+  } catch (error) {
+    if (error instanceof CanonicalDirectedCausalityError) {
+      throw new PeerMessagePolicyError(error.message, { cause: error });
     }
-    const roots = new Set(
-      peerInputs.map((event) => String(event.payload.causalRootId)),
-    );
-    if (roots.size !== 1) {
-      throw new PeerMessagePolicyError(
-        'One sender Turn cannot combine multiple Peer Message causal roots',
-      );
-    }
-    const inputHop = Math.max(
-      ...peerInputs.map((event) => Number(event.payload.hop)),
-    );
-    const nextHop = inputHop + 1;
-    if (nextHop > MAX_PEER_HOPS) {
-      throw new PeerMessagePolicyError(
-        `Peer Message hop ${String(nextHop)} exceeds the limit ${MAX_PEER_HOPS}`,
-      );
-    }
-    return { causalRootId: [...roots][0]!, hop: nextHop };
+    throw error;
   }
-
-  const roots = provenance.inputEvents.filter(
-    (event) => event.type === 'user.message' || event.type === 'task.assigned',
-  );
-  if (roots.length !== 1 || roots.length !== provenance.inputEvents.length) {
-    throw new PeerMessagePolicyError(
-      'Peer Message requires exactly one user, Task, native-composer, or peer input root',
-    );
-  }
-  return { causalRootId: pairEventId(roots[0]!), hop: 1 };
 }
 
 export class PeerMessageService {
@@ -215,7 +223,7 @@ export class PeerMessageService {
     context: PeerMessageServiceContext,
     args: JsonObject,
   ): Promise<PeerMessageSendResult> {
-    const { text } = validateArgs(args);
+    const { text, expectsReply, replyTo } = validateArgs(args);
     if (
       context.agentId !== context.sessionId ||
       !Number.isSafeInteger(context.turn) ||
@@ -236,6 +244,7 @@ export class PeerMessageService {
         'Peer Message sender role is not bound to the active Session',
       );
     }
+    validateReplyBinding(provenance, replyTo);
     const { causalRootId, hop } = deriveCausality(provenance);
     const sourceIdentity =
       `dsh:${context.sessionId}:turn:${String(context.turn)}:peer-message`;
@@ -249,6 +258,8 @@ export class PeerMessageService {
         text,
         causalRootId,
         hop,
+        ...(expectsReply === true ? { expectsReply: true } : {}),
+        ...(replyTo === undefined ? {} : { replyTo }),
       });
       return { ...delivered, status: 'delivered' };
     } catch (error) {
@@ -280,6 +291,8 @@ export class PeerMessageRouter {
         required: ['text'],
         properties: {
           text: { type: 'string', minLength: 1, maxLength: 65_536 },
+          expectsReply: { type: 'boolean' },
+          replyTo: { type: 'string', minLength: 1, maxLength: 160 },
         },
       },
       execute: async (args, context) => {

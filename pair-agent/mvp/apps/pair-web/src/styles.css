@@ -153,6 +153,28 @@ dt {
   background: #111615;
 }
 
+.pair-header__capabilities {
+  grid-column: span 3;
+}
+
+.capability-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.capability-list li {
+  border: 1px solid #28534d;
+  border-radius: 999px;
+  padding: 4px 8px;
+  color: #9fe4d9;
+  background: #10211e;
+  font-size: 0.76rem;
+}
+
 dd {
   margin: 0;
   overflow-wrap: anywhere;
@@ -394,6 +416,10 @@ small {
   .pair-header__grid,
   .pair-shell__panes {
     grid-template-columns: 1fr;
+  }
+
+  .pair-header__capabilities {
+    grid-column: auto;
   }
 
   .pair-pane__heading {

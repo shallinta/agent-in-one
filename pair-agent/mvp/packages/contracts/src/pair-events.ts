@@ -19,7 +19,11 @@ export interface DshMessageOrigin {
 
 export interface PairMessagePayload {
   schemaVersion: 1;
-  kind: 'user-input' | 'turn-output' | 'peer-message';
+  kind:
+    | 'user-input'
+    | 'turn-output'
+    | 'peer-message'
+    | 'completion-handoff';
   text: string;
   content: readonly JsonObject[];
   completion?: 'complete' | 'partial';
@@ -27,6 +31,8 @@ export interface PairMessagePayload {
   deliveryId?: string;
   causalRootId?: string;
   hop?: number;
+  expectsReply?: boolean;
+  replyTo?: string;
 }
 
 export interface SessionEventLinkedPayload {
@@ -37,6 +43,22 @@ export interface SessionEventLinkedPayload {
   messageIds: readonly string[];
   pairEventId: string;
   representation: 'full' | 'summary' | 'artifact-ref';
+  representedContentDigest?: string;
+}
+
+export interface DshTurnOrigin {
+  schemaVersion: 1;
+  sessionId: string;
+  sessionEventSeq: number;
+}
+
+export interface AgentTurnFailedPayload {
+  schemaVersion: 1;
+  failedRole: 'navigator' | 'pilot';
+  failedTurn: number;
+  code: string;
+  message: string;
+  origin: DshTurnOrigin;
 }
 
 export type SessionEventsView = 'semantic' | 'all';
@@ -67,6 +89,8 @@ const MESSAGE_KEYS = new Set([
   'deliveryId',
   'causalRootId',
   'hop',
+  'expectsReply',
+  'replyTo',
 ]);
 const ORIGIN_KEYS = new Set([
   'schemaVersion',
@@ -83,6 +107,20 @@ const LINK_KEYS = new Set([
   'messageIds',
   'pairEventId',
   'representation',
+  'representedContentDigest',
+]);
+const TURN_FAILURE_KEYS = new Set([
+  'schemaVersion',
+  'failedRole',
+  'failedTurn',
+  'code',
+  'message',
+  'origin',
+]);
+const TURN_ORIGIN_KEYS = new Set([
+  'schemaVersion',
+  'sessionId',
+  'sessionEventSeq',
 ]);
 
 function assertPlainObject(
@@ -273,7 +311,7 @@ function assertMessagePayload(
   const allowedKinds =
     type === 'user.message'
       ? new Set(['user-input'])
-      : new Set(['turn-output', 'peer-message']);
+      : new Set(['turn-output', 'peer-message', 'completion-handoff']);
   if (typeof payload.kind !== 'string' || !allowedKinds.has(payload.kind)) {
     throw new TypeError(`payload.kind is invalid for ${type}`);
   }
@@ -303,16 +341,37 @@ function assertMessagePayload(
       throw new TypeError(`payload.hop must be between 0 and ${MAX_PEER_HOPS}`);
     }
   }
+  if (
+    payload.expectsReply !== undefined &&
+    typeof payload.expectsReply !== 'boolean'
+  ) {
+    throw new TypeError('payload.expectsReply must be boolean');
+  }
+  if (payload.replyTo !== undefined) {
+    assertNonEmptyString(payload.replyTo, 'payload.replyTo');
+    if ((payload.replyTo as string).length > 160) {
+      throw new TypeError('payload.replyTo must not exceed 160 characters');
+    }
+  }
 
   if (payload.kind === 'turn-output') {
     if (payload.completion !== 'complete' && payload.completion !== 'partial') {
       throw new TypeError('payload.completion is required for turn-output');
     }
+  } else if (payload.kind === 'completion-handoff') {
+    if (payload.completion !== 'complete') {
+      throw new TypeError(
+        'payload.completion must be complete for completion-handoff',
+      );
+    }
   } else if (payload.completion !== undefined) {
     throw new TypeError(`payload.completion is invalid for ${payload.kind}`);
   }
 
-  if (payload.kind === 'peer-message') {
+  if (
+    payload.kind === 'peer-message' ||
+    payload.kind === 'completion-handoff'
+  ) {
     assertNonEmptyString(payload.causalRootId, 'payload.causalRootId');
     if (
       !Number.isSafeInteger(payload.hop) ||
@@ -321,6 +380,21 @@ function assertMessagePayload(
     ) {
       throw new TypeError(`payload.hop must be between 1 and ${MAX_PEER_HOPS}`);
     }
+  }
+  if (payload.kind === 'peer-message') {
+    if (payload.expectsReply === false) {
+      throw new TypeError('payload.expectsReply must be omitted when false');
+    }
+    if (payload.replyTo !== undefined && payload.expectsReply === true) {
+      throw new TypeError('payload.replyTo cannot request another reply');
+    }
+  } else if (
+    payload.expectsReply !== undefined ||
+    payload.replyTo !== undefined
+  ) {
+    throw new TypeError(
+      `payload reply metadata is invalid for ${payload.kind}`,
+    );
   }
 }
 
@@ -363,6 +437,61 @@ function assertLinkedPayload(
   ) {
     throw new TypeError('payload.representation is invalid');
   }
+  if (payload.representation === 'summary') {
+    if (payload.messageIds.length !== 1) {
+      throw new TypeError(
+        'payload.messageIds must contain one message for summary',
+      );
+    }
+    if (
+      typeof payload.representedContentDigest !== 'string' ||
+      !/^sha256:[0-9a-f]{64}$/.test(payload.representedContentDigest)
+    ) {
+      throw new TypeError(
+        'payload.representedContentDigest must be a sha256 digest for summary',
+      );
+    }
+  } else if (payload.representedContentDigest !== undefined) {
+    throw new TypeError(
+      'payload.representedContentDigest is valid only for summary',
+    );
+  }
+}
+
+function assertTurnFailurePayload(
+  payload: unknown,
+): asserts payload is AgentTurnFailedPayload & JsonObject {
+  assertPlainObject(payload, 'payload');
+  assertJsonSafe(payload, 'payload', new Set());
+  assertExactKeys(payload, TURN_FAILURE_KEYS, 'payload');
+  if (payload.schemaVersion !== 1) {
+    throw new TypeError('payload.schemaVersion must be 1');
+  }
+  if (payload.failedRole !== 'navigator' && payload.failedRole !== 'pilot') {
+    throw new TypeError('payload.failedRole is invalid');
+  }
+  assertSafeNonNegativeInteger(payload.failedTurn, 'payload.failedTurn');
+  if ((payload.failedTurn as number) === 0) {
+    throw new TypeError('payload.failedTurn must be positive');
+  }
+  assertNonEmptyString(payload.code, 'payload.code');
+  assertNonEmptyString(payload.message, 'payload.message');
+  if (
+    new TextEncoder().encode(payload.message as string).byteLength >
+    MAX_PAIR_MESSAGE_BYTES
+  ) {
+    throw new TypeError('payload.message must not exceed 64 KiB of UTF-8');
+  }
+  assertPlainObject(payload.origin, 'payload.origin');
+  assertExactKeys(payload.origin, TURN_ORIGIN_KEYS, 'payload.origin');
+  if (payload.origin.schemaVersion !== 1) {
+    throw new TypeError('payload.origin.schemaVersion must be 1');
+  }
+  assertNonEmptyString(payload.origin.sessionId, 'payload.origin.sessionId');
+  assertSafeNonNegativeInteger(
+    payload.origin.sessionEventSeq,
+    'payload.origin.sessionEventSeq',
+  );
 }
 
 export function assertP05PairEventPayload(
@@ -374,19 +503,39 @@ export function assertP05PairEventPayload(
   payload: unknown,
 ): SessionEventLinkedPayload & JsonObject;
 export function assertP05PairEventPayload(
-  type: 'user.message' | 'agent.message' | 'session_event.linked',
+  type: 'agent.turn_failed',
   payload: unknown,
-): (PairMessagePayload | SessionEventLinkedPayload) & JsonObject;
+): AgentTurnFailedPayload & JsonObject;
+export function assertP05PairEventPayload(
+  type:
+    | 'user.message'
+    | 'agent.message'
+    | 'agent.turn_failed'
+    | 'session_event.linked',
+  payload: unknown,
+): (
+  | PairMessagePayload
+  | AgentTurnFailedPayload
+  | SessionEventLinkedPayload
+) & JsonObject;
 export function assertP05PairEventPayload(
   type: PairEventType,
   payload: unknown,
-): (PairMessagePayload | SessionEventLinkedPayload) & JsonObject {
+): (
+  | PairMessagePayload
+  | AgentTurnFailedPayload
+  | SessionEventLinkedPayload
+) & JsonObject {
   if (type === 'user.message' || type === 'agent.message') {
     assertMessagePayload(type, payload);
     return payload;
   }
   if (type === 'session_event.linked') {
     assertLinkedPayload(payload);
+    return payload;
+  }
+  if (type === 'agent.turn_failed') {
+    assertTurnFailurePayload(payload);
     return payload;
   }
   throw new TypeError(`${type} does not have a P0.5 payload contract`);
@@ -403,4 +552,61 @@ export function isPeerAgentMessage(event: PairEvent): boolean {
     !Array.isArray(event.payload) &&
     event.payload.kind === 'peer-message'
   );
+}
+
+export function isCompletionHandoffAgentMessage(event: PairEvent): boolean {
+  const payload = event.payload;
+  const origin = plainObjectValue(payload.origin);
+  const content = payload.content;
+  const contentBlock = Array.isArray(content) ? content[0] : undefined;
+  const textBlock = plainObjectValue(contentBlock);
+  const sourceEventIds = event.refs.sourceEventIds;
+  return (
+    event.type === 'agent.message' &&
+    event.actor.kind === 'agent' &&
+    event.actor.role === 'pilot' &&
+    event.source === 'pilot-session' &&
+    event.channel === 'navigator' &&
+    event.visibility === 'shared' &&
+    event.authority === 'pilot' &&
+    payload.schemaVersion === 1 &&
+    payload.kind === 'completion-handoff' &&
+    typeof payload.text === 'string' &&
+    payload.text.trim().length > 0 &&
+    new TextEncoder().encode(payload.text).byteLength <= MAX_PAIR_MESSAGE_BYTES &&
+    Array.isArray(content) &&
+    content.length === 1 &&
+    textBlock !== undefined &&
+    Object.keys(textBlock).length === 2 &&
+    textBlock.type === 'text' &&
+    textBlock.text === payload.text &&
+    payload.completion === 'complete' &&
+    payload.deliveryId === undefined &&
+    typeof payload.causalRootId === 'string' &&
+    payload.causalRootId.trim().length > 0 &&
+    Number.isSafeInteger(payload.hop) &&
+    (payload.hop as number) >= 1 &&
+    (payload.hop as number) <= MAX_PEER_HOPS &&
+    origin !== undefined &&
+    origin.schemaVersion === 1 &&
+    origin.sessionId === `pair:${event.pairId}:pilot` &&
+    Number.isSafeInteger(origin.sessionEventSeq) &&
+    (origin.sessionEventSeq as number) >= 0 &&
+    Number.isSafeInteger(origin.turn) &&
+    (origin.turn as number) > 0 &&
+    typeof origin.messageId === 'string' &&
+    origin.messageId.length > 0 &&
+    sourceEventIds?.length === 1 &&
+    sourceEventIds[0] ===
+      `dsh:${origin.sessionId}:${String(origin.sessionEventSeq)}:agent.message`
+  );
+}
+
+function plainObjectValue(
+  value: unknown,
+): Record<string, unknown> | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  return value as Record<string, unknown>;
 }

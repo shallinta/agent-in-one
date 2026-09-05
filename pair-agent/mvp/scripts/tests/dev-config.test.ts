@@ -11,7 +11,25 @@ describe('Phase 0 dev configuration', () => {
     const config = readPhase0DevConfig({});
     expect(config.dataRoot).toBe(join(homedir(), '.pair-agent', 'p0.5'));
     expect(config.provider).toEqual({ kind: 'capture', model: 'capture-model' });
+    expect(config.webSearch).toEqual({
+      enabled: true,
+      apiKeyEnv: 'DEEPSEEK_API_KEY',
+    });
     expect(config.ports).toEqual({ pairWeb: 3070, dshWeb: 3080, pairHost: 3090 });
+  });
+
+  test('allows native DeepSeek web search to be disabled or use another credential reference', () => {
+    expect(readPhase0DevConfig({
+      PAIR_WEB_SEARCH_ENABLED: '0',
+      PAIR_WEB_SEARCH_API_KEY_ENV: 'PAIR_SEARCH_KEY',
+    }).webSearch).toEqual({
+      enabled: false,
+      apiKeyEnv: 'PAIR_SEARCH_KEY',
+    });
+    expect(() => readPhase0DevConfig({ PAIR_WEB_SEARCH_ENABLED: 'yes' }))
+      .toThrow(/PAIR_WEB_SEARCH_ENABLED/);
+    expect(() => readPhase0DevConfig({ PAIR_WEB_SEARCH_API_KEY_ENV: 'bad key' }))
+      .toThrow(/PAIR_WEB_SEARCH_API_KEY_ENV/);
   });
 
   test('requires a complete OpenAI-compatible tuple and absolute data root', () => {

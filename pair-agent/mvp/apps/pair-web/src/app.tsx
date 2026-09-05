@@ -12,6 +12,7 @@ import {
   validateProjectionUpdate,
   type PairWebConfig,
   type ValidatedPairPane,
+  type ValidatedPairResponse,
 } from './pair-client.js';
 import { PairHeaderView } from './pair-header.js';
 import { PairMessageForm } from './pair-message-form.js';
@@ -31,6 +32,7 @@ interface LoadedState {
   readonly pairId: string;
   readonly projection: PairProjection;
   readonly panes: readonly [ValidatedPairPane, ValidatedPairPane];
+  readonly capabilities: ValidatedPairResponse['capabilities'];
 }
 
 type AppState =
@@ -226,6 +228,7 @@ export function App({
     <main className="pair-shell">
       <PairHeaderView
         projection={state.projection}
+        capabilities={state.capabilities}
         connectionState={state.kind}
         onOpenSessionEvents={() => setSessionEventsOpen(true)}
         sessionEventsButtonRef={sessionEventsButtonRef}

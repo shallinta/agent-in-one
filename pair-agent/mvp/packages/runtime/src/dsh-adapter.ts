@@ -28,6 +28,7 @@ import {
   PairRequestBindingError,
   PairRequestPlugin,
   createPairDeliveryMessageInput,
+  rebuildAcceptedPairDeliveryIds,
   type PersistedPairRequest,
 } from './pair-request-plugin.js';
 import {
@@ -44,6 +45,9 @@ import type {
 import type { DshSessionEvent } from './session-event-derive.js';
 import {
   SessionToPairBridge,
+  type CompletionHandoffDeliveryInput,
+  type CompletionHandoffDeliveryPort,
+  type TurnFailureDeliveryInput,
   type PairSessionBridgePort,
 } from './session-to-pair-bridge.js';
 import type {
@@ -151,6 +155,9 @@ interface DshContext {
   readonly tools: {
     register(tool: object): () => void;
     schemas(scope?: unknown): readonly JsonObject[];
+    guard(
+      guard: (execution: { readonly name: string }) => string | undefined,
+    ): () => void;
   };
   readonly systemPrompt: {
     assemble(): Promise<{ readonly tools: readonly JsonObject[] }>;
@@ -340,6 +347,17 @@ export interface OpenAiCompletionsProviderOptions {
   readonly compatibility?: 'openai' | 'deepseek';
 }
 
+export interface DshWebSearchOptions {
+  readonly apiKeyEnv: string;
+  readonly baseURL?: string;
+  readonly model?: string;
+  readonly maxTokens?: number;
+  readonly maxUses?: number;
+  readonly maxResults?: number;
+  readonly maxQueries?: number;
+  readonly timeoutMs?: number;
+}
+
 export interface DshPairAgentAdapterOptions {
   readonly source: DshSourceOptions;
   readonly store: JsonlPairLedgerStore;
@@ -349,6 +367,8 @@ export interface DshPairAgentAdapterOptions {
   readonly model: string;
   readonly capture?: CaptureProviderOptions;
   readonly openai?: OpenAiCompletionsProviderOptions;
+  /** DSH-native search-only web capability. Omitted means no web tool is mounted. */
+  readonly webSearch?: DshWebSearchOptions;
   readonly tools?: readonly DshPairToolDefinition[];
   readonly requestDefaults?: {
     readonly maxTokens?: number;
@@ -362,6 +382,7 @@ export interface DshPairAgentAdapterOptions {
   readonly lifecycleFaults?: {
     afterAgentOpened?(): void;
     beforeBridgeRead?(sessionId: string, fromSeq: number): Promise<void> | void;
+    beforeCompletionHandoffDelivery?(input: CompletionHandoffDeliveryInput): Promise<void> | void;
     beforeDispose?(reason: 'rollback' | 'release' | 'close'): Promise<void> | void;
     /** Hosted capture-runtime fault injection only. */
     beforeHostedContextDispose?(): void;
@@ -468,6 +489,19 @@ function assertExactToolCatalog(
   if (canonicalToolCatalog(actual) === canonicalToolCatalog(expected)) return;
   throw new PairRequestBindingError(
     `DSH ${boundary} tool catalog must exactly equal the Pair allowlist`,
+  );
+}
+
+function assertExactToolNames(
+  actual: readonly JsonObject[],
+  expectedNames: readonly string[],
+  boundary: string,
+): void {
+  const actualNames = actual.map(({ name }) => String(name)).sort();
+  const expected = [...expectedNames].sort();
+  if (canonicalJsonStringify(actualNames) === canonicalJsonStringify(expected)) return;
+  throw new PairRequestBindingError(
+    `DSH ${boundary} native tool catalog must exactly equal the Pair allowlist`,
   );
 }
 
@@ -980,7 +1014,11 @@ export function validatePairRequestCoordinates(
   return requests;
 }
 
-export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPort {
+export class DshPairAgentAdapter implements
+  AgentAdapter,
+  PeerMessageExecutionPort,
+  CompletionHandoffDeliveryPort
+{
   readonly closeOwnsHandles = true as const;
   readonly #handles = new Map<string, DshOwnedAgentHandle>();
   readonly #pairHandles = new WeakMap<PairAgentHandle, DshOwnedAgentHandle>();
@@ -1060,7 +1098,12 @@ export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPo
     context: DshContext,
     ownsContext: boolean,
   ): Promise<DshPairAgentAdapter> {
-    assertExactToolCatalog(context.tools.schemas(), [], 'pre-registration');
+    const nativeToolSchemas = context.tools.schemas();
+    assertExactToolNames(
+      nativeToolSchemas,
+      options.webSearch === undefined ? [] : ['web_search'],
+      'pre-registration',
+    );
     const definitions = (options.tools ?? []).map((tool) => {
       const properties = jsonRecord(tool.parameters.properties);
       const required = Array.isArray(tool.parameters.required)
@@ -1105,11 +1148,14 @@ export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPo
           })
         : definition;
     });
-    const expectedToolSchemas = definitions.map(({ name, description, parameters }) => ({
-      name,
-      description,
-      parameters,
-    }));
+    const expectedToolSchemas = [
+      ...structuredClone(nativeToolSchemas),
+      ...definitions.map(({ name, description, parameters }) => ({
+        name,
+        description,
+        parameters,
+      })),
+    ];
     for (const definition of definitions) context.tools.register(definition);
     const registeredTools = context.tools.schemas();
     assertExactToolCatalog(registeredTools, expectedToolSchemas, 'global');
@@ -1222,6 +1268,7 @@ export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPo
     this.#bridge = new SessionToPairBridge(
       this.observationPort(),
       new PairDerivedEventWriter(registry),
+      this,
     );
   }
 
@@ -1467,17 +1514,30 @@ export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPo
         }
       },
     });
+    const setupPairScope = (scope: unknown): void => {
+      const scoped = scope as Parameters<PairRequestPlugin['install']>[0] & {
+        readonly tools: DshContext['tools'];
+      };
+      plugin.install(scoped);
+      if (input.role === 'navigator' && this.options.webSearch !== undefined) {
+        scoped.tools.guard((execution) =>
+          execution.name === 'web_search'
+            ? 'Navigator cannot execute web_search; delegate web research to Pilot.'
+            : undefined,
+        );
+      }
+    };
     const createOptions = {
       agentOptions: {
         provider: this.options.provider,
         model: this.options.model,
         ...this.options.requestDefaults,
       },
-      setup: (scope: unknown) => plugin.install(scope as Parameters<PairRequestPlugin['install']>[0]),
+      setup: setupPairScope,
     };
     if (this.options.capture?.retryFailures === true) {
       createOptions.setup = (scope: unknown): void => {
-        plugin.install(scope as Parameters<PairRequestPlugin['install']>[0]);
+        setupPairScope(scope);
         (scope as {
           on(
             name: 'agent/request-error',
@@ -1525,9 +1585,17 @@ export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPo
         );
       }
       const prepared = this.#makePrepared(input, handle);
+      const durablePairEvents = await this.options.store.read(pairId);
+      const acceptedDeliveryIds = rebuildAcceptedPairDeliveryIds(
+        handle.agent.session.events
+          .filter((event) => event.type === 'user/message')
+          .map((event) => jsonRecord(event.data) ?? {}),
+        durablePairEvents,
+        input.role,
+      );
       this.#handles.set(input.sessionId, handle);
       this.#bindings.set(input.sessionId, { pairId, role: input.role });
-      this.#deliveries.set(input.sessionId, new Set());
+      this.#deliveries.set(input.sessionId, acceptedDeliveryIds);
       this.#artifacts.set(input.sessionId, {
         path: location.path,
         compression: 'none',
@@ -1722,6 +1790,85 @@ export class DshPairAgentAdapter implements AgentAdapter, PeerMessageExecutionPo
     // Admission is intentionally the Promise boundary. Waiting for Provider
     // completion here would hold PairRegistry's command mutation queue while
     // request-layout performs its own durable CAS append.
+  }
+
+  async deliverCompletion(
+    input: CompletionHandoffDeliveryInput,
+  ): Promise<void> {
+    const pairId = parsePairId(input.pairId);
+    const prefix = `${pairId}:`;
+    const seqText = input.pairEventId.startsWith(prefix)
+      ? input.pairEventId.slice(prefix.length)
+      : '';
+    if (
+      input.senderRole !== 'pilot' ||
+      !Number.isSafeInteger(input.senderTurn) ||
+      input.senderTurn <= 0 ||
+      !/^[1-9][0-9]*$/.test(seqText) ||
+      !Number.isSafeInteger(Number(seqText))
+    ) {
+      throw new PairRequestBindingError(
+        'Completion handoff delivery reference is invalid',
+      );
+    }
+    const navigatorSessionId = createPairSessionIds(pairId).navigatorSessionId;
+    const binding = this.#bindings.get(navigatorSessionId);
+    if (
+      binding?.pairId !== pairId ||
+      binding.role !== 'navigator'
+    ) {
+      throw new PairRequestBindingError(
+        `Completion handoff target Navigator is not bound for Pair ${pairId}`,
+      );
+    }
+    await this.options.lifecycleFaults?.beforeCompletionHandoffDelivery?.(input);
+    await this.followup({
+      sessionId: navigatorSessionId,
+      deliveryId: input.pairEventId,
+      trigger: {
+        kind: 'completion-handoff',
+        pairEventId: input.pairEventId,
+        senderRole: 'pilot',
+        senderTurn: input.senderTurn,
+      },
+    });
+  }
+
+  async deliverTurnFailure(input: TurnFailureDeliveryInput): Promise<void> {
+    const pairId = parsePairId(input.pairId);
+    const prefix = `${pairId}:`;
+    const seqText = input.pairEventId.startsWith(prefix)
+      ? input.pairEventId.slice(prefix.length)
+      : '';
+    if (
+      input.failedRole !== 'pilot' ||
+      !Number.isSafeInteger(input.failedTurn) ||
+      input.failedTurn < 0 ||
+      typeof input.code !== 'string' ||
+      input.code.trim() === '' ||
+      !/^[1-9][0-9]*$/.test(seqText) ||
+      !Number.isSafeInteger(Number(seqText))
+    ) {
+      throw new PairRequestBindingError('Turn failure delivery reference is invalid');
+    }
+    const navigatorSessionId = createPairSessionIds(pairId).navigatorSessionId;
+    const binding = this.#bindings.get(navigatorSessionId);
+    if (binding?.pairId !== pairId || binding.role !== 'navigator') {
+      throw new PairRequestBindingError(
+        `Turn failure target Navigator is not bound for Pair ${pairId}`,
+      );
+    }
+    await this.followup({
+      sessionId: navigatorSessionId,
+      deliveryId: input.pairEventId,
+      trigger: {
+        kind: 'agent.turn_failed',
+        pairEventId: input.pairEventId,
+        failedRole: 'pilot',
+        failedTurn: input.failedTurn,
+        code: input.code,
+      },
+    });
   }
 
   async whenIdle(sessionId: string): Promise<void> {
@@ -2312,13 +2459,13 @@ async function createSafePreset(root: string): Promise<string> {
   await Promise.all([
     writeFile(
       join(presetDirectory, 'preset.yml'),
-      'name: Pair Safe\ndescription: Pair Agent Phase 0 harmless-tool-only preset.\norder: 1\n',
+      'name: Pair Safe\ndescription: Pair Agent P0.5 runtime-owned capability preset.\norder: 1\n',
       { flag: 'w' },
     ),
     writeFile(
       join(presetDirectory, 'agent.cordis.yml'),
       [
-        '# Pair Phase 0 intentionally contributes no shell, filesystem, network, workflow, or delegation tools.',
+        '# Pair P0.5 intentionally contributes no preset tools; Pair Host owns the exact capability composition.',
         '[]',
         '',
       ].join('\n'),
@@ -2387,7 +2534,53 @@ export async function launchDshPairWebRuntime(
     { id: 'session-telemetry-otel', disabled: true },
     { id: 'llm-deepseek', disabled: true },
     { id: 'llm-pi-ai', disabled: true },
-    { id: 'web-search-deepseek', disabled: true },
+    ...(options.webSearch === undefined
+      ? [
+          { id: 'web-search-deepseek', disabled: true },
+          { id: 'tool-web', disabled: true },
+        ]
+      : [
+          {
+            id: 'web',
+            config: { searchProvider: 'deepseek-official' },
+          },
+          {
+            id: 'web-search-deepseek',
+            disabled: false,
+            config: {
+              apiKeyEnv: options.webSearch.apiKeyEnv,
+              ...(options.webSearch.baseURL === undefined
+                ? {}
+                : { baseURL: options.webSearch.baseURL }),
+              ...(options.webSearch.model === undefined
+                ? {}
+                : { model: options.webSearch.model }),
+              ...(options.webSearch.maxTokens === undefined
+                ? {}
+                : { maxTokens: options.webSearch.maxTokens }),
+              ...(options.webSearch.maxUses === undefined
+                ? {}
+                : { maxUses: options.webSearch.maxUses }),
+            },
+          },
+          {
+            id: 'tool-web',
+            disabled: false,
+            config: {
+              search: true,
+              fetch: false,
+              ...(options.webSearch.maxResults === undefined
+                ? {}
+                : { searchMaxResults: options.webSearch.maxResults }),
+              ...(options.webSearch.maxQueries === undefined
+                ? {}
+                : { searchMaxQueries: options.webSearch.maxQueries }),
+              ...(options.webSearch.timeoutMs === undefined
+                ? { searchTimeoutMs: 60_000 }
+                : { searchTimeoutMs: options.webSearch.timeoutMs }),
+            },
+          },
+        ]),
     {
       id: 'agent-default-model',
       config: { provider: options.provider, model: options.model },

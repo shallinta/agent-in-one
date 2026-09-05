@@ -1123,6 +1123,12 @@ user:             Current Trigger（可选）
 
 同一个 Pair Session snapshot 中，Navigator/Pilot 的 Common Contract 与 Shared Context 使用字节一致的公共前缀；两条 Agent Local History 随后自然分叉，Reminder 位于各自 Local History 之后。Reminder 只能选择 Pair Contract 已定义的角色，不能授予权限或改变权威状态；有 Current Trigger 时紧邻其前，无 Trigger 的工具续接请求中作为最后一条消息。Harness 仍以 Agent Session binding、工具视图和状态校验执行确定性边界。
 
+该顺序明确优先跨 Agent 的共同事实与公共前缀，而不是单独最大化某一 Agent 的 Local History 缓存。Shared Context 中已经提交的 canonical event 不修改或重排；序列化时应把稳定事件放在前面，把会变化的 head、digest、统计和闭合边界放在末尾。这样已有事件仍可形成增长的稳定 token 前缀，但整个 Shared Context envelope 不必是旧字符串的严格尾部追加。
+
+Agent Local History 是否变化由本地 continuation 和 Shared Event 映射共同决定：只有存在可信完整映射时才能排除 Shared Context 已表达的本地 span；对方新增 Shared Event 不必然改变当前 Agent 的 Local History，reasoning、tool protocol span、未完成 continuation 和无法证明可安全排除的消息继续保留。仅尾部增长的 Local History 仍可能复用自身前缀，删除或重组则可能从更早位置分叉。
+
+Active Role 后置的理由也不是它自身足够短，而是任何较早的角色差异都会截断其后全部跨 Agent 缓存。两条 Local History 本来就可能先发生差异，因此 Active Role 是 Host 明确引入的第一个角色选择差异，而不保证是整个请求的第一处字节差异；它靠近 Current Trigger 还有利于模型识别本轮响应责任。
+
 ### 12.2 角色前置不属于当前保留位置协议
 
 ```text
@@ -1146,6 +1152,9 @@ user:             Agent Local State + Current Trigger
 - Prompt material identity 应覆盖实际 Common Pair Contract 与 Navigator/Pilot 两份 role guidance；任一实际字节变化都产生新身份，Runtime 在请求前校验身份与材料一致；
 - Tool schema 使用版本号并保持序列化顺序稳定；
 - 同一 snapshot 的 Shared Context 使用确定性序列化；
+- canonical Shared Event 保持 append-only；动态 head/digest 等尾部元数据不得放在稳定事件之前，且不把整个 envelope 误称为严格字符串追加；
+- Local History 的排除必须以可信完整映射为依据；允许其因 continuation 尾部增长或安全去重而变化，不假设每次 Shared Head 前进都会同步改变 Local History；
+- Active Role 放置关注的是第一个角色选择差异对后续前缀的影响，而不是只比较 Reminder 自身 token 数；
 - Navigator/Pilot 工具集合不同可能改变供应商缓存行为，不假设只有 messages 参与缓存；
 - 以 API 返回的 cached token 指标做实验，不把推测写成保证；
 - Checkpoint 更新会产生新的内容边界，接受其后的缓存重新建立。

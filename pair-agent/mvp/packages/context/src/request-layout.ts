@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 
 import {
   canonicalJsonStringify,
+  type JsonObject,
   type JsonValue,
   type PairEvent,
   type PairProjection,
@@ -63,6 +64,13 @@ export interface PairCurrentTrigger {
   deliveryId?: string;
   causalRootId?: string;
   hop?: number;
+  senderRole?: PairRole;
+  senderTurn?: number;
+  failedRole?: PairRole;
+  failedTurn?: number;
+  code?: string;
+  expectsReply?: true;
+  replyTo?: string;
 }
 
 export interface LayoutManifest {
@@ -101,6 +109,35 @@ export interface PairRequestSnapshot {
   configDigest: string;
   manifestDigest: string;
   fullRequestDigest: string;
+  segmentMeasurements: PairRequestSegmentMeasurements;
+}
+
+export type PairRequestSegmentName =
+  | 'common-system'
+  | 'shared-events'
+  | 'shared-projection'
+  | 'local-history'
+  | 'active-role'
+  | 'current-trigger'
+  | 'tool-schemas'
+  | 'request-config';
+
+export interface PairRequestSegmentMeasurement extends JsonObject {
+  name: PairRequestSegmentName;
+  utf8Bytes: number;
+  estimatedTokens: number;
+  itemCount: number;
+  digest: string;
+}
+
+export interface PairRequestSegmentMeasurements extends JsonObject {
+  schema: 'pair-request-segments/v1';
+  tokenEstimateMethod: 'utf8-bytes-div-4/v1';
+  segments: readonly PairRequestSegmentMeasurement[];
+  categorizedUtf8Bytes: number;
+  estimatedTokens: number;
+  sharedEventCount: number;
+  localMessageCount: number;
 }
 
 export interface PairRequestLayout {
@@ -154,6 +191,27 @@ function nonEmptyString(value: string, label: string): void {
 function sha256Canonical(value: unknown): string {
   const bytes = canonicalJsonStringify(value);
   return `sha256:${createHash('sha256').update(bytes, 'utf8').digest('hex')}`;
+}
+
+function segmentMeasurement(
+  name: PairRequestSegmentName,
+  material: unknown,
+  itemCount: number,
+  included = true,
+): PairRequestSegmentMeasurement {
+  const canonical = canonicalJsonStringify(material);
+  const utf8Bytes = included ? Buffer.byteLength(canonical, 'utf8') : 0;
+  return {
+    name,
+    utf8Bytes,
+    estimatedTokens: Math.ceil(utf8Bytes / 4),
+    itemCount: included ? itemCount : 0,
+    digest: sha256Canonical(material),
+  };
+}
+
+function collectionItemCount(value: JsonValue): number {
+  return Array.isArray(value) ? value.length : 1;
 }
 
 function buildActiveRoleReminder(
@@ -249,6 +307,13 @@ function validateInput(input: PairRequestLayoutInput): void {
       'deliveryId',
       'causalRootId',
       'hop',
+      'senderRole',
+      'senderTurn',
+      'failedRole',
+      'failedTurn',
+      'code',
+      'expectsReply',
+      'replyTo',
     ]);
     invariant(
       Object.keys(input.currentTrigger).every((key) => allowed.has(key)),
@@ -265,6 +330,31 @@ function validateInput(input: PairRequestLayoutInput): void {
         'currentTrigger.deliveryId',
       );
     }
+    if (input.currentTrigger.failedRole !== undefined) {
+      invariant(
+        input.currentTrigger.failedRole === 'navigator' ||
+          input.currentTrigger.failedRole === 'pilot',
+        'currentTrigger.failedRole is invalid',
+      );
+    }
+    if (input.currentTrigger.failedTurn !== undefined) {
+      positiveSafeInteger(
+        input.currentTrigger.failedTurn,
+        'currentTrigger.failedTurn',
+      );
+    }
+    if (input.currentTrigger.code !== undefined) {
+      nonEmptyString(input.currentTrigger.code, 'currentTrigger.code');
+    }
+    if (input.currentTrigger.expectsReply !== undefined) {
+      invariant(
+        input.currentTrigger.expectsReply === true,
+        'currentTrigger.expectsReply must be true when present',
+      );
+    }
+    if (input.currentTrigger.replyTo !== undefined) {
+      nonEmptyString(input.currentTrigger.replyTo, 'currentTrigger.replyTo');
+    }
     if (input.currentTrigger.causalRootId !== undefined) {
       nonEmptyString(
         input.currentTrigger.causalRootId,
@@ -273,6 +363,19 @@ function validateInput(input: PairRequestLayoutInput): void {
     }
     if (input.currentTrigger.hop !== undefined) {
       nonNegativeSafeInteger(input.currentTrigger.hop, 'currentTrigger.hop');
+    }
+    if (input.currentTrigger.senderRole !== undefined) {
+      invariant(
+        input.currentTrigger.senderRole === 'navigator' ||
+          input.currentTrigger.senderRole === 'pilot',
+        'currentTrigger.senderRole must be navigator or pilot',
+      );
+    }
+    if (input.currentTrigger.senderTurn !== undefined) {
+      positiveSafeInteger(
+        input.currentTrigger.senderTurn,
+        'currentTrigger.senderTurn',
+      );
     }
     canonicalJsonStringify(input.currentTrigger);
   }
@@ -308,15 +411,21 @@ export function buildPairRequestLayout(
     commonSystemPlacement === 'request-system'
       ? input.commonSystem.content
       : undefined;
+  const activeRoleReminder = buildActiveRoleReminder(
+    input.role,
+    input.roleToolGuidance,
+  );
+  const currentTrigger =
+    input.currentTrigger === undefined
+      ? undefined
+      : buildCurrentTrigger(input.currentTrigger);
   const messages: readonly NormalizedMessage[] = [
     ...(commonSystemPlacement === 'request-system'
       ? sharedPrefix.slice(1)
       : sharedPrefix),
     ...local.messages,
-    buildActiveRoleReminder(input.role, input.roleToolGuidance),
-    ...(input.currentTrigger === undefined
-      ? []
-      : [buildCurrentTrigger(input.currentTrigger)]),
+    activeRoleReminder,
+    ...(currentTrigger === undefined ? [] : [currentTrigger]),
   ];
   const manifest: LayoutManifest = {
     role: input.role,
@@ -340,6 +449,52 @@ export function buildPairRequestLayout(
   const toolsDigest = sha256Canonical(tools);
   const configDigest = sha256Canonical(config);
   const manifestDigest = sha256Canonical(manifest);
+  const segments: readonly PairRequestSegmentMeasurement[] = [
+    segmentMeasurement(
+      'common-system',
+      system ?? sharedPrefix[0],
+      1,
+    ),
+    segmentMeasurement('shared-events', sharedPrefix[1], 1),
+    segmentMeasurement('shared-projection', sharedPrefix[2], 1),
+    segmentMeasurement(
+      'local-history',
+      local.messages as unknown as JsonValue,
+      local.messages.length,
+    ),
+    segmentMeasurement('active-role', activeRoleReminder, 1),
+    segmentMeasurement(
+      'current-trigger',
+      currentTrigger ?? null,
+      1,
+      currentTrigger !== undefined,
+    ),
+    segmentMeasurement(
+      'tool-schemas',
+      tools,
+      collectionItemCount(tools),
+    ),
+    segmentMeasurement(
+      'request-config',
+      config,
+      collectionItemCount(config),
+    ),
+  ];
+  const segmentMeasurements: PairRequestSegmentMeasurements = {
+    schema: 'pair-request-segments/v1',
+    tokenEstimateMethod: 'utf8-bytes-div-4/v1',
+    segments,
+    categorizedUtf8Bytes: segments.reduce(
+      (total, segment) => total + segment.utf8Bytes,
+      0,
+    ),
+    estimatedTokens: segments.reduce(
+      (total, segment) => total + segment.estimatedTokens,
+      0,
+    ),
+    sharedEventCount: input.sharedEvents.length,
+    localMessageCount: local.messages.length,
+  };
   const snapshot: PairRequestSnapshot = {
     role: input.role,
     sessionId: input.sessionId,
@@ -364,6 +519,7 @@ export function buildPairRequestLayout(
       tools,
       config,
     }),
+    segmentMeasurements,
   };
   return deepFreezeJson({
     ...(system === undefined ? {} : { system }),

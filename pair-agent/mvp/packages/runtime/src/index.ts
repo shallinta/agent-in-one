@@ -1,4 +1,5 @@
 export * from './coordinator.js';
+export * from './completion-handoff.js';
 export * from './dsh-adapter.js';
 export * from './pair-derived-event-writer.js';
 export * from './peer-message.js';

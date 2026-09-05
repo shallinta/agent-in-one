@@ -42,6 +42,12 @@ export function isCanonicalDirectedPeerMessage(event: PairEvent): boolean {
     Number.isSafeInteger(payload.hop) &&
     (payload.hop as number) >= 1 &&
     (payload.hop as number) <= MAX_PEER_HOPS &&
+    (payload.expectsReply === undefined || payload.expectsReply === true) &&
+    (payload.replyTo === undefined ||
+      (typeof payload.replyTo === 'string' &&
+        payload.replyTo.length > 0 &&
+        payload.replyTo.length <= 160)) &&
+    !(payload.expectsReply === true && payload.replyTo !== undefined) &&
     sourceEventIds?.length === 1 &&
     /^[1-9][0-9]*$/.test(turnText) &&
     Number.isSafeInteger(Number(turnText))
