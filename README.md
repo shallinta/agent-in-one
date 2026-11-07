@@ -13,6 +13,7 @@
 9. [主流 Coding Agent 的 read 工具实现对比](posts/read-tool-comparison/read-tool-comparison.md)
 10. [从 API 到 Token：大模型调用与底层机制](posts/llm-from-api-to-token/llm-from-api-to-token.md)
 11. [Deepseek Harness 技术概览](posts/deepseek-harness-architecture-report.md)
+12. [Pi 的五个包：从模型调用到 Agent 运行时](posts/pi-package-architecture/pi-package-architecture.md)
 
 ## 🧪 探索目录
 
